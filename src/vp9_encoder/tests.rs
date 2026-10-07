@@ -976,10 +976,20 @@ fn visible(picture: &Picture, geometry: &Geometry) -> Vec<u8> {
 /// filter, and returns the total size in bytes and the PSNR of the
 /// reconstruction against the source.
 fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (usize, f64) {
+    let (sizes, psnr) = encode_group_frames(frames, base_q_idx, loop_filter);
+    (sizes.iter().sum(), psnr)
+}
+
+/// [`encode_group`], with the size of every frame.
+fn encode_group_frames(
+    frames: &[VideoFrame],
+    base_q_idx: u8,
+    loop_filter: bool,
+) -> (Vec<usize>, f64) {
     let dimensions = frames[0].dimensions;
     let geometry = Geometry::new(dimensions.width as usize, dimensions.height as usize);
     let mut reference: Option<Picture> = None;
-    let (mut bytes, mut reconstructed, mut sources) = (0, Vec::new(), Vec::new());
+    let (mut sizes, mut reconstructed, mut sources) = (Vec::new(), Vec::new(), Vec::new());
     for frame in frames {
         let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
         // Error resilient, so the comparison isolates the loop filter.
@@ -999,12 +1009,12 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
         }
         let encoded = encoder.encode(false);
         let (data, reconstruction) = (encoded.data, encoded.reconstruction);
-        bytes += data.len();
+        sizes.push(data.len());
         reconstructed.extend(visible(&reconstruction, &geometry));
         sources.extend(visible(&source, &geometry));
         reference = Some(reconstruction);
     }
-    (bytes, psnr(&reconstructed, &sources))
+    (sizes, psnr(&reconstructed, &sources))
 }
 
 #[test]
@@ -1043,5 +1053,43 @@ fn loop_filter_is_a_rate_distortion_gain() {
             "q {base_q_idx}: {filtered_bytes} bytes at {filtered_psnr:.2} dB filtered, \
              {unfiltered_bytes} bytes at {unfiltered_psnr:.2} dB unfiltered"
         );
+    }
+}
+
+#[test]
+fn panning_inter_frames_find_the_motion() {
+    // The texture's fine detail leaves the motion search many local minima.
+    // Started from the neighbours' vectors alone, a frame whose first blocks
+    // missed the pan fell back to intra nearly everywhere and came out about
+    // as large as the key frame, and the loop filter's small changes to the
+    // reference decided which frames did: the filtered sequence was up to a
+    // third larger than the unfiltered one would have to grow to match its
+    // quality (issue #583). Content this sharp has little blocking left for
+    // the filter to remove, so it must now cost next to nothing either way.
+    for (width, height) in [(96, 64), (192, 128)] {
+        let frames: Vec<VideoFrame> = (0..12)
+            .map(|index| moving_yuv_frame(width, height, index))
+            .collect();
+        for base_q_idx in [30, 40, 130, 200, 210, 220] {
+            let [unfiltered, filtered] = [false, true].map(|loop_filter| {
+                let (sizes, psnr) = encode_group_frames(&frames, base_q_idx, loop_filter);
+                for (index, &size) in sizes.iter().enumerate().skip(1) {
+                    assert!(
+                        size < sizes[0] / 2,
+                        "{width}x{height} q {base_q_idx}, filter {loop_filter}:                          frame {index} is {size} bytes, the key frame {}",
+                        sizes[0]
+                    );
+                }
+                (sizes.iter().sum::<usize>(), psnr)
+            });
+            let ((unfiltered_bytes, unfiltered_psnr), (filtered_bytes, filtered_psnr)) =
+                (unfiltered, filtered);
+            let equivalent_bytes =
+                unfiltered_bytes as f64 * 2_f64.powf((filtered_psnr - unfiltered_psnr) / 6.0);
+            assert!(
+                filtered_bytes as f64 <= equivalent_bytes * 1.03,
+                "{width}x{height} q {base_q_idx}: {filtered_bytes} bytes at                  {filtered_psnr:.2} dB filtered, {unfiltered_bytes} bytes at                  {unfiltered_psnr:.2} dB unfiltered"
+            );
+        }
     }
 }

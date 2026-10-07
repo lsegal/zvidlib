@@ -19,8 +19,9 @@
 //!   reference deltas;
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with
-//!   whole-sample motion vectors found by a diamond search, coded as
-//!   `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
+//!   whole-sample motion vectors found by a diamond search, started from the
+//!   neighbours' vectors and the frame's motion estimated from its
+//!   projections, coded as `ZEROMV`, `NEARESTMV`, `NEARMV` or `NEWMV`, or fall back to intra.
 //!
 //! Each superblock is searched first, with every candidate's rate counted
 //! from the same probabilities and contexts the bitstream codes it with, and
@@ -337,6 +338,9 @@ pub(super) struct FrameEncoder<'a> {
     /// Whether [`Self::encode`] chooses a loop filter level at all; tests
     /// clear it to compare against an unfiltered encode.
     loop_filter: bool,
+    /// The frame's motion estimated from its projections, which every
+    /// block's motion search also starts from.
+    projected_mvs: Vec<Mv>,
     /// Every block written, as `(mi_row, mi_col, bsl)`, which the loop
     /// filter's edge masks are built from.
     coded_blocks: Vec<(usize, usize, usize)>,
@@ -385,6 +389,7 @@ impl<'a> FrameEncoder<'a> {
             previous_mode_info: previous_mode_info.filter(|_| reference.is_some()),
             filter_level: 0,
             loop_filter: true,
+            projected_mvs: Vec::new(),
             coded_blocks: Vec::new(),
             dc_q: DC_QLOOKUP[q],
             ac_q: ac,
@@ -427,6 +432,9 @@ impl<'a> FrameEncoder<'a> {
         };
         let sb_rows = self.geometry.mi_rows.div_ceil(8);
         let sb_cols = self.geometry.mi_cols.div_ceil(8);
+        if let Some(reference) = self.reference {
+            self.projected_mvs = self.projected_motion(reference);
+        }
         for sb_row in 0..sb_rows {
             self.left_nonzero = [[false; 16]; 3];
             self.left_partition = [0; 8];
@@ -1263,7 +1271,65 @@ impl<'a> FrameEncoder<'a> {
         sad
     }
 
-    /// Finds the whole-sample motion vector with the smallest luma SAD.
+    /// Estimates the frame's whole-sample motion from its luma projections,
+    /// as libvpx's `vp9_int_pro_motion_estimation` does for a block: the
+    /// column sums give the horizontal motion and the row sums the vertical,
+    /// each by the offset within the search range that matches the
+    /// reference's sums best. Content can leave one direction's sums nearly
+    /// flat, and its estimate noise, so each direction is also offered on its
+    /// own.
+    ///
+    /// A diamond search from the neighbours' vectors alone can settle in a
+    /// local minimum on fine texture. Once a frame's first blocks miss the
+    /// motion and fall back to intra, the blocks after them have no vectors
+    /// to start from either, and a panning frame can code nearly all intra:
+    /// small changes to the reference, such as the loop filter's, then swing
+    /// the size of the whole sequence (issue #583).
+    fn projected_motion(&self, reference: &Picture) -> Vec<Mv> {
+        const RANGE: usize = 64;
+        let stride = self.source.strides[0];
+        let (width, height) = (self.geometry.width, self.geometry.height);
+        let source = |x: usize, y: usize| u32::from(self.source.planes[0][y * stride + x]);
+        // The reference sample at an offset, extended past the edges as
+        // motion compensation extends it.
+        let reference = |x: isize, y: isize| {
+            let x = x.clamp(0, width as isize - 1) as usize;
+            let y = y.clamp(0, height as isize - 1) as usize;
+            u32::from(reference.planes[0][y * stride + x])
+        };
+        let best_offset = |projection: &[u32], shifted: &[u32]| {
+            (0..=2 * RANGE)
+                .min_by_key(|&offset| {
+                    let sad: u64 = projection
+                        .iter()
+                        .zip(&shifted[offset..])
+                        .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                        .sum();
+                    // Prefer the smaller offset among equals.
+                    (sad, offset.abs_diff(RANGE))
+                })
+                .expect("the range is not empty") as i32
+                - RANGE as i32
+        };
+        let columns: Vec<u32> = (0..width)
+            .map(|x| (0..height).map(|y| source(x, y)).sum())
+            .collect();
+        let reference_columns: Vec<u32> = (-(RANGE as isize)..(width + RANGE) as isize)
+            .map(|x| (0..height).map(|y| reference(x, y as isize)).sum())
+            .collect();
+        let rows: Vec<u32> = (0..height)
+            .map(|y| (0..width).map(|x| source(x, y)).sum())
+            .collect();
+        let reference_rows: Vec<u32> = (-(RANGE as isize)..(height + RANGE) as isize)
+            .map(|y| (0..width).map(|x| reference(x as isize, y)).sum())
+            .collect();
+        let row = best_offset(&rows, &reference_rows) * 8;
+        let col = best_offset(&columns, &reference_columns) * 8;
+        vec![Mv { row, col }, Mv { row: 0, col }, Mv { row, col: 0 }]
+    }
+
+    /// Finds the whole-sample motion vector with the smallest luma SAD,
+    /// starting from `starts` and the frame's projected motion.
     fn search_motion(
         &self,
         reference: &Picture,
@@ -1277,7 +1343,7 @@ impl<'a> FrameEncoder<'a> {
         let range = 64 * 8;
         let mut best_mv = Mv::default();
         let mut best_sad = self.luma_sad(reference, mi_row, mi_col, size, best_mv, u32::MAX);
-        for start in starts {
+        for start in starts.into_iter().chain(self.projected_mvs.iter().copied()) {
             let start = Mv {
                 row: start.row / 8 * 8,
                 col: start.col / 8 * 8,
