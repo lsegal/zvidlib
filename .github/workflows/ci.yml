@@ -334,8 +334,8 @@ jobs:
   #
   # The compile check is one job and the timed run is one job *per bench
   # target*, because the two have opposite shapes. Compiling is a single cargo
-  # invocation whose cost is almost entirely the shared crate build, so eleven
-  # copies of it would pay that eleven times for one result. Measuring is eleven
+  # invocation whose cost is almost entirely the shared crate build, so twelve
+  # copies of it would pay that twelve times for one result. Measuring is twelve
   # independent programs that share nothing but the binary they were built
   # from, and running them on one runner made the job's wall clock their sum:
   # on `main` push 33834381334 the timed step spanned 03:48:55Z to 04:26Z, and
@@ -367,7 +367,7 @@ jobs:
       - name: Install native audio dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Every `[[bench]]` target, not one of them: naming one would let the
-      # other ten rot unnoticed, which is the exact failure this job exists
+      # other eleven rot unnoticed, which is the exact failure this job exists
       # to catch.
       - name: Compile the benchmark suite
         run: cargo bench --features native --benches --no-run
@@ -379,13 +379,13 @@ jobs:
     permissions:
       contents: read
     strategy:
-      # One target failing still leaves the other ten measured, and the
+      # One target failing still leaves the other eleven measured, and the
       # report job below refuses to build a baseline out of a partial suite
       # anyway - so cancelling the survivors would only cost the log that says
       # which ones were fine.
       fail-fast: false
       matrix:
-        # Slowest first, because a pool that cannot start all eleven at once
+        # Slowest first, because a pool that cannot start all twelve at once
         # starts them in this order and the wall clock is whatever finishes
         # last. `tests/ci_benchmarks_run_every_target.rs` asserts this list is
         # exactly the `[[bench]]` targets `Cargo.toml` declares, so a target
@@ -394,6 +394,7 @@ jobs:
           - hevc_encode
           - av1_encode
           - av1_decode
+          - vp9_encode
           - hevc_decode
           - vp9_decode
           - vpx_decode
@@ -445,7 +446,7 @@ jobs:
       # `bench_across_isas` runs one arm per entry in `zvidlib::simd::available()`,
       # so a runner without AVX2 has no `avx2` arm rather than reporting scalar
       # numbers under a vector label. Recording the model per target is what
-      # keeps a merged baseline attributable: the eleven targets are eleven
+      # keeps a merged baseline attributable: the twelve targets are twelve
       # runners now, and an arm that vanished because the pool changed looks
       # exactly like an arm that never existed.
       - name: Record this target's host
@@ -497,7 +498,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `merge-multiple` unpacks all eleven artifacts into one tree. The criterion
+      # `merge-multiple` unpacks all twelve artifacts into one tree. The criterion
       # paths cannot collide across targets - two bench targets sharing a group
       # name is what `tests/bench_group_names_are_unique.rs` forbids (#414) -
       # and the per-target log and host files carry the target in their names.
@@ -543,8 +544,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Every distinct host, not the first one: the baseline is a merge across
-      # eleven runners, and naming one of them would attribute the whole suite to
-      # a machine that measured an eleventh of it.
+      # twelve runners, and naming one of them would attribute the whole suite to
+      # a machine that measured a twelfth of it.
       - name: Collect this run's baseline
         run: |
           # `awk` rather than `paste -sd '; '`, which cycles its delimiter

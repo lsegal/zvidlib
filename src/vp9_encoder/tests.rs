@@ -1045,3 +1045,188 @@ fn loop_filter_is_a_rate_distortion_gain() {
         );
     }
 }
+
+/// A frame of interleaved 4-byte pixels whose channels vary independently,
+/// with a pattern that pans by `index` samples a frame.
+fn moving_rgb_frame(
+    width: u32,
+    height: u32,
+    index: u32,
+    format: PixelFormat,
+    range: ColorRange,
+) -> VideoFrame {
+    let (width, height) = (width as usize, height as usize);
+    // A stride wider than the row, so the conversion must honour it.
+    let stride = width * 4 + 12;
+    let mut data = vec![0_u8; stride * height];
+    for y in 0..height {
+        for x in 0..width {
+            let u = x + index as usize * 3;
+            let pixel = &mut data[y * stride + x * 4..][..4];
+            pixel[0] = ((u * 5 + y * 3) % 256) as u8;
+            pixel[1] = (((u ^ y) * 7) % 256) as u8;
+            pixel[2] = (255 - (u * 2 + y * 9) % 256) as u8;
+            pixel[3] = (x * y % 256) as u8;
+        }
+    }
+    VideoFrame::new(
+        VideoDimensions {
+            width: width as u32,
+            height: height as u32,
+        },
+        format,
+        range,
+        vec![Plane { data, stride }],
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+/// The RGBA/BGRA conversion as it was written per pixel before it was
+/// vectorized: BT.601 luma per pixel, and chroma from each channel's rounded
+/// average over a 2x2 block whose last row and column repeat at odd sizes.
+fn reference_conversion(
+    frame: &VideoFrame,
+    orientation: Orientation,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (width, height) = (
+        frame.dimensions.width as usize,
+        frame.dimensions.height as usize,
+    );
+    let plane = &frame.planes[0];
+    let full = frame.color_range == ColorRange::Full;
+    let (red, blue) = if frame.pixel_format == PixelFormat::Rgba8 {
+        (0, 2)
+    } else {
+        (2, 0)
+    };
+    let rgb = |x: usize, y: usize| {
+        let y = match orientation {
+            Orientation::TopLeft => y,
+            Orientation::BottomLeft => height - 1 - y,
+        };
+        let offset = y * plane.stride + x * 4;
+        [red, 1, blue].map(|channel| i32::from(plane.data[offset + channel]))
+    };
+    let mut luma = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let [r, g, b] = rgb(x, y);
+            luma.push(if full {
+                ((77 * r + 150 * g + 29 * b + 128) >> 8).clamp(0, 255) as u8
+            } else {
+                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+            });
+        }
+    }
+    let (mut cb, mut cr) = (Vec::new(), Vec::new());
+    for y in 0..height.div_ceil(2) {
+        for x in 0..width.div_ceil(2) {
+            let mut sum = [0_i32; 3];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let sample = rgb((x * 2 + dx).min(width - 1), (y * 2 + dy).min(height - 1));
+                for channel in 0..3 {
+                    sum[channel] += sample[channel];
+                }
+            }
+            let [r, g, b] = sum.map(|value| (value + 2) >> 2);
+            let (u, v) = if full {
+                (
+                    (-43 * r - 85 * g + 128 * b + 128) >> 8,
+                    (128 * r - 107 * g - 21 * b + 128) >> 8,
+                )
+            } else {
+                (
+                    (-38 * r - 74 * g + 112 * b + 128) >> 8,
+                    (112 * r - 94 * g - 18 * b + 128) >> 8,
+                )
+            };
+            cb.push((u + 128).clamp(0, 255) as u8);
+            cr.push((v + 128).clamp(0, 255) as u8);
+        }
+    }
+    (luma, cb, cr)
+}
+
+#[test]
+fn rgb_conversion_matches_the_per_pixel_bt601_reference_on_every_isa() {
+    let _guard = crate::simd::test_lock();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        for (width, height) in [(16, 16), (17, 9), (33, 2), (1, 1), (70, 35)] {
+            let geometry = Geometry::new(width, height);
+            for format in [PixelFormat::Rgba8, PixelFormat::Bgra8] {
+                for range in [ColorRange::Limited, ColorRange::Full] {
+                    for orientation in [Orientation::TopLeft, Orientation::BottomLeft] {
+                        let frame = moving_rgb_frame(width as u32, height as u32, 1, format, range);
+                        let picture = source_picture(&geometry, &frame, orientation).unwrap();
+                        let (luma, cb, cr) = reference_conversion(&frame, orientation);
+                        let crop = |plane: usize, width: usize, height: usize| {
+                            let stride = picture.strides[plane];
+                            (0..height)
+                                .flat_map(|row| {
+                                    picture.planes[plane][row * stride..][..width].to_vec()
+                                })
+                                .collect::<Vec<u8>>()
+                        };
+                        let (chroma_width, chroma_height) =
+                            (geometry.chroma_width(), geometry.chroma_height());
+                        let label = format!(
+                            "{} {width}x{height} {format:?} {range:?} {orientation:?}",
+                            isa.name()
+                        );
+                        assert_eq!(crop(0, width, height), luma, "{label} luma");
+                        assert_eq!(crop(1, chroma_width, chroma_height), cb, "{label} Cb");
+                        assert_eq!(crop(2, chroma_width, chroma_height), cr, "{label} Cr");
+                    }
+                }
+            }
+        }
+    }
+    crate::simd::set_override(None);
+}
+
+/// The vector kernels are bit-exact with the scalar ones, so the encoder has
+/// to write the same bytes whichever instruction set it runs on (cf. #231).
+#[test]
+fn every_instruction_set_encodes_byte_identical_bitstreams() {
+    let _guard = crate::simd::test_lock();
+    let encode = |config: &VideoEncoderConfig, content: &dyn Fn(u32) -> VideoFrame| {
+        let mut encoder = NativeVp9Encoder::new(config, &Limits::default()).unwrap();
+        (0..4)
+            .flat_map(|index| {
+                let frame = content(index);
+                let source = FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                });
+                block_on(encoder.encode(FrameIndex(u64::from(index)), source))
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|sample| sample.data)
+            })
+            .collect::<Vec<u8>>()
+    };
+    let yuv = configuration(100, 66, PixelFormat::Yuv420p8);
+    let mut bgra = configuration(67, 45, PixelFormat::Bgra8);
+    bgra.color_range = ColorRange::Full;
+    let streams = || {
+        [
+            encode(&yuv, &|index| moving_yuv_frame(100, 66, index)),
+            encode(&bgra, &|index| {
+                moving_rgb_frame(67, 45, index, PixelFormat::Bgra8, ColorRange::Full)
+            }),
+        ]
+    };
+    crate::simd::set_override(Some(crate::simd::SimdIsa::Scalar));
+    let reference = streams();
+    for isa in crate::simd::available() {
+        crate::simd::set_override(Some(isa));
+        assert!(
+            streams() == reference,
+            "{} encoded different bytes from the scalar kernels",
+            isa.name()
+        );
+    }
+    crate::simd::set_override(None);
+}
