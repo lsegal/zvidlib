@@ -1,3 +1,7 @@
+//! The native AV1 encoder's output decodes through ffmpeg, where it is
+//! installed, above a PSNR floor, round-trips through the native decoder, and
+//! passes the shared encoder conformance runner.
+
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::io::Write;
