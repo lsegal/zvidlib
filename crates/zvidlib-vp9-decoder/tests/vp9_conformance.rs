@@ -8,8 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use zvidlib_container::{
-    FrameDigest, Mp4DemuxerOptions, VideoDecoderConformanceVector,
-    verify_video_decoder_conformance,
+    FrameDigest, Mp4DemuxerOptions, VideoDecoderConformanceVector, verify_video_decoder_conformance,
 };
 use zvidlib_core::io::MemorySource;
 use zvidlib_core::{
@@ -43,21 +42,15 @@ fn native_vp9_decoder_conforms_to_libvpx_for_sequential_reverse_and_alternating_
     for (name, mp4, expected, (width, height), frames) in [
         (
             "VP9 256x144 with hidden frames",
-            include_bytes!("fixtures/vp9_bbb_256x144.mp4")
-                .as_slice(),
-            include_str!(
-                "fixtures/vp9_bbb_256x144_rgba.sha256"
-            ),
+            include_bytes!("fixtures/vp9_bbb_256x144.mp4").as_slice(),
+            include_str!("fixtures/vp9_bbb_256x144_rgba.sha256"),
             (256, 144),
             48,
         ),
         (
             "VP9 250x142",
-            include_bytes!("fixtures/vp9_bbb_250x142.mp4")
-                .as_slice(),
-            include_str!(
-                "fixtures/vp9_bbb_250x142_rgba.sha256"
-            ),
+            include_bytes!("fixtures/vp9_bbb_250x142.mp4").as_slice(),
+            include_str!("fixtures/vp9_bbb_250x142_rgba.sha256"),
             (250, 142),
             12,
         ),

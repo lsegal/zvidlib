@@ -11,7 +11,7 @@ use zvidlib::io::{MemorySink, MemorySource};
 use zvidlib::{
     AudioBuffer, AudioDrain, AudioEncoder, AudioEncoderFormat, AudioGapless, Codec, ColorRange,
     CoverArt, CoverArtFormat, CoverSource, CpuFrameSource, EncodedSample, EncoderConfig,
-    EncoderFuture, ErrorKind, FrameIndex, FrameRate, FrameSource, Limits, MediaOutput, Mp4Demuxer,
+    EncoderFuture, FrameIndex, FrameRate, FrameSource, Limits, MediaOutput, Mp4Demuxer,
     Mp4DemuxerOptions, Orientation, OutputOptions, PixelFormat, Plane, SampleDependency, Timeline,
     VideoDimensions, VideoEncoder, VideoEncoderFormat, VideoFrame,
 };
@@ -68,7 +68,7 @@ fn png() -> CoverArt {
     }
 }
 
-
+/// Emits one sync sample per frame, so a `MediaOutput` can be driven without a
 /// real codec.
 struct PassthroughVideoEncoder {
     config: EncoderConfig,

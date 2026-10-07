@@ -96,8 +96,7 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // `crates/zvidlib-av1/src/av1_filters.rs`) applied to that hermetically decoded YUV420
     // output.
     let stream_hex =
-        include_str!("../../zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex")
-            .trim();
+        include_str!("../../zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex").trim();
     let stream: Vec<u8> = stream_hex
         .as_bytes()
         .chunks_exact(2)
@@ -106,15 +105,14 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     let units = av1_temporal_units(&stream);
     assert_eq!(units.len(), 5);
 
-    let expected: Vec<FrameDigest> = include_str!(
-        "../../zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16_rgba.sha256"
-    )
-    .lines()
-    .map(|line| {
-        let (_, digest) = line.split_once(' ').unwrap();
-        FrameDigest::from_hex(digest).unwrap()
-    })
-    .collect();
+    let expected: Vec<FrameDigest> =
+        include_str!("../../zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16_rgba.sha256")
+            .lines()
+            .map(|line| {
+                let (_, digest) = line.split_once(' ').unwrap();
+                FrameDigest::from_hex(digest).unwrap()
+            })
+            .collect();
     assert_eq!(expected.len(), units.len());
 
     let limits = Limits::default();
@@ -190,14 +188,13 @@ fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
     // point, so `verify_video_decoder_conformance`'s reverse pattern would
     // re-decode it from the start for nearly every frame; every frame is
     // checked in order instead, followed by backward and forward seeks.
-    let expected =
-        include_str!("fixtures/big_buck_bunny_av1_rgba.sha256")
-            .lines()
-            .map(|line| {
-                let (_, digest) = line.split_once(' ').unwrap();
-                FrameDigest::from_hex(digest).unwrap()
-            })
-            .collect::<Vec<_>>();
+    let expected = include_str!("fixtures/big_buck_bunny_av1_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
     let limits = Limits::default();
     let source =
         MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.av1.mp4").to_vec());

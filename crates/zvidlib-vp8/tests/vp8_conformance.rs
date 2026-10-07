@@ -173,9 +173,7 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
 
 #[test]
 fn a_webm_vp8_track_returns_every_frame_exactly() {
-    let source = MemorySource::new(
-        include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
-    );
+    let source = MemorySource::new(include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec());
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
@@ -214,9 +212,7 @@ fn a_webm_vp8_track_returns_every_frame_exactly() {
 fn a_seek_decodes_through_a_hidden_key_frame() {
     // Vector 018 opens with a key frame that is never shown; every frame
     // after it predicts from it.
-    let (dimensions, frames) = ivf(include_bytes!(
-        "fixtures/vp8/vp80-00-comprehensive-018.ivf"
-    ));
+    let (dimensions, frames) = ivf(include_bytes!("fixtures/vp8/vp80-00-comprehensive-018.ivf"));
     assert!(frames[0].key_frame && !frames[0].shown);
     assert!(frames[1..].iter().all(|frame| frame.shown));
     let factory = native_vp8_video_decoder_factory();
@@ -281,9 +277,7 @@ fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
     // Issue #537: three of this track's 43 blocks are hidden alternate
     // references. `crates/zvidlib-vp8/src/tests.rs` holds the 40 shown frames to libvpx's
     // MD5s.
-    let source = MemorySource::new(
-        include_bytes!("fixtures/vp8/vp8_altref_98x66.webm").to_vec(),
-    );
+    let source = MemorySource::new(include_bytes!("fixtures/vp8/vp8_altref_98x66.webm").to_vec());
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];
     assert_eq!(track.presentation_order.len(), 40);
@@ -357,9 +351,7 @@ fn capability_honors_the_hardware_preference() {
 
 #[test]
 fn a_frame_of_the_wrong_size_or_a_malformed_frame_is_an_error() {
-    let (_, frames) = ivf(include_bytes!(
-        "fixtures/vp8/vp80-00-comprehensive-001.ivf"
-    ));
+    let (_, frames) = ivf(include_bytes!("fixtures/vp8/vp80-00-comprehensive-001.ivf"));
     let factory = native_vp8_video_decoder_factory();
     let limits = Limits::default();
     let cancellation = CancellationToken::new();
@@ -506,9 +498,7 @@ fn hardware_vp8_matches_the_software_decoder_and_seeks_exactly() {
 
 #[test]
 fn a_hardware_webm_vp8_track_matches_the_software_decoder() {
-    let source = MemorySource::new(
-        include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec(),
-    );
+    let source = MemorySource::new(include_bytes!("fixtures/vp8/vp8_testsrc2_98x66.webm").to_vec());
     let limits = Limits::default();
     let demuxer = block_on(WebmDemuxer::open(&source, Default::default())).unwrap();
     let track = &demuxer.tracks[0];

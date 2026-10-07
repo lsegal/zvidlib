@@ -12,8 +12,7 @@ use zvidlib_container::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib_container::{CoverArt, CoverArtFormat, Mp4Demuxer, Mp4DemuxerOptions};
 use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_core::{
-    Codec, ColorRange, EncodedSample, ErrorKind, Limits, PixelFormat, SampleDependency,
-    VideoDimensions,
+    Codec, EncodedSample, EncoderConfig, ErrorKind, SampleDependency, VideoDimensions,
 };
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -346,5 +345,3 @@ fn ffprobe_reports_the_cover_as_an_attached_picture() {
         );
     }
 }
-
-/// Emits one sync sample per frame, so a `MediaOutput` can be driven without a

@@ -9,8 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use zvidlib_container::{
-    ExpectedVideoFrame, FrameDigest, Mp4DemuxerOptions, VideoDecoderConformanceVector,
-    verify_video_decoder_conformance,
+    FrameDigest, Mp4DemuxerOptions, VideoDecoderConformanceVector, verify_video_decoder_conformance,
 };
 use zvidlib_core::io::MemorySource;
 use zvidlib_core::{
@@ -42,17 +41,16 @@ fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
     // checked in order instead, followed by backward and forward seeks. The
     // three patterns still run for HEVC Main on the 32-frame groups of
     // `bbb_hevc_512x288_gop32.mp4`, in `crates/zvidlib-hevc-decoder/src/lib.rs`.
-    let expected = include_str!(
-        "fixtures/big_buck_bunny_hevc_rgba.sha256"
-    )
-    .lines()
-    .map(|line| {
-        let (_, digest) = line.split_once(' ').unwrap();
-        FrameDigest::from_hex(digest).unwrap()
-    })
-    .collect::<Vec<_>>();
+    let expected = include_str!("fixtures/big_buck_bunny_hevc_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source = MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
+    let source =
+        MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
         "bundled HEVC Main sample",
         &source,
@@ -121,20 +119,15 @@ fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
 /// to an 8-bit-only accelerated backend first.
 #[test]
 fn native_hevc_decoder_conforms_for_main10() {
-    let expected = include_str!(
-        "fixtures/bbb_hevc_main10_128x72_rgba.sha256"
-    )
-    .lines()
-    .map(|line| {
-        let (_, digest) = line.split_once(' ').unwrap();
-        FrameDigest::from_hex(digest).unwrap()
-    })
-    .collect::<Vec<_>>();
+    let expected = include_str!("fixtures/bbb_hevc_main10_128x72_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source = MemorySource::new(
-        include_bytes!("fixtures/bbb_hevc_main10_128x72.mp4")
-            .to_vec(),
-    );
+    let source = MemorySource::new(include_bytes!("fixtures/bbb_hevc_main10_128x72.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
         "HEVC Main 10 sample",
         &source,
@@ -168,17 +161,16 @@ fn native_hevc_decoder_conforms_for_main10() {
 /// tail it keeps behind it, and a frame it passed are all still the fixture's frames.
 #[test]
 fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns() {
-    let expected = include_str!(
-        "fixtures/big_buck_bunny_hevc_rgba.sha256"
-    )
-    .lines()
-    .map(|line| {
-        let (_, digest) = line.split_once(' ').unwrap();
-        FrameDigest::from_hex(digest).unwrap()
-    })
-    .collect::<Vec<_>>();
+    let expected = include_str!("fixtures/big_buck_bunny_hevc_rgba.sha256")
+        .lines()
+        .map(|line| {
+            let (_, digest) = line.split_once(' ').unwrap();
+            FrameDigest::from_hex(digest).unwrap()
+        })
+        .collect::<Vec<_>>();
     let limits = Limits::default();
-    let source = MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
+    let source =
+        MemorySource::new(include_bytes!("../../../examples/media/BigBuckBunny.mp4").to_vec());
     let vector = block_on(VideoDecoderConformanceVector::from_mp4(
         "bundled HEVC Main sample",
         &source,
