@@ -1,4 +1,5 @@
-//! Guards against a CI guard test that no CI job runs.
+//! Guards against a CI guard test, or any other integration test, that no CI
+//! job runs.
 //!
 //! CI names the integration tests it runs one `--test <name>` at a time -
 //! there is no blanket `--tests` - so a test file that is not named is compiled
@@ -21,6 +22,11 @@
 //! `--test` names of the cargo invocations that *run* tests in
 //! `.github/workflows/` have to be the same set, and a guard added without a
 //! name there fails here.
+//!
+//! The integration tests that exercise the library had the same gap: nine of
+//! them were compiled and never run (#599). So every other `tests/*.rs` file
+//! has to be run by a workflow too, unless [`NOT_RUN_BY_CI`] names it with the
+//! reason it is left out.
 //!
 //! Deliberately line-based rather than a YAML parse, for the same reason
 //! `ci_workflows_cache_cargo` is: the alternative is a `serde_yaml` dependency
@@ -51,22 +57,60 @@ fn workflow_files() -> Vec<PathBuf> {
     files
 }
 
-/// The `tests/ci_*.rs` files, by target name.
+/// Integration tests that no workflow runs, each with the reason it is left out.
+///
+/// Every test in these files is `#[ignore]`d, so naming one in an archive would
+/// only add a binary whose every test is skipped. A file that gains a test that
+/// asserts something belongs in a workflow instead.
+/// [`every_test_left_out_of_ci_exists_and_is_not_run`] fails if a workflow
+/// starts running one of these files while it is still listed here.
+const NOT_RUN_BY_CI: &[(&str, &str)] = &[
+    (
+        "preview_index",
+        "its one test times the preview tier on the host that runs it (#395); a \
+         shared runner's numbers say nothing, so it is run by hand with --ignored",
+    ),
+    (
+        "sao_band_occupancy",
+        "it measures how many SAO bands a CTB occupies, to decide whether a kernel \
+         was worth writing (#406); it reports rather than asserts, and is run by hand \
+         with --ignored --nocapture",
+    ),
+];
+
+/// Every `tests/*.rs` file of every workspace package, by target name. Since
+/// the workspace split (#604) a codec's integration tests live in its crate.
+fn test_targets() -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    for package in workspace::packages() {
+        let dir = package.path().join("tests");
+        if !dir.is_dir() {
+            continue;
+        }
+        targets.extend(
+            std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()))
+                .map(|entry| entry.expect("tests directory entry").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+                .filter_map(|path| {
+                    path.file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                }),
+        );
+    }
+    targets
+}
+
+/// The `tests/ci_*.rs` files, by target name. They are all the root package's.
 ///
 /// The `ci_` prefix is the convention these guards are named by, and it is what
 /// distinguishes them from the integration tests that exercise the library:
 /// those cover code a unit test could reach, while these read the repository's
-/// own configuration and are worth nothing unless something runs them.
+/// own configuration and are worth nothing unless something runs them. That is
+/// why no guard may be on [`NOT_RUN_BY_CI`].
 fn ci_guard_targets() -> BTreeSet<String> {
-    let dir = manifest_dir().join("tests");
-    let targets: BTreeSet<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()))
-        .map(|entry| entry.expect("tests directory entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .filter_map(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
+    let targets: BTreeSet<String> = test_targets()
+        .into_iter()
         .filter(|stem| stem.starts_with("ci_"))
         .collect();
     assert!(
@@ -176,6 +220,48 @@ fn every_ci_guard_test_is_run_by_a_workflow() {
          the test shards run, or a `cargo test` - so they are compiled and never \
          executed: {unrun:?}"
     );
+}
+
+#[test]
+fn every_integration_test_is_run_by_a_workflow_or_left_out_with_a_reason() {
+    let run = targets_run_by_workflows();
+    let left_out: BTreeSet<&str> = NOT_RUN_BY_CI.iter().map(|(name, _)| *name).collect();
+    let unrun: Vec<String> = test_targets()
+        .into_iter()
+        .filter(|target| !run.contains(target) && !left_out.contains(target.as_str()))
+        .collect();
+
+    assert!(
+        unrun.is_empty(),
+        "these packages' tests/*.rs files are not named by a `--test <name>` of any cargo \
+         invocation in .github/workflows/ that runs tests, so they are compiled and \
+         never executed (#599). Name each one in the archive of the job that should \
+         run it, or add it to NOT_RUN_BY_CI with the reason it is left out: {unrun:?}"
+    );
+}
+
+#[test]
+fn every_test_left_out_of_ci_exists_and_is_not_run() {
+    let run = targets_run_by_workflows();
+    let targets = test_targets();
+    for (name, reason) in NOT_RUN_BY_CI {
+        assert!(
+            !reason.trim().is_empty(),
+            "NOT_RUN_BY_CI names {name} without a reason"
+        );
+        assert!(
+            !name.starts_with("ci_"),
+            "NOT_RUN_BY_CI names the CI guard {name}, and a guard nothing runs protects nothing"
+        );
+        assert!(
+            targets.contains(*name),
+            "NOT_RUN_BY_CI names {name}, which is not a file under any package's tests/"
+        );
+        assert!(
+            !run.contains(*name),
+            "NOT_RUN_BY_CI names {name}, but a workflow runs it; take it off the list"
+        );
+    }
 }
 
 #[test]

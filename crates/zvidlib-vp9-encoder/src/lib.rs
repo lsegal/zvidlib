@@ -622,6 +622,7 @@ impl NativeVp9Encoder {
                 key,
                 self.previous_was_key,
                 self.tools.larger_transforms,
+                encoded.allow_high_precision_mv,
             );
         }
         self.reference = Some(encoded.reconstruction);
