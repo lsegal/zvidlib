@@ -1443,9 +1443,10 @@ impl<'a> FrameEncoder<'a> {
     /// levels cost more than the distortion they remove is coded empty.
     ///
     /// The block reuses the coding of the same residual earlier in the
-    /// superblock: an inter one, predicted along `inter`, from 8x8 up, and an
-    /// intra one from 16x16 up. Smaller transforms cost less than looking
-    /// them up.
+    /// superblock: an inter one predicted along `inter`, or an intra one
+    /// with the same prediction. The search codes the same small transform
+    /// blocks again for a third of its candidates, at each partition level
+    /// and in each block searched again in full, so every size is reused.
     #[allow(clippy::too_many_arguments)]
     fn code_residual(
         &mut self,
@@ -1472,39 +1473,35 @@ impl<'a> FrameEncoder<'a> {
             tx_type,
         };
         let key = match inter {
-            Some(mv) if tx_size > 0 => Some(ResidualKey::Inter {
+            Some(mv) => ResidualKey::Inter {
                 plane: plane as u8,
                 tx_size: tx_size as u8,
                 x: x as u16,
                 y: y as u16,
                 mv,
-            }),
-            // Hashing a prediction only pays for itself on the larger
-            // transforms.
-            None if tx_size >= 2 => Some(ResidualKey::Intra {
+            },
+            None => ResidualKey::Intra {
                 plane: plane as u8,
                 tx_size: tx_size as u8,
                 tx_type: tx_type as u8,
                 x: x as u16,
                 y: y as u16,
                 prediction: block_rows(&self.recon, plane, x, y, n).fold(0, |hash, row| {
-                    row.chunks_exact(8).fold(hash, |hash, word| {
+                    row.chunks_exact(4).fold(hash, |hash, word| {
                         fx_mix(
                             hash,
-                            u64::from_le_bytes(word.try_into().expect("eight samples")),
+                            u64::from(u32::from_le_bytes(word.try_into().expect("four samples"))),
                         )
                     })
                 }),
-            }),
-            _ => None,
+            },
         };
         let ResidualCache {
             entries,
             samples: cached_samples,
             levels: cached_levels,
         } = &mut self.residual_cache;
-        if let Some(key) = &key
-            && let Some(cached) = entries.get_mut(key)
+        if let Some(cached) = entries.get_mut(&key)
             && cached.prediction.is_none_or(|prediction| {
                 block_rows(&self.recon, plane, x, y, n)
                     .zip(cached_samples[prediction..][..n * n].chunks_exact(n))
@@ -1573,27 +1570,25 @@ impl<'a> FrameEncoder<'a> {
         );
         // An intra block's prediction, kept with its coding.
         let prediction_copy = match key {
-            Some(ResidualKey::Intra { .. }) => {
+            ResidualKey::Intra { .. } => {
                 Some(self.residual_cache.push_block(&self.recon, plane, x, y, n))
             }
-            _ => None,
+            ResidualKey::Inter { .. } => None,
         };
         // Remembers an empty coding of this residual.
         let cache_empty = |encoder: &mut Self| {
-            if let Some(key) = key {
-                encoder.residual_cache.entries.insert(
-                    key,
-                    CachedResidual {
-                        prediction: prediction_copy,
-                        prediction_error,
-                        eob: 0,
-                        levels: 0,
-                        reconstructed: 0,
-                        error: prediction_error,
-                        bits: [None; 3],
-                    },
-                );
-            }
+            encoder.residual_cache.entries.insert(
+                key,
+                CachedResidual {
+                    prediction: prediction_copy,
+                    prediction_error,
+                    eob: 0,
+                    levels: 0,
+                    reconstructed: 0,
+                    error: prediction_error,
+                    bits: [None; 3],
+                },
+            );
         };
         if prediction_error == 0 {
             cache_empty(self);
@@ -1656,26 +1651,24 @@ impl<'a> FrameEncoder<'a> {
             n,
             n,
         );
-        if let Some(key) = key {
-            let mut cached_bits = [None; 3];
-            cached_bits[context] = Some(bits);
-            let cache = &mut self.residual_cache;
-            let reconstructed = cache.push_block(&self.recon, plane, x, y, n);
-            let cached_levels = cache.levels.len();
-            cache.levels.extend_from_slice(levels);
-            cache.entries.insert(
-                key,
-                CachedResidual {
-                    prediction: prediction_copy,
-                    prediction_error,
-                    eob,
-                    levels: cached_levels,
-                    reconstructed,
-                    error,
-                    bits: cached_bits,
-                },
-            );
-        }
+        let mut cached_bits = [None; 3];
+        cached_bits[context] = Some(bits);
+        let cache = &mut self.residual_cache;
+        let reconstructed = cache.push_block(&self.recon, plane, x, y, n);
+        let cached_levels = cache.levels.len();
+        cache.levels.extend_from_slice(levels);
+        cache.entries.insert(
+            key,
+            CachedResidual {
+                prediction: prediction_copy,
+                prediction_error,
+                eob,
+                levels: cached_levels,
+                reconstructed,
+                error,
+                bits: cached_bits,
+            },
+        );
         if prediction_error as f64 + self.lambda * empty_bits <= error as f64 + self.lambda * bits {
             for row in 0..n {
                 let start = (y + row) * stride + x;
