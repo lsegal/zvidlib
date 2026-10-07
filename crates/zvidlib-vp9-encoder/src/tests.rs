@@ -1146,8 +1146,8 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
 }
 
 /// The coding tools [`encode_group`] codes with: every tool, with the default
-/// coefficient probabilities, so that its comparisons isolate the loop filter
-/// and the lookahead. Fitted to each frame's own tokens (issue #622), the
+/// coefficient probabilities, so that its comparisons isolate the loop filter.
+/// Fitted to each frame's own tokens (issue #622), the
 /// probabilities move a group's size between neighbouring quantizers, and
 /// between a weighted and an unweighted key frame, by more than either does.
 const GROUP_TOOLS: CodingTools = CodingTools {
@@ -1177,7 +1177,29 @@ fn encode_group_frames(
         full_range: false,
         loop_filter,
     };
-    let coded = StreamState::default().code_group_start(&settings, &pictures);
+    let coded = if loop_filter {
+        StreamState::default().code_group_start(&settings, &pictures)
+    } else {
+        // The unfiltered encodes keep whichever key frame the lookahead keeps
+        // with the filter on, so that the comparisons measure the filter and
+        // not a near tie in the lookahead tipping one way unfiltered and the
+        // other filtered (issue #626).
+        let filtered = StreamSettings {
+            loop_filter: true,
+            ..settings
+        };
+        let kept = StreamState::default().code_group_start(&filtered, &pictures);
+        let unweighted_key = StreamState::default().code(&filtered, &pictures[0], true, false);
+        let weighted = kept[0].data != unweighted_key.data;
+        let mut stream = StreamState::default();
+        pictures
+            .iter()
+            .enumerate()
+            .map(|(index, picture)| {
+                stream.code(&settings, picture, index == 0, index == 0 && weighted)
+            })
+            .collect()
+    };
     let (mut sizes, mut reconstructed, mut sources) = (Vec::new(), Vec::new(), Vec::new());
     for (frame, source) in coded.iter().zip(&pictures) {
         sizes.push(frame.data.len());
@@ -1335,7 +1357,11 @@ fn long_pans_keep_key_frame_detail_only_where_it_pays() {
     // so over the longer group the weighted key frame left the sequence up to
     // 44% larger at equal quality (issue #618). The lookahead codes the
     // group's start both ways, so the long pan must code no worse than with
-    // the key frame unweighted, beyond decision noise.
+    // the key frame unweighted, beyond decision noise, with every coding tool
+    // on. Fitted to each key frame's tokens (issue #622), the coefficient
+    // probabilities made a weighted key frame cheaper, and at 96x64 and q 235
+    // the lookahead kept one on a near tie that left the stream 5% larger
+    // (issue #626).
     for (width, height) in [(96, 64), (192, 128)] {
         let frames: Vec<VideoFrame> = (0..48)
             .map(|index| moving_yuv_frame(width, height, index))
@@ -1345,23 +1371,35 @@ fn long_pans_keep_key_frame_detail_only_where_it_pays() {
             let settings = StreamSettings {
                 geometry,
                 base_q_idx,
-                tools: GROUP_TOOLS,
+                tools: CodingTools::ALL,
                 error_resilient: true,
                 full_range: false,
                 loop_filter: true,
             };
+            let pictures: Vec<Picture> = frames
+                .iter()
+                .map(|frame| source_picture(&geometry, frame, Orientation::TopLeft).unwrap())
+                .collect();
+            let sizes_and_quality = |coded: &[CodedFrame]| {
+                let (mut reconstructed, mut sources) = (Vec::new(), Vec::new());
+                for (frame, source) in coded.iter().zip(&pictures) {
+                    reconstructed.extend(visible(&frame.reconstruction, &geometry));
+                    sources.extend(visible(source, &geometry));
+                }
+                (
+                    coded.iter().map(|frame| frame.data.len()).sum::<usize>(),
+                    psnr(&reconstructed, &sources),
+                )
+            };
             let mut stream = StreamState::default();
-            let (mut unweighted_bytes, mut reconstructed, mut sources) =
-                (0, Vec::new(), Vec::new());
-            for (index, frame) in frames.iter().enumerate() {
-                let source = source_picture(&geometry, frame, Orientation::TopLeft).unwrap();
-                let coded = stream.code(&settings, &source, index == 0, false);
-                unweighted_bytes += coded.data.len();
-                reconstructed.extend(visible(&coded.reconstruction, &geometry));
-                sources.extend(visible(&source, &geometry));
-            }
-            let unweighted_psnr = psnr(&reconstructed, &sources);
-            let (bytes, quality) = encode_group(&frames, base_q_idx, true);
+            let unweighted: Vec<CodedFrame> = pictures
+                .iter()
+                .enumerate()
+                .map(|(index, picture)| stream.code(&settings, picture, index == 0, false))
+                .collect();
+            let (unweighted_bytes, unweighted_psnr) = sizes_and_quality(&unweighted);
+            let (bytes, quality) =
+                sizes_and_quality(&StreamState::default().code_group_start(&settings, &pictures));
             let equivalent_bytes =
                 unweighted_bytes as f64 * 2_f64.powf((quality - unweighted_psnr) / 6.0);
             assert!(

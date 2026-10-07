@@ -9,10 +9,26 @@
 //! cheaply than intra coding does, so over a long pan the sharper key frame
 //! leaves the group larger and blurrier (issue #618). The encoder cannot tell
 //! from the key frame alone, so it codes the frames it has buffered both ways
-//! and keeps whichever costs less in the frames' own rate-distortion terms.
+//! and keeps whichever costs less in the frames' own rate-distortion terms,
+//! the weighted key frame only by a margin.
 
 use crate::context::FrameContext;
 use crate::frame::{CodingTools, FrameEncoder, Geometry, ModeInfo, Picture, lambda};
+
+/// How much less, as a fraction of the unweighted coding's rate-distortion
+/// cost, the coding with the key frame weighted must cost for the encoder to
+/// keep it.
+///
+/// The two codings sit on different rate-distortion curves, and one lambda
+/// weighs them against a single tangent, so a near tie in its terms says
+/// little about which codes the group better at equal quality. With the
+/// coefficient probabilities fitted to each key frame (issue #622), a 48-frame
+/// pan at 96x64 and `base_q_idx` 235 kept a weighted key frame that cost 0.4%
+/// less by lambda but left the stream 5% larger at equal quality (issue
+/// #626). Groups whose later frames need the key frame's detail, where an
+/// inter frame would otherwise buy it back at twice the key frame's size,
+/// save 1.5% or more.
+const WEIGHTED_KEY_MARGIN: f64 = 0.01;
 
 /// How a stream's frames are coded.
 #[derive(Clone, Copy)]
@@ -119,7 +135,8 @@ impl StreamState {
 
     /// Codes `pictures`, the start of a group whose first picture is its key
     /// frame, with the key frame weighted or not, whichever leaves these
-    /// frames the lower total rate-distortion cost.
+    /// frames the lower total rate-distortion cost. The weighted key frame
+    /// must win by [`WEIGHTED_KEY_MARGIN`].
     ///
     /// Only the key frame's lambda differs between the two; the frames after
     /// it code as they otherwise would, from whichever key frame is kept.
@@ -150,7 +167,7 @@ impl StreamState {
                 .map(|frame| frame.distortion as f64 + lambda * 8.0 * frame.data.len() as f64)
                 .sum::<f64>()
         };
-        if cost(&weighted) < cost(&unweighted) {
+        if cost(&weighted) < cost(&unweighted) * (1.0 - WEIGHTED_KEY_MARGIN) {
             *self = weighted_state;
             weighted
         } else {
