@@ -424,9 +424,16 @@ impl ResidualCache {
         n: usize,
     ) -> usize {
         let start = self.samples.len();
-        for row in block_rows(picture, plane, x, y, n) {
-            self.samples.extend_from_slice(row);
-        }
+        self.samples.resize(start + n * n, 0);
+        let stride = picture.strides[plane];
+        copy_block(
+            &mut self.samples[start..],
+            n,
+            &picture.planes[plane][y * stride + x..],
+            stride,
+            n,
+            n,
+        );
         start
     }
 }
@@ -601,9 +608,7 @@ impl InterBuffers {
                 &mut self.filter,
                 prediction,
             );
-            for (row, predicted) in prediction.chunks_exact(size).enumerate() {
-                pixels[offset + row * 64..][..size].copy_from_slice(predicted);
-            }
+            copy_block(&mut pixels[offset..], 64, prediction, size, size, size);
             *valid |= cells_mask;
         }
         &pixels[offset..]
@@ -1163,10 +1168,15 @@ impl<'a> FrameEncoder<'a> {
     fn block_pixels(&self, plane: usize, mi_row: usize, mi_col: usize, bsl: usize) -> Vec<u8> {
         let (x, y, width, height) = self.plane_region(plane, mi_row, mi_col, bsl);
         let stride = self.recon.strides[plane];
-        let mut pixels = Vec::with_capacity(width * height);
-        for row in y..y + height {
-            pixels.extend_from_slice(&self.recon.planes[plane][row * stride + x..][..width]);
-        }
+        let mut pixels = vec![0; width * height];
+        copy_block(
+            &mut pixels,
+            width,
+            &self.recon.planes[plane][y * stride + x..],
+            stride,
+            width,
+            height,
+        );
         pixels
     }
 
@@ -1180,10 +1190,14 @@ impl<'a> FrameEncoder<'a> {
     ) {
         let (x, y, width, height) = self.plane_region(plane, mi_row, mi_col, bsl);
         let stride = self.recon.strides[plane];
-        for row in 0..height {
-            self.recon.planes[plane][(y + row) * stride + x..][..width]
-                .copy_from_slice(&pixels[row * width..][..width]);
-        }
+        copy_block(
+            &mut self.recon.planes[plane][y * stride + x..],
+            stride,
+            pixels,
+            width,
+            width,
+            height,
+        );
     }
 
     /// The above context entries of a block in `plane`, in 4x4 units.
@@ -1538,11 +1552,14 @@ impl<'a> FrameEncoder<'a> {
             {
                 return (empty, *prediction_error, empty_bits);
             }
-            let reconstructed = &cached_samples[*reconstructed..][..n * n];
-            for (row, pixels) in reconstructed.chunks_exact(n).enumerate() {
-                let start = (y + row) * stride + x;
-                self.recon.planes[plane][start..start + n].copy_from_slice(pixels);
-            }
+            copy_block(
+                &mut self.recon.planes[plane][y * stride + x..],
+                stride,
+                &cached_samples[*reconstructed..],
+                n,
+                n,
+                n,
+            );
             let block = TxBlock {
                 levels: levels.to_vec(),
                 eob: *eob,
@@ -1629,11 +1646,14 @@ impl<'a> FrameEncoder<'a> {
         );
         // Restored if the residual is not worth its bits.
         let prediction = &mut prediction[..n * n];
-        for row in 0..n {
-            let start = (y + row) * stride + x;
-            prediction[row * n..row * n + n]
-                .copy_from_slice(&self.recon.planes[plane][start..start + n]);
-        }
+        copy_block(
+            prediction,
+            n,
+            &self.recon.planes[plane][y * stride + x..],
+            stride,
+            n,
+            n,
+        );
         let start = y * stride + x;
         inverse_transform_add(
             dequantized,
@@ -1670,11 +1690,14 @@ impl<'a> FrameEncoder<'a> {
             },
         );
         if prediction_error as f64 + self.lambda * empty_bits <= error as f64 + self.lambda * bits {
-            for row in 0..n {
-                let start = (y + row) * stride + x;
-                self.recon.planes[plane][start..start + n]
-                    .copy_from_slice(&prediction[row * n..row * n + n]);
-            }
+            copy_block(
+                &mut self.recon.planes[plane][y * stride + x..],
+                stride,
+                prediction,
+                n,
+                n,
+                n,
+            );
             return (empty, prediction_error, empty_bits);
         }
         let block = TxBlock {
@@ -2368,11 +2391,14 @@ impl<'a> FrameEncoder<'a> {
                     size,
                     size,
                 );
-                for row in 0..size {
-                    let start = start + row * stride;
-                    self.recon.planes[plane][start..start + size]
-                        .copy_from_slice(&prediction[row * prediction_stride..][..size]);
-                }
+                copy_block(
+                    &mut self.recon.planes[plane][start..],
+                    stride,
+                    prediction,
+                    prediction_stride,
+                    size,
+                    size,
+                );
             }
             let predicted: [Vec<u8>; 3] =
                 core::array::from_fn(|plane| self.block_pixels(plane, mi_row, mi_col, bsl));
@@ -2752,6 +2778,76 @@ fn block_rows(
 ) -> impl Iterator<Item = &[u8]> {
     let stride = picture.strides[plane];
     (0..n).map(move |row| &picture.planes[plane][(y + row) * stride + x..][..n])
+}
+
+/// Copies a `width` x `height` block between buffers with the given row
+/// strides. The search copies many small blocks, and a row copy of a width
+/// the compiler cannot see was a library call each.
+fn copy_block(
+    destination: &mut [u8],
+    destination_stride: usize,
+    source: &[u8],
+    source_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    fn rows<const WIDTH: usize>(
+        destination: &mut [u8],
+        destination_stride: usize,
+        source: &[u8],
+        source_stride: usize,
+        height: usize,
+    ) {
+        for row in 0..height {
+            let samples: &[u8; WIDTH] = source[row * source_stride..][..WIDTH]
+                .try_into()
+                .expect("a whole row");
+            destination[row * destination_stride..][..WIDTH].copy_from_slice(samples);
+        }
+    }
+    match width {
+        4 => rows::<4>(
+            destination,
+            destination_stride,
+            source,
+            source_stride,
+            height,
+        ),
+        8 => rows::<8>(
+            destination,
+            destination_stride,
+            source,
+            source_stride,
+            height,
+        ),
+        16 => rows::<16>(
+            destination,
+            destination_stride,
+            source,
+            source_stride,
+            height,
+        ),
+        32 => rows::<32>(
+            destination,
+            destination_stride,
+            source,
+            source_stride,
+            height,
+        ),
+        64 => rows::<64>(
+            destination,
+            destination_stride,
+            source,
+            source_stride,
+            height,
+        ),
+        _ => {
+            for row in 0..height {
+                destination[row * destination_stride..][..width]
+                    .copy_from_slice(&source[row * source_stride..][..width]);
+            }
+        }
+    }
 }
 
 /// The total bits of the symbols `write` codes.
