@@ -1,8 +1,8 @@
 //! Guards against a copy of the release version outside `Cargo.toml`.
 //!
-//! The 0.4.0 bump (#633) had to edit `README.md` in five places on top of
-//! `Cargo.toml`, and any copy a bump misses goes stale without anything
-//! noticing (#641). So the version is written once, as `workspace.package`'s
+//! The last release bump (#633) had to edit `README.md` in five places on
+//! top of `Cargo.toml`, and any copy a bump misses goes stale without
+//! anything noticing (#641). So the version is written once, as `workspace.package`'s
 //! `version` in the root `Cargo.toml`: Rust code reads it with
 //! `env!("CARGO_PKG_VERSION")`, the release workflow from `cargo metadata` and
 //! the pushed tag, and documentation names it with a placeholder such as
@@ -61,8 +61,8 @@ fn tracked_files() -> Vec<String> {
         .collect()
 }
 
-/// Whether `line` names `version` as a whole version, so `0.4.0` is found in
-/// `v0.4.0` and `zvidlib-0.4.0.crate` but not in `10.4.0` or `0.4.01`.
+/// Whether `line` names `version` as a whole version, so `1.2.3` is found in
+/// `v1.2.3` and `zvidlib-1.2.3.crate` but not in `11.2.3` or `1.2.34`.
 fn names_version(line: &str, version: &str) -> bool {
     line.match_indices(version).any(|(start, _)| {
         let before = line[..start].chars().next_back();
@@ -111,10 +111,21 @@ fn release_version_is_written_only_in_cargo_toml() {
 
 #[test]
 fn names_version_matches_whole_versions_only() {
-    for line in ["tag = \"v1.2.3\"", "zvidlib-1.2.3.crate", "version 1.2.3.", "1.2.3"] {
+    for line in [
+        "tag = \"v1.2.3\"",
+        "zvidlib-1.2.3.crate",
+        "version 1.2.3.",
+        "1.2.3",
+    ] {
         assert!(names_version(line, "1.2.3"), "{line}");
     }
-    for line in ["11.2.3", "1.2.34", "1.2.3.4", "0.1.2.3", "1.2.30 and 21.2.3"] {
+    for line in [
+        "11.2.3",
+        "1.2.34",
+        "1.2.3.4",
+        "0.1.2.3",
+        "1.2.30 and 21.2.3",
+    ] {
         assert!(!names_version(line, "1.2.3"), "{line}");
     }
 }
