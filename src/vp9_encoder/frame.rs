@@ -149,6 +149,9 @@ const MV_REF_SEARCH: [[(isize, isize); 8]; 4] = [
 /// above and left values agree.
 const PARTITION_CONTEXT: [u8; 4] = [14, 12, 8, 0];
 
+/// The border, in samples, around the copies the loop filter runs on.
+const FILTER_BORDER: usize = 8;
+
 const NEARESTMV: u8 = 10;
 const NEARMV: u8 = 11;
 const ZEROMV: u8 = 12;
@@ -295,22 +298,39 @@ enum Prediction {
     Inter(Mv),
 }
 
-/// Identifies an inter transform block's residual: its prediction depends
-/// only on where the block is and the motion vector, so blocks that agree on
-/// all of these quantize and reconstruct identically.
+/// Identifies a transform block's residual. Coding one depends only on
+/// where it is, its transform, whether it is inter, and its prediction, so
+/// blocks that agree on all of these quantize and reconstruct identically.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct ResidualKey {
-    plane: u8,
-    tx_size: u8,
-    x: u16,
-    y: u16,
-    mv: Mv,
+enum ResidualKey {
+    /// An inter prediction depends only on the position and the motion
+    /// vector.
+    Inter {
+        plane: u8,
+        tx_size: u8,
+        x: u16,
+        y: u16,
+        mv: Mv,
+    },
+    /// An intra prediction depends on the reconstruction around the block,
+    /// so it is identified by a hash of its samples, which are compared in
+    /// full on a match.
+    Intra {
+        plane: u8,
+        tx_size: u8,
+        tx_type: u8,
+        x: u16,
+        y: u16,
+        prediction: u64,
+    },
 }
 
-/// What coding one inter transform block's residual produced, for every
-/// candidate in the superblock that codes the same one. Only its token bits
-/// depend on the block's surroundings, through the nonzero context.
+/// What coding one transform block's residual produced, for every candidate
+/// in the superblock that codes the same one. Only its token bits depend on
+/// the block's surroundings, through the nonzero context.
 struct CachedResidual {
+    /// An intra block's prediction, to tell blocks apart whose hashes agree.
+    prediction: Vec<u8>,
     prediction_error: u64,
     eob: usize,
     levels: Vec<i32>,
@@ -577,8 +597,7 @@ impl<'a> FrameEncoder<'a> {
         }
         let mut errors = [None; 64];
         let mut error = |level: u8| {
-            *errors[usize::from(level)]
-                .get_or_insert_with(|| self.source_error(&self.filtered(level)))
+            *errors[usize::from(level)].get_or_insert_with(|| self.filtered_error(level))
         };
 
         let mut middle = guess.clamp(0, 63) as u8;
@@ -622,6 +641,38 @@ impl<'a> FrameEncoder<'a> {
         if level == 0 {
             return picture;
         }
+        for (plane, (data, padded_stride)) in self.filter_copy(level).iter().enumerate() {
+            let stride = picture.strides[plane];
+            for (row, output) in picture.planes[plane].chunks_exact_mut(stride).enumerate() {
+                let start = (row + FILTER_BORDER) * padded_stride + FILTER_BORDER;
+                output.copy_from_slice(&data[start..start + stride]);
+            }
+        }
+        picture
+    }
+
+    /// The squared error from the source of the reconstruction after the
+    /// loop filter at `level`, measured on the filter's own copies.
+    fn filtered_error(&self, level: u8) -> u64 {
+        if level == 0 {
+            return self.source_error(core::array::from_fn(|plane| {
+                (&self.recon.planes[plane][..], self.recon.strides[plane])
+            }));
+        }
+        let padded = self.filter_copy(level);
+        self.source_error(
+            padded
+                .each_ref()
+                .map(|(data, stride)| (&data[FILTER_BORDER * stride + FILTER_BORDER..], *stride)),
+        )
+    }
+
+    /// Copies of the reconstruction's planes after the loop filter at
+    /// `level`, with their strides. The filter works a superblock at a time
+    /// and may touch samples past the decoded area, so it runs on copies laid
+    /// out as the decoder's planes are: whole superblocks with a border of
+    /// [`FILTER_BORDER`] samples.
+    fn filter_copy(&self, level: u8) -> [(Vec<u8>, usize); 3] {
         let Geometry {
             mi_rows, mi_cols, ..
         } = self.geometry;
@@ -646,43 +697,34 @@ impl<'a> FrameEncoder<'a> {
                 size,
             );
         }
-        // The filter works a superblock at a time and may touch samples past
-        // the decoded area, so it runs on copies laid out as the decoder's
-        // planes are: whole superblocks with an 8-sample border.
-        const BORDER: usize = 8;
+        let recon = &self.recon;
         let mut padded = [0, 1, 2].map(|plane| {
             let superblock = if plane == 0 { 64 } else { 32 };
-            let stride = picture.strides[plane];
-            let rows = picture.planes[plane].len() / stride;
-            let padded_stride = stride.div_ceil(superblock) * superblock + 2 * BORDER;
-            let padded_rows = rows.div_ceil(superblock) * superblock + 2 * BORDER;
+            let stride = recon.strides[plane];
+            let rows = recon.planes[plane].len() / stride;
+            let padded_stride = stride.div_ceil(superblock) * superblock + 2 * FILTER_BORDER;
+            let padded_rows = rows.div_ceil(superblock) * superblock + 2 * FILTER_BORDER;
             let mut data = vec![0; padded_stride * padded_rows];
             for row in 0..rows {
-                let start = (row + BORDER) * padded_stride + BORDER;
+                let start = (row + FILTER_BORDER) * padded_stride + FILTER_BORDER;
                 data[start..start + stride]
-                    .copy_from_slice(&picture.planes[plane][row * stride..(row + 1) * stride]);
+                    .copy_from_slice(&recon.planes[plane][row * stride..(row + 1) * stride]);
             }
             (data, padded_stride)
         });
         let mut planes = padded.each_mut().map(|(data, stride)| FilterPlane {
             data,
             stride: *stride,
-            origin: BORDER * *stride + BORDER,
+            origin: FILTER_BORDER * *stride + FILTER_BORDER,
         });
         loopfilter::filter_frame(&mut planes, &mut masks, mi_rows, mi_cols, 0);
-        for (plane, (data, padded_stride)) in padded.iter().enumerate() {
-            let stride = picture.strides[plane];
-            for (row, output) in picture.planes[plane].chunks_exact_mut(stride).enumerate() {
-                let start = (row + BORDER) * padded_stride + BORDER;
-                output.copy_from_slice(&data[start..start + stride]);
-            }
-        }
-        picture
+        padded
     }
 
-    /// The squared error between `picture` and the source over the visible
-    /// area of every plane.
-    fn source_error(&self, picture: &Picture) -> u64 {
+    /// The squared error from the source over the visible area of every
+    /// plane of a picture, given as each plane's samples from its top-left
+    /// one, with its stride.
+    fn source_error(&self, planes: [(&[u8], usize); 3]) -> u64 {
         let geometry = &self.geometry;
         let mut error = 0;
         for (plane, width, height) in [
@@ -690,12 +732,12 @@ impl<'a> FrameEncoder<'a> {
             (1, geometry.chroma_width(), geometry.chroma_height()),
             (2, geometry.chroma_width(), geometry.chroma_height()),
         ] {
-            let stride = picture.strides[plane];
+            let (samples, stride) = planes[plane];
+            let source_stride = self.source.strides[plane];
             for row in 0..height {
-                let range = row * stride..row * stride + width;
-                error += picture.planes[plane][range.clone()]
+                error += samples[row * stride..][..width]
                     .iter()
-                    .zip(&self.source.planes[plane][range])
+                    .zip(&self.source.planes[plane][row * source_stride..][..width])
                     .map(|(&a, &b)| u64::from(a.abs_diff(b)).pow(2))
                     .sum::<u64>();
             }
@@ -1139,17 +1181,40 @@ impl<'a> FrameEncoder<'a> {
             eob: 0,
             tx_type,
         };
-        let key = inter.filter(|_| tx_size > 0).map(|mv| ResidualKey {
-            plane: plane as u8,
-            tx_size: tx_size as u8,
-            x: x as u16,
-            y: y as u16,
-            mv,
-        });
+        let key = match inter {
+            Some(mv) if tx_size > 0 => Some(ResidualKey::Inter {
+                plane: plane as u8,
+                tx_size: tx_size as u8,
+                x: x as u16,
+                y: y as u16,
+                mv,
+            }),
+            // Hashing a prediction only pays for itself on the larger
+            // transforms.
+            None if tx_size >= 2 => Some(ResidualKey::Intra {
+                plane: plane as u8,
+                tx_size: tx_size as u8,
+                tx_type: tx_type as u8,
+                x: x as u16,
+                y: y as u16,
+                prediction: block_rows(&self.recon, plane, x, y, n)
+                    .flat_map(|row| row.chunks_exact(8))
+                    .fold(0, |hash: u64, word| {
+                        let word = u64::from_le_bytes(word.try_into().expect("eight samples"));
+                        (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
+                    }),
+            }),
+            _ => None,
+        };
         if let Some(key) = &key
             && let Some(cached) = self.residual_cache.get_mut(key)
+            && (cached.prediction.is_empty()
+                || block_rows(&self.recon, plane, x, y, n)
+                    .zip(cached.prediction.chunks_exact(n))
+                    .all(|(row, cached)| row == cached))
         {
             let CachedResidual {
+                prediction: _,
                 prediction_error,
                 eob,
                 levels,
@@ -1206,11 +1271,20 @@ impl<'a> FrameEncoder<'a> {
             prediction_error += u64::from(row_error);
         }
         // Remembers an empty coding of this residual.
-        let cache_empty = |encoder: &mut Self| {
+        // An intra block's prediction, kept with its coding.
+        let mut prediction_copy = match key {
+            Some(ResidualKey::Intra { .. }) => block_rows(&self.recon, plane, x, y, n)
+                .flatten()
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut cache_empty = |encoder: &mut Self| {
             if let Some(key) = key {
                 encoder.residual_cache.insert(
                     key,
                     CachedResidual {
+                        prediction: core::mem::take(&mut prediction_copy),
                         prediction_error,
                         eob: 0,
                         levels: Vec::new(),
@@ -1312,6 +1386,7 @@ impl<'a> FrameEncoder<'a> {
             self.residual_cache.insert(
                 key,
                 CachedResidual {
+                    prediction: prediction_copy,
                     prediction_error,
                     eob,
                     levels: levels.to_vec(),
@@ -2127,6 +2202,19 @@ impl<'a> FrameEncoder<'a> {
             }
         }
     }
+}
+
+/// The rows of the `n` x `n` block of `plane` whose top-left sample is at
+/// `(x, y)`.
+fn block_rows(
+    picture: &Picture,
+    plane: usize,
+    x: usize,
+    y: usize,
+    n: usize,
+) -> impl Iterator<Item = &[u8]> {
+    let stride = picture.strides[plane];
+    (0..n).map(move |row| &picture.planes[plane][(y + row) * stride + x..][..n])
 }
 
 /// The total bits of the symbols `write` codes.
