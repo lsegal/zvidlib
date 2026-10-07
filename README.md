@@ -390,35 +390,34 @@ The repository contains a dependency-free portable core that validates native an
 
 ## Using a release
 
-`zvidlib` is published on [crates.io](https://crates.io/crates/zvidlib), with API documentation on
-[docs.rs](https://docs.rs/zvidlib). Add the latest release to a native application with:
-
-```sh
-cargo add zvidlib --features native
-```
-
-or name the release version from crates.io in `Cargo.toml` yourself:
+zvidlib is published to [crates.io](https://crates.io/crates/zvidlib), with API documentation on
+[docs.rs](https://docs.rs/zvidlib). For a native build, depend on the `zvidlib` crate:
 
 ```toml
 [dependencies]
 zvidlib = { version = "<version>", features = ["native"] }
 ```
 
-The workspace's `zvidlib-*` crates are published alongside `zvidlib` at the same version, but they are
-implementation crates: depend on `zvidlib` only. To pin a release tag instead, or to try an unreleased
-commit, use a git dependency, replacing `X.Y.Z` with the release version:
+with the latest version from crates.io in place of `<version>`, or run
+`cargo add zvidlib --features native`. The workspace's `zvidlib-*` crates are published
+alongside `zvidlib` at the same version, but they are implementation crates that `zvidlib`
+re-exports; depend on `zvidlib` only. The native API requires Rust 1.85 or later, as recorded by
+`rust-version` in `Cargo.toml`; platform codec adapters retain their documented platform capability
+checks.
+
+To pin a release tag, or to use a commit that is not yet on crates.io, use a Git dependency
+instead, with the release version in place of `X.Y.Z`:
 
 ```toml
 [dependencies]
 zvidlib = { git = "https://github.com/lsegal/zvidlib.git", tag = "vX.Y.Z", features = ["native"] }
 ```
 
-Each [GitHub release](https://github.com/lsegal/zvidlib/releases) also attaches the
-`zvidlib-X.Y.Z.crate` archive for inspection or offline packaging.
-The native API requires Rust 1.85 or later, as recorded by `rust-version` in `Cargo.toml`; platform codec
-adapters retain their documented platform capability checks.
+Each GitHub release also attaches the `.crate` archives it published, such as `zvidlib-X.Y.Z.crate`,
+for inspection or offline packaging.
 
-For a browser build, download the `zvidlib-web-vX.Y.Z.tgz` asset from the
+The browser package is not on crates.io or npm: it is a GitHub release asset. For a browser build,
+download the `zvidlib-web-vX.Y.Z.tgz` asset from the
 [latest GitHub release](https://github.com/lsegal/zvidlib/releases/latest) and install it:
 
 ```sh
@@ -431,8 +430,8 @@ and Cargo consumers must use the same release version when they exchange media o
 
 zvidlib follows pre-1.0 semantic versioning: patch releases preserve documented public API and
 behavior, while a minor release may make breaking API changes. Every release publishes its Rust
-crates to crates.io and attaches the browser package to its GitHub release; release notes call out any platform
-capability change.
+crates to crates.io and attaches its browser package to the GitHub release; release notes call out
+any platform capability change.
 
 ## Building the library
 
