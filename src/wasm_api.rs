@@ -80,6 +80,8 @@ fn error_code_for_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::InvalidState => "INVALID_STATE",
         ErrorKind::Internal => "INTERNAL",
         ErrorKind::WouldBlock => "WOULD_BLOCK",
+        // A kind a later zvidlib-core adds before this table names it.
+        _ => "INTERNAL",
     }
 }
 

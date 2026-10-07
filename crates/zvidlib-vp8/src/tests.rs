@@ -1,6 +1,6 @@
 //! Bit-exactness against libvpx on the VP8 test vectors.
 //!
-//! `tests/fixtures/codec/vp8/` holds libvpx's `vp80-00-comprehensive` vectors
+//! `crates/zvidlib-vp8/tests/fixtures/vp8/` holds libvpx's `vp80-00-comprehensive` vectors
 //! together with the `.md5` files libvpx publishes beside them: one MD5 of
 //! each shown frame's I420 output, cropped to the display size. See
 //! `tests/fixtures/codec/README.md`.

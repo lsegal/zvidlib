@@ -38,7 +38,7 @@
 //!   over those bytes, plus the RGBA allocation it fills. This is host CPU work
 //!   in every case.
 //!
-//! # Threads, and why this is not [`crate::hevc::decode_profile`]
+//! # Threads, and why this is not `crate::hevc::decode_profile`
 //!
 //! NVDEC and VideoToolbox deliver frames from a driver or framework callback
 //! that need not run on the thread that called `submit`, so the thread-local
@@ -51,7 +51,7 @@
 //! # Cost
 //!
 //! Accumulation is unconditional — no start/stop switch and no cargo feature,
-//! for the same reason [`crate::hevc::decode_profile`] leaves its scopes on the
+//! for the same reason `crate::hevc::decode_profile` leaves its scopes on the
 //! ordinary path: a gated profiler measures a build nobody ships. It costs two
 //! `Instant::now()` reads and one relaxed `fetch_add` per phase per *frame*,
 //! tens of nanoseconds against a whole-frame surface copy and colour

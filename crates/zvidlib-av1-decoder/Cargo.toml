@@ -7,6 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
 
 [dependencies]
 zvidlib-core = { workspace = true }

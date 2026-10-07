@@ -11,7 +11,7 @@
 //! every other target, `wasm32` included.
 //!
 //! The kernels fall into three dispatch sites, registered with
-//! [`zvidlib_core::simd::active_by_site`]:
+//! `zvidlib_core::simd::active_by_site`:
 //!
 //! - `vp8_encode` ([`encode_isa`]): the encoder-only kernels - [`sad16`],
 //!   [`satd4`] and [`satd`], the residual and forward DCT ([`residual_dct`]),

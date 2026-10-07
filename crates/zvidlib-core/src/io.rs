@@ -22,7 +22,7 @@ pub trait ByteSource {
 /// (e.g. a streaming HTTP upload or a pipe) must override it to return
 /// `false` *and* make `seek()` reject every call with
 /// [`ErrorKind::Unsupported`]. Callers that require a seekable sink, such as
-/// [`crate::mp4::Mp4Muxer`], check `is_seekable()` up front and never call
+/// `crate::mp4::Mp4Muxer`, check `is_seekable()` up front and never call
 /// `seek()` on a sink that reports `false`; a non-seekable sink's `seek()`
 /// implementation exists only to fail safely if that contract is ever
 /// violated.

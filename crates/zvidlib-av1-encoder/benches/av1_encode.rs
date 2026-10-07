@@ -1,11 +1,12 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's AV1 encoder-side kernels.
 //!
 //! The AV1 encoder's forward transforms are the counterpart to the inverse
-//! transforms `benches/av1_decode.rs` measures: the same block sizes, the same
-//! `Av1TxType` families, and the same `av1_simd` dispatch site, run in the
-//! encoding direction. They are measured here rather than beside the inverse
-//! sweep because they are encoder work, and a decoder target that reports
-//! encoder numbers is a target whose scope cannot be read off its name.
+//! transforms `crates/zvidlib-av1-decoder/benches/av1_decode.rs` measures: the
+//! same block sizes, the same `Av1TxType` families, and the same `av1_simd`
+//! dispatch site, run in the encoding direction. They are measured here rather
+//! than beside the inverse sweep because they are encoder work, and a decoder
+//! target that reports encoder numbers is a target whose scope cannot be read
+//! off its name.
 //!
 //! Every group runs once per instruction set `zvidlib_core::simd::available()`
 //! reports, through the crate-wide override in [`zvidlib_core::simd`], and
@@ -18,15 +19,15 @@
 //!
 //! | Group | Stage |
 //! | --- | --- |
-//! | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `src/av1_encoder/transform.rs` through `zvidlib_av1::forward_transform` |
+//! | `av1_forward_dct_{4x4,8x8,16x16,32x32}` | forward DCT, `crates/zvidlib-av1/src/av1_encoder/transform.rs` through `zvidlib_av1::forward_transform` |
 //! | `av1_forward_adst_8x8`, `av1_forward_flipadst_16x16` | the forward ADST family, including a flipped type |
-//! | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `src/av1_encoder/tile.rs` |
-//! | `av1_encode_stage_wht` | the forward 4x4 WHT, `src/av1_encoder/wht.rs` |
-//! | `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `src/av1_encoder/wht.rs` |
-//! | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `src/av1_encoder/symbol.rs` and `cdf.rs` |
-//! | `av1_encode_stage_tile` | tile encoding, `src/av1_encoder/tile.rs` |
-//! | `av1_encode_stage_coeff_ctx` | §8.3.2 `coeff_base`/`coeff_br` context derivation, `src/av1_simd/coeff.rs` |
-//! | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `src/av1_encoder/{bitwriter,headers,leb128}.rs` |
+//! | `av1_encode_frame_q{0,32,160}` | one whole frame through the public encoder, `crates/zvidlib-av1-encoder/src/tile.rs` |
+//! | `av1_encode_stage_wht` | the forward 4x4 WHT, `crates/zvidlib-av1/src/av1_encoder/wht.rs` |
+//! | `av1_encode_stage_iwht` | the lossless inverse 4x4 WHT, `crates/zvidlib-av1/src/av1_encoder/wht.rs` |
+//! | `av1_encode_stage_symbol` | symbol coding over the static CDF tables, `crates/zvidlib-av1-encoder/src/symbol.rs` and `cdf.rs` |
+//! | `av1_encode_stage_tile` | tile encoding, `crates/zvidlib-av1-encoder/src/tile.rs` |
+//! | `av1_encode_stage_coeff_ctx` | §8.3.2 `coeff_base`/`coeff_br` context derivation, `crates/zvidlib-av1/src/av1_simd/coeff.rs` |
+//! | `av1_encode_stage_bitstream` | headers, bit writing and OBU LEB128 framing, `crates/zvidlib-av1-encoder/src/{bitwriter,headers,leb128}.rs` |
 //!
 //! The whole-frame groups say what a frame costs; the per-stage groups say
 //! where that cost goes. They reach the encoder's individual stages through
@@ -51,9 +52,9 @@
 //!
 //! The block counts and the coefficient generator are the ones the groups were
 //! introduced with (issue #140, in `tests/av1_simd_bench.rs`, and then in
-//! `benches/av1_decode.rs`), so the numbers stay directly comparable with the
-//! inverse-transform groups and with everything reported for them before the
-//! move.
+//! `crates/zvidlib-av1-decoder/benches/av1_decode.rs`), so the numbers stay
+//! directly comparable with the inverse-transform groups and with everything
+//! reported for them before the move.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 
@@ -75,17 +76,17 @@ use support::FrameWork;
 use support::isa::{IsaWorkload, bench_across_isas, checksum, log_host_isas};
 
 /// Luma dimensions the kernel-level groups run over, matching
-/// `benches/av1_decode.rs`. One 1080p plane is large enough that per-call
-/// dispatch overhead is negligible next to the vectorized inner loops, and it
-/// is the size these measurements have always used, so their numbers stay
-/// comparable across the move.
+/// `crates/zvidlib-av1-decoder/benches/av1_decode.rs`. One 1080p plane is large
+/// enough that per-call dispatch overhead is negligible next to the vectorized
+/// inner loops, and it is the size these measurements have always used, so
+/// their numbers stay comparable across the move.
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
 
 /// Criterion windows for the kernel groups.
 ///
 /// Each group is measured once per available instruction set, so the default
-/// five-second window would stretch a plain `cargo bench --bench av1_encode`
+/// five-second window would stretch a plain `cargo bench -p zvidlib-av1-encoder --bench av1_encode`
 /// out for no extra resolution. Two seconds over a 1080p plane is still
 /// hundreds of iterations of work per sample.
 fn kernel_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
@@ -97,7 +98,8 @@ fn kernel_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Forward transforms (src/av1_encoder/transform.rs, src/av1_simd/transforms.rs)
+// Forward transforms (crates/zvidlib-av1/src/av1_encoder/transform.rs,
+// crates/zvidlib-av1/src/av1_simd/transforms.rs)
 // ---------------------------------------------------------------------------
 
 /// Every forward transform size and family the vector kernels cover, applied
@@ -131,7 +133,7 @@ fn av1_forward_transforms(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Whole-frame encode (src/av1_encoder/tile.rs)
+// Whole-frame encode (crates/zvidlib-av1-encoder/src/tile.rs)
 // ---------------------------------------------------------------------------
 
 /// Environment variable that opts into the 1080p-scale whole-frame group.
@@ -139,7 +141,7 @@ fn av1_forward_transforms(criterion: &mut Criterion) {
 /// One 1080p non-lossless frame is most of a second of search work, so a
 /// default `cargo bench` would stretch out for minutes. Keeping the large size
 /// opt-in leaves the default run usable in an ordinary edit loop, the same way
-/// `benches/hevc_encode.rs` gates its 1080p groups.
+/// `crates/zvidlib-hevc-encoder/benches/hevc_encode.rs` gates its 1080p groups.
 const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 
 /// The size the whole-frame groups always run.
@@ -234,7 +236,7 @@ fn av1_encode_whole_frame(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage encoder groups (src/av1_encoder/, through zvidlib_av1_encoder::bench)
+// Per-stage encoder groups (crates/zvidlib-av1-encoder/src/, through zvidlib_av1_encoder::bench)
 // ---------------------------------------------------------------------------
 
 /// CDF-coded symbols the symbol group encodes per 4x4 block.
@@ -297,11 +299,12 @@ fn stage_wht(criterion: &mut Criterion, (width, height): (u32, u32), suffix: &st
 /// The lossless inverse 4x4 WHT over the same plane's coefficients: the other
 /// half of the `av1_simd` WHT dispatch family.
 ///
-/// It is here rather than in `benches/av1_decode.rs` because the function it
-/// measures is `av1_encoder::wht::iwht4x4` — the encoder-side reconstruct and
-/// the oracle the forward transform is checked against. The AV1 decoders reach
-/// their lossless reconstruct through `av1_intra::inverse_wht_4x4`, which is a
-/// different function and not a dispatch site at all.
+/// It is here rather than in `crates/zvidlib-av1-decoder/benches/av1_decode.rs`
+/// because the function it measures is `av1_encoder::wht::iwht4x4` — the
+/// encoder-side reconstruct and the oracle the forward transform is checked
+/// against. The AV1 decoders reach their lossless reconstruct through
+/// `av1_intra::inverse_wht_4x4`, which is a different function and not a
+/// dispatch site at all.
 ///
 /// It gets its own group because the forward group cannot settle it: the
 /// forward pass runs three `transpose4`s to the inverse's two, so the shuffle

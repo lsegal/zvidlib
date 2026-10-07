@@ -1,12 +1,13 @@
 //! Exclusive-time stage attribution for a whole-frame HEVC decode.
 //!
-//! The per-stage criterion groups in `benches/hevc_decode.rs` measure each
-//! kernel in isolation: they say how fast §8.7.3 SAO is, not how much SAO a
-//! 1080p frame actually runs. That bounds what vectorizing a stage *could*
-//! buy and says nothing about what it *does* buy, which is the gap issue #189
-//! asks to close — the whole-frame `hevc_decode/<isa>` arms move only ~1.06x
-//! while the individual kernels measure 1.3x-2.4x, and only a share-of-total
-//! breakdown explains why.
+//! The per-stage criterion groups in
+//! `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs` measure each kernel in
+//! isolation: they say how fast §8.7.3 SAO is, not how much SAO a 1080p frame
+//! actually runs. That bounds what vectorizing a stage *could* buy and says
+//! nothing about what it *does* buy, which is the gap issue #189 asks to close
+//! — the whole-frame `hevc_decode/<isa>` arms move only ~1.06x while the
+//! individual kernels measure 1.3x-2.4x, and only a share-of-total breakdown
+//! explains why.
 //!
 //! This module is that breakdown. [`scope`] opens a stage; the returned guard
 //! closes it on drop. Scopes nest, and time is attributed *exclusively*: the

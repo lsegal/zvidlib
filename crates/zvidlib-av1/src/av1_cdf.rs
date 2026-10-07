@@ -5,7 +5,7 @@
 //! context 0, and the `TX_4X4` coefficient tables, which the non-lossless additions at the bottom of
 //! this module extend to the larger square transforms. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
-//! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
+//! `gamut_bitstream::SymbolEncoder::encode_symbol` (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
 //!
 //! The inter-frame tables below (`IS_INTER` through `MV_FR`) extend the same bounded slice to the
@@ -70,7 +70,7 @@ pub static PARTITION_W64: [[u16; 10]; 4] = [
     ],
 ];
 
-/// `Default_Skip_Cdf`, indexed [ctx].
+/// `Default_Skip_Cdf`, indexed \[ctx\].
 pub static SKIP: [[u16; 2]; 3] = [[31671, 32768], [16515, 32768], [4576, 32768]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf[0][0]` (above/left both `DC_PRED`).
@@ -106,7 +106,7 @@ pub fn coeff_qctx(base_q_idx: u8) -> usize {
 }
 
 /// The transform-size context the coefficient CDFs are selected by. The
-/// specification derives it as `(Tx_Size_Sqr[txSz] + Tx_Size_Sqr_Up[txSz] +
+/// specification derives it as `(Tx_Size_Sqr\[txSz\] + Tx_Size_Sqr_Up\[txSz\] +
 /// 1) >> 1`; for the square transforms this crate codes both terms are the
 /// transform's own size, so the context is `log2(size) - 2`: `TX_4X4` is 0
 /// through `TX_64X64` at 4.
@@ -438,7 +438,7 @@ pub fn eob_pt_cdf(qctx: usize, size: usize, plane_type: usize) -> &'static [u16]
 /// `Coeff_Base_Ctx_Offset` (§8.3.2) for `TX_CLASS_2D`, as the closed form
 /// the specification's per-size tables all expand to: the offset depends
 /// only on the anti-diagonal `row + col` the position sits on, so one rule
-/// covers every square transform size. [`COEFF_BASE_CTX_OFFSET_4X4`] is the
+/// covers every square transform size. `COEFF_BASE_CTX_OFFSET_4X4` is the
 /// TX_4X4 slice of exactly this rule (asserted by this module's tests), and
 /// the position `(0, 0)` never reaches here - `coeff_base`'s DC context is
 /// 0 unconditionally.

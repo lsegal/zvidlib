@@ -453,7 +453,7 @@ macro_rules! dispatch {
     };
 }
 
-/// The vector [`crate::predict::predict_subblock_scalar`], or `false`
+/// The vector `crate::predict::predict_subblock_scalar`, or `false`
 /// when the active instruction set has none.
 pub fn subblock(
     mode: u8,
@@ -469,7 +469,7 @@ pub fn subblock(
     )
 }
 
-/// The vector [`crate::predict::idct_dc_add_row_scalar`] over `dcs`, 2
+/// The vector `crate::predict::idct_dc_add_row_scalar` over `dcs`, 2
 /// or 4 blocks, or `false` when the active instruction set has none.
 pub fn idct_dc_add_row(dcs: &[i16], plane: &mut [u8], offset: usize, stride: usize) -> bool {
     assert!(matches!(dcs.len(), 2 | 4), "a row of 2 or 4 blocks");

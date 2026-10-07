@@ -5,8 +5,8 @@ use crate::{Error, ErrorKind, Limits, Result, SampleRange};
 #[non_exhaustive]
 pub enum Container {
     Mp4,
-    /// The WebM subset of Matroska, read by [`crate::WebmDemuxer`] and
-    /// written by [`crate::webm::WebmMuxer`].
+    /// The WebM subset of Matroska, read by `crate::WebmDemuxer` and
+    /// written by `crate::webm::WebmMuxer`.
     WebM,
 }
 
@@ -43,15 +43,15 @@ impl Container {
 #[non_exhaustive]
 pub enum Codec {
     UncompressedVideo,
-    /// H.264/AVC video. MP4 passthrough only: [`crate::Mp4Demuxer`] reads
-    /// `avc1`/`avc3` sample entries and [`crate::mp4::Mp4Muxer`] writes `avc1`,
+    /// H.264/AVC video. MP4 passthrough only: `crate::Mp4Demuxer` reads
+    /// `avc1`/`avc3` sample entries and `crate::mp4::Mp4Muxer` writes `avc1`,
     /// with an `avcC` box as the decoder configuration. No encoder or decoder
     /// factory accepts it.
     H264,
     Hevc,
     Av1,
     /// VP8 video, as carried in WebM (`V_VP8`). It has no decoder
-    /// configuration record. [`crate::native_vp8_video_decoder_factory`]
+    /// configuration record. `crate::native_vp8_video_decoder_factory`
     /// decodes it; no encoder factory accepts it.
     Vp8,
     /// VP9 video, carried in MP4 as a `vp09` sample entry whose decoder
@@ -62,11 +62,11 @@ pub enum Codec {
     /// Opus audio (RFC 6716). MP4 carries it in an `Opus` sample entry whose
     /// decoder configuration is a `dOps` box; Matroska and WebM carry the
     /// RFC 7845 `OpusHead` identification header as `CodecPrivate`. See
-    /// [`crate::OpusHead`].
+    /// `crate::OpusHead`.
     Opus,
     /// Vorbis I audio. There is no widely supported MP4 mapping for Vorbis, so
     /// it has no MP4 sample entry; Matroska and WebM carry its three setup
-    /// headers Xiph-laced as `CodecPrivate`. See [`crate::VorbisConfig`].
+    /// headers Xiph-laced as `CodecPrivate`. See `crate::VorbisConfig`.
     Vorbis,
 }
 

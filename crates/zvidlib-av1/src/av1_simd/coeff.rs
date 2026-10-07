@@ -26,7 +26,7 @@
 //! A neighbour at `(row + dr, col + dc)` is defined as zero once it leaves the
 //! block, and both offset tables reach at most two rows down and two columns
 //! right. Rather than branch per lane, the caller keeps the levels in a plane
-//! padded by [`MAX_ROW_OFFSET`] zero rows and [`MAX_COL_OFFSET`] zero columns
+//! padded by `MAX_ROW_OFFSET` zero rows and `MAX_COL_OFFSET` zero columns
 //! (plus a vector's worth of slack so a full-width load at the last column
 //! stays in bounds), which turns each neighbour into an unaligned load. The
 //! padding is written once when the plane is sized and never again: a block only
@@ -84,7 +84,7 @@ pub(crate) const fn padded_len(size: usize) -> usize {
 
 /// The instruction set this dispatch family will actually run.
 ///
-/// Registered as the `av1_coeff_ctx` site of [`crate::simd::active_by_site`].
+/// Registered as the `av1_coeff_ctx` site of `crate::simd::active_by_site`.
 /// Like every other site it consults [`crate::simd::set_override`] first and
 /// falls back to its own cached CPU probe, so pinning an instruction set reaches
 /// the coefficient contexts and a benchmark can prove that it did.

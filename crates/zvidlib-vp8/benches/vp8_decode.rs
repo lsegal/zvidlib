@@ -1,7 +1,7 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's pure-Rust VP8 software decoder
 //! (issue #568).
 //!
-//! The decode-side counterpart to `benches/vp8_encode.rs`, which times the
+//! The decode-side counterpart to `crates/zvidlib-vp8/benches/vp8_encode.rs`, which times the
 //! reconstruction kernels the encoder and decoder share (`vp8_recon`). This
 //! target times what only the decoder runs, and the decoder as a whole. Every
 //! group runs once per instruction set `zvidlib_core::simd::available()` reports,

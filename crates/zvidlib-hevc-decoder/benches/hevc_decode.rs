@@ -1,15 +1,16 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's pure-Rust HEVC software decoder.
 //!
-//! The companion to `benches/av1_decode.rs`, for the other software decoder.
-//! It answers three questions separately: how fast a whole 1080p HEVC frame
-//! decodes, how much of that is the decoder's own work rather than the RGBA
-//! output conversion every application pays on the way out, and where the time
-//! inside a decode goes. Every group runs once per
-//! instruction set `zvidlib_core::simd::available()` reports, through the crate-wide
-//! override in [`zvidlib_core::simd`], and `benches/support/isa.rs` asserts both that
-//! each arm is bit-exact with scalar before timing it and that the override
-//! really landed in every dispatch family — so a reported speedup cannot come
-//! from a kernel that quietly diverged or a switch that never took effect.
+//! The companion to `crates/zvidlib-av1-decoder/benches/av1_decode.rs`, for the
+//! other software decoder. It answers three questions separately: how fast a
+//! whole 1080p HEVC frame decodes, how much of that is the decoder's own work
+//! rather than the RGBA output conversion every application pays on the way
+//! out, and where the time inside a decode goes. Every group runs once per
+//! instruction set `zvidlib_core::simd::available()` reports, through the
+//! crate-wide override in [`zvidlib_core::simd`], and `benches/support/isa.rs`
+//! asserts both that each arm is bit-exact with scalar before timing it and
+//! that the override really landed in every dispatch family — so a reported
+//! speedup cannot come from a kernel that quietly diverged or a switch that
+//! never took effect.
 //!
 //! # Groups
 //!

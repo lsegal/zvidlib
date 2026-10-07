@@ -11,6 +11,7 @@
 use crate::codec::CodecProfile;
 use crate::media::Codec;
 use crate::{Av1CodecConfigurationRecord, Error, ErrorKind, Limits, Result};
+#[doc(inline)]
 pub use zvidlib_core::codec_config::Vp9CodecConfig;
 use zvidlib_core::codec_config::box_payload;
 

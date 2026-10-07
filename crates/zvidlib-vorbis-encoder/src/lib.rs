@@ -48,7 +48,7 @@ const VENDOR: &str = concat!(
 /// chooses for that nominal rate. The encoder config's `decoder_config` is the
 /// stream's three header packets Xiph-laced, the `CodecPrivate` Matroska and
 /// WebM carry ([`VorbisConfig::from_codec_private`]): Vorbis has no MP4 sample
-/// entry, so [`crate::mp4::Mp4Muxer`] refuses it.
+/// entry, so `crate::mp4::Mp4Muxer` refuses it.
 ///
 /// Each emitted [`EncodedSample`] spans the samples its packet decodes to - the
 /// first spans none - so a stream's priming is zero, and the drained

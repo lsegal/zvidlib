@@ -2,7 +2,7 @@
 //! conversion.
 //!
 //! This is the pass every decoded picture takes on its way out of
-//! [`super::picture_to_rgba`]: the fixed BT.601/709 limited-range integer
+//! `super::picture_to_rgba`: the fixed BT.601/709 limited-range integer
 //! matrix, applied per sample, with the chroma planes read at half resolution
 //! in both directions. It is not decoding, but it is on the path of both
 //! whole-frame benchmark groups, and the issue #189 stage attribution recorded
@@ -32,7 +32,7 @@
 //!
 //! # Bit-exactness
 //!
-//! Every backend is **bit-exact** with [`convert_row_scalar`], which is the
+//! Every backend is **bit-exact** with `convert_row_scalar`, which is the
 //! reference the shipped scalar path uses and which
 //! `canonical_conversion_uses_decoder_integer_rounding` in [`super`] pins. The
 //! arithmetic is plain `i32` throughout, in the same order, and the `>> 16` is
@@ -53,7 +53,7 @@
 //! [`crate::simd::override_isa`] ahead of that cache on every call, so
 //! `simd::set_override` reaches this kernel the way it reaches the engine's.
 //! The site is reported as `hevc_color_convert` by
-//! [`crate::simd::active_by_site`].
+//! `crate::simd::active_by_site`.
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;

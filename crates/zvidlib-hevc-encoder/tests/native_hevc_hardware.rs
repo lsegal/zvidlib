@@ -349,12 +349,14 @@ fn a_cold_hardware_seek_costs_this_much() {
 
 // ---- Hardware HEVC encoding (issue #486) ----
 //
-// What a stream from the hardware encoder `Require` selects has to survive: the encoder
-// conformance runner, `Mp4Muxer` and `Mp4Demuxer`, BGRA and bottom-up input, and being abandoned
-// mid-stream. Which encoder a preference selects, and the 1080p30 real-time bar, are
-// `tests/native_hevc_encoder.rs`. Written against VideoToolbox, the backend a hosted runner can
-// reach (`macos-latest`); every test skips itself on a host with no hardware encoder, the way
-// the decoder tests above do.
+// What a stream from the hardware encoder `Require` selects has to survive: the
+// encoder conformance runner, `Mp4Muxer` and `Mp4Demuxer`, BGRA and bottom-up
+// input, and being abandoned mid-stream. Which encoder a preference selects,
+// and the 1080p30 real-time bar, are
+// `crates/zvidlib-hevc-encoder/tests/native_hevc_encoder.rs`. Written against
+// VideoToolbox, the backend a hosted runner can reach (`macos-latest`); every
+// test skips itself on a host with no hardware encoder, the way the decoder
+// tests above do.
 
 /// A 30 fps clock.
 const TIMESCALE: u32 = 90_000;

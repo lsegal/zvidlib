@@ -17,7 +17,7 @@
 //! reconstructed data, independent of the entropy/prediction pipeline in
 //! [`crate::av1_intra_decoder`] and [`crate::av1_inter_decoder`]. The
 //! registered [`crate::VideoDecoderFactory`] (`crate::av1_decoder`,
-//! [`crate::native_av1_video_decoder_factory`]) only calls
+//! `crate::native_av1_video_decoder_factory`) only calls
 //! [`convert_to_rgba8`], the final output-conversion stage: it decodes with
 //! `crate::av1_dec`, which carries its own bit-exact implementation of every
 //! in-loop filter, so the other stages in this module are exercised only by
@@ -63,6 +63,7 @@
 
 use crate::{Error, ErrorKind, Limits, Result};
 
+#[doc(inline)]
 pub use zvidlib_color::frame::{FilterFrame, FilterPlane, MatrixCoefficients, convert_to_rgba8};
 
 // ---------------------------------------------------------------------

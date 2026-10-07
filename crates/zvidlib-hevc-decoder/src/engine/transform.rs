@@ -20,7 +20,7 @@
 //! * §8.6.4 **transformation process for scaled transform
 //!   coefficients** ([`inverse_transform`]) — the separable inverse
 //!   transform. Each column then each row is passed through the
-//!   §8.6.4.2 one-dimensional transform ([`transform_1d`]); the
+//!   §8.6.4.2 one-dimensional transform (`transform_1d`); the
 //!   `trType == 1` 4x4 alternate transform (the DST-VII matrix of
 //!   equation 8-316) is selected only for `MODE_INTRA` 4x4 luma
 //!   blocks, every other block uses the `trType == 0` partial-butterfly
@@ -619,7 +619,7 @@ pub(crate) fn transform_basis(n_tbs: usize, tr_type: bool) -> (&'static [i32], u
 ///
 /// [`inverse_transform`] produces bit-identical output through the
 /// vectorized `i32` kernels for every block whose coefficient range fits
-/// (see [`fits_i32_accumulation`]); this is what runs for the wider
+/// (see `fits_i32_accumulation`); this is what runs for the wider
 /// extended-precision ranges, and what the SIMD backends are tested
 /// against.
 ///

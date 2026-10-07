@@ -8,7 +8,7 @@
 //! encoder and [`crate::av1_intra_decoder`] necessarily agree on every table they share and on
 //! the quantizer and transform-size context each symbol is selected by. CDFs are stored in the spec's cumulative form (rising to 32768)
 //! with the trailing adaptation-count element dropped, so each row is ready to pass straight to
-//! [`gamut_bitstream::SymbolEncoder::encode_symbol`] (the M0 frame sets `disable_cdf_update = 1`,
+//! `gamut_bitstream::SymbolEncoder::encode_symbol` (the M0 frame sets `disable_cdf_update = 1`,
 //! so the tables are never adapted). These values are extracted verbatim from the specification.
 
 // --- Partition CDFs (Default_Partition_W*_Cdf), indexed [ctx]. ---
@@ -66,7 +66,7 @@ pub static PARTITION_W64: [[u16; 10]; 4] = [
     ],
 ];
 
-/// `Default_Skip_Cdf`, indexed [ctx].
+/// `Default_Skip_Cdf`, indexed \[ctx\].
 pub static SKIP: [[u16; 2]; 3] = [[31671, 32768], [16515, 32768], [4576, 32768]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf[0][0]` (above/left both `DC_PRED`).

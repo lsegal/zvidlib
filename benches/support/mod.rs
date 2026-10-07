@@ -139,9 +139,10 @@ pub fn aac_mono_track() -> &'static BundledAacTrack {
 
 /// A libvorbis-encoded Vorbis fixture, split into packets once per process.
 ///
-/// The fixtures are the ones `tests/vorbis_codec.rs` checks the decoder against
-/// libvorbis's own decode with, so a Vorbis benchmark times the same streams
-/// the decoder is held correct on.
+/// The fixtures are the ones
+/// `crates/zvidlib-vorbis-encoder/tests/vorbis_codec.rs` checks the decoder
+/// against libvorbis's own decode with, so a Vorbis benchmark times the same
+/// streams the decoder is held correct on.
 pub struct VorbisFixture {
     pub config: VorbisConfig,
     pub packets: Vec<EncodedAudioSample>,

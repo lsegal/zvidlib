@@ -1,6 +1,6 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's native VP8 encoder.
 //!
-//! The encoder's kernels dispatch through two sites in `src/vp8/simd/`:
+//! The encoder's kernels dispatch through two sites in `crates/zvidlib-vp8/src/simd/`:
 //! `vp8_encode`, the encoder-only distortion metrics, forward transforms and
 //! quantization, and `vp8_recon`, the reconstruction and loop filter the
 //! encoder shares with the decoder so that its reference frames are the
@@ -60,7 +60,7 @@ use support::isa::{IsaWorkload, bench_across_isas, log_host_isas};
 ///
 /// The encoder takes most of half a second for a 1080p frame on one core, so
 /// four of them per arm would stretch a default `cargo bench` out for minutes,
-/// the same reason `benches/av1_encode.rs` gates its 1080p groups.
+/// the same reason `crates/zvidlib-av1-encoder/benches/av1_encode.rs` gates its 1080p groups.
 const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 
 /// The size every group runs at.
@@ -137,7 +137,7 @@ fn vp8_encode_whole_frame(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-stage groups (src/vp8/, through zvidlib_vp8::bench)
+// Per-stage groups (crates/zvidlib-vp8/src/, through zvidlib_vp8::bench)
 // ---------------------------------------------------------------------------
 
 /// A deterministic plane: a gradient with texture and noise, so neither a

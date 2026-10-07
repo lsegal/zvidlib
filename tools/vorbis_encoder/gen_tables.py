@@ -7,7 +7,7 @@ Usage (re-runnable, idempotent):
 
 The argument is an unpacked libvorbis 1.3.7 source release
 (https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.gz).
-Output goes to src/vorbis_encoder/tables/*.rs (files whose name starts with
+Output goes to crates/zvidlib-vorbis-encoder/src/vorbis_encoder/tables/*.rs (files whose name starts with
 `gen_`); every generated file carries a header naming its sources.
 
 What it does:
@@ -26,7 +26,7 @@ What it does:
   members of the residue templates are only used by bitrate-managed (ABR/CBR)
   mode, which this port does not implement, so they are not followed;
 * writes Rust `static` items using the struct definitions of
-  src/vorbis_encoder/tables/types.rs.
+  crates/zvidlib-vorbis-encoder/src/vorbis_encoder/tables/types.rs.
 
 Float values are printed as the shortest decimal that round-trips to the same
 f32/f64, so the Rust tables are bit-identical to what a C compiler produces.

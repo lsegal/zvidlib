@@ -6,9 +6,12 @@
 //! `zvidlib_core::simd`'s process-wide instruction-set override. See
 //! `benches/README.md` for how to run and filter it.
 //!
-//! The per-codec targets own their own measurements: `benches/hevc_decode.rs`,
-//! `benches/av1_decode.rs`, `benches/hevc_encode.rs`, `benches/audio_decode.rs`,
-//! `benches/audio_mux.rs` and `benches/vpx_decode.rs`.
+//! The per-codec targets own their own measurements:
+//! `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`,
+//! `crates/zvidlib-av1-decoder/benches/av1_decode.rs`,
+//! `crates/zvidlib-hevc-encoder/benches/hevc_encode.rs`,
+//! `benches/audio_decode.rs`, `benches/audio_mux.rs` and
+//! `benches/vpx_decode.rs`.
 
 mod support;
 
@@ -132,18 +135,19 @@ fn isa_luma_plane() -> &'static [u8] {
 /// `av1_simd`, which the in-loop filters dispatch to.
 ///
 /// The group is `av1_deblock_luma` rather than `av1_deblock`, which is the name
-/// it carried until issue #414. `benches/av1_decode.rs` has a group of its own
+/// it carried until issue #414.
+/// `crates/zvidlib-av1-decoder/benches/av1_decode.rs` has a group of its own
 /// called `av1_deblock` - the narrow-filter member of its deblocking trio - and
 /// criterion keys a group by its name alone, so two targets claiming one name
 /// write the same `target/criterion/av1_deblock/<isa>` directory and the one
 /// that runs second is the only one a collected baseline can still see. The two
 /// measure different things: this one is a synthetic 1080p plane at level 24,
 /// the other a structured plane at level 32, and their `scalar` arms are 27%
-/// apart because the scalar path branches per position on the filter mask
-/// while the vector kernels do fixed masked work per lane and land within 0.1%
-/// of each other. That is the whole of what #414 reports as a 25% regression:
-/// the two committed tables collected opposite sides of the collision, because
-/// the draws ran the targets in opposite orders. The name pairs with
+/// apart because the scalar path branches per position on the filter mask while
+/// the vector kernels do fixed masked work per lane and land within 0.1% of
+/// each other. That is the whole of what #414 reports as a 25% regression: the
+/// two committed tables collected opposite sides of the collision, because the
+/// draws ran the targets in opposite orders. The name pairs with
 /// [`av1_deblock_chroma_by_isa`] below, which is this group's chroma half.
 fn av1_deblock_by_isa(criterion: &mut Criterion) {
     let plane = isa_luma_plane();

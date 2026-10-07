@@ -45,6 +45,7 @@
 
 #[cfg(test)]
 use zvidlib_core::simd::test_lock;
+#[doc(inline)]
 pub use zvidlib_core::simd::{SimdIsa, active, available, detected, set_override};
 
 /// The instruction set every individual dispatch site resolves to right now,

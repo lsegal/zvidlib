@@ -18,7 +18,7 @@ static OVERRIDE: AtomicU8 = AtomicU8::new(0);
 ///
 /// The override reaches every dispatch family: the AV1 transform and in-loop
 /// filter kernels, AV1 motion compensation (through the default level
-/// [`crate::av1_mc::McContext::new`] picks up), AV1 intra prediction, the
+/// `crate::av1_mc::McContext::new` picks up), AV1 intra prediction, the
 /// Vorbis encoder's analysis kernels, the VP8 encoder, reconstruction and
 /// decoder kernels, every VP9 decoder kernel, every HEVC engine kernel, the
 /// AV1, VP8 and VP9 output color conversion, the Vorbis decoder's synthesis

@@ -11,7 +11,7 @@
 //!   source row) and for the vertical pass (the taps are consecutive rows
 //!   of the intermediate buffer) alike.
 //! * [`combine_weighted`] — the sample combine
-//!   `out[i] = Clip3( 0, max, ( ( Σ w[t] · tap[t][i] ) + round ) >> shift
+//!   `out\[i\] = Clip3( 0, max, ( ( Σ w\[t\] · tap\[t\]\[i\] ) + round ) >> shift
 //!   + post )`. The §8.5.3.3.4.2 default uni-/bi-predictive average and
 //!   the §8.5.3.3.4.3 explicit weighted combine are both instances of it.
 //!
@@ -1171,7 +1171,7 @@ fn filter_taps_tail<const N: usize>(
 // Weighted sample combine
 // ---------------------------------------------------------------------------
 
-/// `out[i] = Clip3( 0, max_val, ( ( ( Σ weights[t] · taps[t][i] ) + round )
+/// `out\[i\] = Clip3( 0, max_val, ( ( ( Σ weights\[t\] · taps\[t\]\[i\] ) + round )
 /// >> shift ) + post )` for every `i` in `out`, on the requested backend.
 ///
 /// `N` is 1 for the uni-predictive combines (§8.5.3.3.4.2 equations

@@ -2,12 +2,12 @@
 //!
 //! This module intentionally provides syntax/state only; it does not
 //! implement pixel reconstruction. The bounded lossless monochrome
-//! reconstruction in [`crate::av1_intra_decoder`] and
-//! [`crate::av1_inter_decoder`] is kept for its own callers; the registered
-//! [`VideoDecoderFactory`](crate::VideoDecoderFactory) in `crate::av1_decoder`
-//! ([`native_av1_video_decoder_factory`](crate::native_av1_video_decoder_factory))
-//! decodes with the complete Main-profile decoder in `crate::av1_dec`, which
-//! carries its own header parsing.
+//! reconstruction in `zvidlib::av1_intra_decoder` and
+//! `zvidlib::av1_inter_decoder` is kept for its own callers; the registered
+//! [`VideoDecoderFactory`](zvidlib_core::VideoDecoderFactory),
+//! `zvidlib::native_av1_video_decoder_factory`, decodes with the complete
+//! Main-profile decoder in `zvidlib-av1-decoder`, which carries its own header
+//! parsing.
 
 use zvidlib_core::{Error, ErrorKind, Limits, Result};
 

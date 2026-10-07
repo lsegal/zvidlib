@@ -26,7 +26,7 @@ const CONFIGURATION_HELP: &str = "the native VP8 encoder's configuration is empt
 /// The encoder accepts [`Codec::Vp8`] with [`CodecProfile::Vp8`] and
 /// limited-range [`PixelFormat::Rgba8`] or [`PixelFormat::Bgra8`] CPU
 /// frames of any size up to 16383 pixels a side, top-down or bottom-up, and
-/// emits one VP8 frame per sample, ready for [`crate::WebmMuxer`]. VP8 has no
+/// emits one VP8 frame per sample, ready for `crate::WebmMuxer`. VP8 has no
 /// codec configuration record, so [`EncoderConfig::decoder_config`] is empty.
 ///
 /// It is a dependency-free, pure-Rust implementation that codes key frames

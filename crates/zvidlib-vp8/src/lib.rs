@@ -9,7 +9,7 @@
 //! segmentation, the normal and simple loop filters, and last, golden and
 //! alternate reference frames with their sign bias, copies and probability
 //! persistence. Its output matches libvpx bit for bit on the VP8 test vectors
-//! in `tests/fixtures/codec/vp8/`.
+//! in `crates/zvidlib-vp8/tests/fixtures/vp8/`.
 //!
 //! Each [`EncodedVideoSample`] holds exactly one VP8 frame, as an IVF frame or
 //! a WebM block does. A hidden frame (`show_frame` = 0, typically an

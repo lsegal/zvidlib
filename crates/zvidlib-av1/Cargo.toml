@@ -7,6 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Tests, their fixtures and benchmarks are not needed to build the crate.
+exclude = ["/tests", "/benches"]
 
 [dependencies]
 zvidlib-core = { workspace = true }
@@ -25,8 +27,8 @@ zvidlib-container = { path = "../zvidlib-container" }
 simd = []
 
 # Criterion drives its own harness (`harness = false`), so the bench targets must
-# not link libtest. Every codec group lives in this one target so the shared
-# `benches/support/` fixture cache is loaded and decoded once per process.
+# not link libtest. Every group of this target shares one process so the
+# `benches/support/` fixture cache is loaded and decoded once.
 [[bench]]
 name = "codec"
 harness = false

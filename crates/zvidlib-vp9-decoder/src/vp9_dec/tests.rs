@@ -170,7 +170,7 @@ pub fn webm_frames(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The libvpx VP9 profile 0 test vectors, listed in
-/// `tests/fixtures/codec/libvpx_vp9_test_vectors.txt` (the profile 0 part of
+/// `crates/zvidlib-vp9-decoder/tests/fixtures/libvpx_vp9_test_vectors.txt` (the profile 0 part of
 /// `test/test_vectors.cc`).
 const LIBVPX_VECTORS: &str = include_str!("../../tests/fixtures/libvpx_vp9_test_vectors.txt");
 

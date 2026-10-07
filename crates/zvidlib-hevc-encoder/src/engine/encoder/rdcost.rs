@@ -3,8 +3,8 @@
 //! Mode and motion decisions evaluate the same two block distortion metrics over every
 //! candidate partition, which is where an encoder spends most of its CPU time:
 //!
-//! - [`sad`], the sum of absolute differences between a source block and a prediction.
-//! - [`satd`], the sum of absolute Hadamard-transformed differences, a closer proxy for the
+//! - `sad`, the sum of absolute differences between a source block and a prediction.
+//! - `satd`, the sum of absolute Hadamard-transformed differences, a closer proxy for the
 //!   number of bits the transform stage will spend on the residual.
 //!
 //! Both dispatch once per call through cached runtime CPU feature detection ([`isa`]) to an

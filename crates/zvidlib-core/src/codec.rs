@@ -155,7 +155,7 @@ pub trait VideoEncoder {
 /// The concern behind issue #174 was that a mediocre encoder shipped under
 /// this crate's name is worse for callers than none, because it is harder to
 /// route around. A port of the reference encoder answers that concern where an
-/// original design could not. [`crate::MediaOutput`] muxes an audio track
+/// original design could not. `crate::MediaOutput` muxes an audio track
 /// given any `AudioEncoder`, so a caller with an encoder of its own still
 /// plugs it in here.
 pub trait AudioEncoder {
@@ -468,17 +468,14 @@ pub const SEEK_LATENCY_BUDGET: Duration = Duration::from_millis(50);
 /// Already-decoded pictures spread over a track, which a seek may answer from.
 ///
 /// This is a trait rather than the concrete index because [`ExactFrameReader`] is portable and
-/// [`previews::PreviewIndex`] is not - its pass owns a thread, so it is native-only - and a
+/// `zvidlib::previews::PreviewIndex` is not - its pass owns a thread, so it is native-only - and a
 /// reader that named the concrete type could not be built for the browser at all, which is the
 /// target that needs the tier most. An implementation must not decode and must not wait on a
 /// decoder: what it returns is a picture it already had, or nothing.
 ///
 /// Issue #432 gave the browser its own implementation. What answers a seek on either target is
-/// now the same [`previews::PreviewStore`]; what differs is only what fills it, a thread in
-/// [`previews::PreviewIndex`] against an idle callback in `crate::web_previews`.
-///
-/// [`previews::PreviewIndex`]: crate::previews::PreviewIndex
-/// [`previews::PreviewStore`]: crate::previews::PreviewStore
+/// now the same `zvidlib::previews::PreviewStore`; what differs is only what fills it, a thread in
+/// `zvidlib::previews::PreviewIndex` against an idle callback in `zvidlib::web_previews`.
 pub trait SeekPreviewSource: Send + Sync {
     /// The kept picture closest to `frame` and the frame it is actually of, or `None` while
     /// nothing near that position has been decoded.
@@ -598,11 +595,9 @@ impl ExactFrameReader {
 
     /// Attaches (or, with `None`, detaches) the preview source [`Self::seek`] answers from.
     ///
-    /// The source is normally a [`previews::PreviewIndex`] filling itself on a decoder of its
+    /// The source is normally a `zvidlib::previews::PreviewIndex` filling itself on a decoder of its
     /// own, and it is shared rather than owned so a reader can start answering seeks from it
     /// while its pass is still walking the track.
-    ///
-    /// [`previews::PreviewIndex`]: crate::previews::PreviewIndex
     pub fn set_seek_previews(&mut self, previews: Option<Arc<dyn SeekPreviewSource>>) {
         self.seek_previews = previews;
     }

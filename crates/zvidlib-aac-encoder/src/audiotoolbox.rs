@@ -1,7 +1,7 @@
 //! macOS AudioToolbox AAC-LC backend for [`crate::AudioEncoder`].
 //!
 //! Encodes 32-bit float interleaved PCM to AAC-LC through `AudioConverter`'s
-//! pull model: [`AudioConverterFillComplexBuffer`] calls [`input_proc`] back
+//! pull model: [`AudioConverterFillComplexBuffer`] calls `input_proc` back
 //! for source frames as it needs them, one 1024-sample AAC-LC frame per call
 //! here since the source and destination sample rates always match (no
 //! resampling is asked of the converter).
@@ -24,7 +24,7 @@ use super::{FRAME_LENGTH, esds_box, gapless_padding};
 pub type OSStatus = i32;
 pub type AudioConverterRef = *mut c_void;
 
-/// A sentinel this module's own [`input_proc`], and the AAC decoder's in
+/// A sentinel this module's own `input_proc`, and the AAC decoder's in
 /// `native_audio`, return from `AudioConverterFillComplexBuffer`'s pull
 /// callback to say no more source data is available for the current call. Not a system `OSStatus`: the
 /// converter passes whatever the callback returns straight back to its

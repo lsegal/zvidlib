@@ -605,7 +605,8 @@ fn larger_partitions_and_transforms_shrink_the_stream_at_no_loss_of_quality() {
     }
 }
 
-/// The RGBA test card of `tests/native_vp9_encoder.rs`: gradients under a
+/// The RGBA test card of
+/// `crates/zvidlib-vp9-encoder/tests/native_vp9_encoder.rs`: gradients under a
 /// checkerboard of sharp-edged squares, panning two samples a frame.
 fn test_card_frame(width: u32, height: u32, index: u32) -> VideoFrame {
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);

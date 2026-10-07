@@ -9,15 +9,20 @@
 // The library is a workspace of codec, container and shared-core crates
 // (#604); these re-export their modules under the paths they had when they
 // were modules of this crate.
+#[doc(inline)]
 pub use zvidlib_av1::{
     av1_entropy, av1_filters, av1_inter_decoder, av1_intra, av1_intra_decoder, av1_intra_pred,
     av1_mc, av1_simd,
 };
+#[doc(inline)]
 pub use zvidlib_av1_syntax as av1;
+#[doc(inline)]
 pub use zvidlib_container::{
     codec_config, conformance, container, cover, mp4, mp4_demux, webm, webm_demux,
 };
+#[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
+#[doc(inline)]
 pub use zvidlib_opus as opus;
 pub mod output;
 pub mod playback;
@@ -86,11 +91,14 @@ pub mod web_previews;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use wasm_api::*;
 
+#[doc(no_inline)]
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
+#[doc(no_inline)]
 pub use audio::{
     AacDecoder, AacSampleReader, AudioDecoder, AudioEdit, AudioSampleReader, AudioTrackTiming,
     EncodedAudioSample,
 };
+#[doc(no_inline)]
 pub use av1::{
     Av1CodecConfigurationRecord, Av1ColorConfig, Av1FrameHeader, Av1FrameType, Av1Metadata, Av1Obu,
     Av1ObuHeader, Av1ObuType, Av1OperatingPoint, Av1Parser, Av1SequenceHeader, Av1SyntaxSupport,
@@ -102,27 +110,36 @@ pub use av1::{
 /// Internal and unstable, and the AV1 counterpart to [`hevc_encoder_bench`]:
 /// the encoder's forward WHT, symbol coder, tile encoder and bitstream writers
 /// are not otherwise reachable from a benchmark, which is a separate crate.
-/// See `benches/av1_encode.rs`.
+/// See `crates/zvidlib-av1-encoder/benches/av1_encode.rs`.
 #[doc(hidden)]
 pub use av1_encoder::bench as av1_encoder_bench;
+#[doc(inline)]
 pub use av1_encoder::native_av1_video_encoder_factory;
+#[doc(no_inline)]
 pub use av1_entropy::{AV1_CDF_MAX, Av1SymbolDecoder, validate_cdf};
+#[doc(no_inline)]
 pub use av1_filters::{
     CdefStrength, FilmGrainParams, FilterFrame, FilterPlane, LoopFilterParams, MatrixCoefficients,
     RestorationUnit, TxSizeGrid, apply_film_grain, apply_restoration_unit, cdef_frame,
     convert_to_rgba8, deblock_frame, super_resolution_upscale,
 };
+#[doc(no_inline)]
 pub use av1_inter_decoder::Av1InterDecoder;
+#[doc(no_inline)]
 pub use av1_intra::{
     Av1IntraBlock, Av1IntraFrame, Av1IntraMode, Av1TxType, Tx1d, get_ac_quant, get_dc_quant,
     inverse_transform, inverse_wht_4x4,
 };
+#[doc(no_inline)]
 pub use av1_intra_decoder::{decode_av1_lossless_intra, decode_av1_lossless_intra_with_tx_sizes};
+#[doc(no_inline)]
 pub use av1_intra_pred::{
     Av1IntraSimd, SmoothMode, add_residual_row, av1_intra_simd, directional_row, paeth_row,
     smooth_row, sum_samples,
 };
+#[doc(no_inline)]
 pub use av1_simd::SimdIsa;
+#[doc(no_inline)]
 pub use codec::{
     AudioDrain, AudioEncoder, AudioEncoderConfig, AudioEncoderFactory, AudioEncoderFormat,
     AudioGapless, CancellationToken, CodecImplementation, CodecProfile, CodecSupport,
@@ -132,39 +149,53 @@ pub use codec::{
     VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
+#[doc(no_inline)]
 pub use codec_config::{DerivedCodecString, Vp9CodecConfig, derive_codec_string};
+#[doc(no_inline)]
 pub use conformance::{
     ExpectedVideoFrame, FrameDigest, VideoDecoderConformanceReport, VideoDecoderConformanceVector,
     VideoEncoderConformanceReport, VideoEncoderConformanceVector, verify_video_decoder_conformance,
     verify_video_encoder_conformance,
 };
+#[doc(no_inline)]
 pub use container::{container_capabilities, probe_container};
+#[doc(no_inline)]
 pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
+#[doc(no_inline)]
 pub use media::{
     AudioBuffer, Codec, ColorRange, Container, PixelFormat, Plane, VideoDimensions, VideoFrame,
 };
+#[doc(no_inline)]
 pub use mp4::{CoverArt, CoverArtFormat};
+#[doc(no_inline)]
 pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
 };
+#[doc(no_inline)]
 pub use opus::{
     NativeOpusDecoder, OPUS_PREROLL_SAMPLES, OPUS_SAMPLE_RATE, OpusHead,
     native_opus_audio_encoder_factory, opus_packet_samples, opus_preroll_packets,
 };
+#[doc(no_inline)]
 pub use output::{MediaOutput, OutputOptions};
+#[doc(no_inline)]
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
     PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
     PlaybackVideoSource, Presentation, WebAudioOutput,
 };
+#[doc(no_inline)]
 pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
+#[doc(no_inline)]
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
+#[doc(no_inline)]
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,
     ExecutionOwner, FrameDestination, FrameSource, GraphicsAdapter, GraphicsApi, GraphicsResource,
     Orientation, ResourceKind, ResourceOwnership, ScaleFilter, TransferCapability, TransferPolicy,
     TransferStage, execute_transfer, inspect_transfer,
 };
+#[doc(no_inline)]
 pub use vorbis::{
     NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig, native_vorbis_audio_encoder_factory,
 };
@@ -174,9 +205,10 @@ pub use vorbis::{
 /// Internal and unstable, and the VP8 counterpart to [`hevc_encoder_bench`]:
 /// the encoder's distortion metrics, transforms, quantization, prediction and
 /// loop filter are not otherwise reachable from a benchmark, which is a
-/// separate crate. See `benches/vp8_encode.rs`.
+/// separate crate. See `crates/zvidlib-vp8/benches/vp8_encode.rs`.
 #[doc(hidden)]
 pub use vp8::bench as vp8_encoder_bench;
+#[doc(inline)]
 pub use zvidlib_av1::forward_transform;
 
 /// Per-stage access to the native VP8 decoder for the criterion benchmark
@@ -185,25 +217,35 @@ pub use zvidlib_av1::forward_transform;
 /// Internal and unstable, and the decode-side counterpart to
 /// [`vp8_encoder_bench`]: the stages only the decoder takes and its whole-frame
 /// decode, which a benchmark, being a separate crate, cannot otherwise reach.
-/// See `benches/vp8_decode.rs`.
+/// See `crates/zvidlib-vp8/benches/vp8_decode.rs`.
 #[doc(hidden)]
 pub use vp8::decode_bench as vp8_decoder_bench;
+#[doc(inline)]
 pub use vp9_encoder::native_vp9_video_encoder_factory;
+#[doc(no_inline)]
 pub use webm::WebmMuxer;
+#[doc(no_inline)]
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,
     probe_webm,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
+#[doc(inline)]
 pub use aac_encoder::native_aac_audio_encoder_factory;
+#[doc(inline)]
 pub use av1_decoder::native_av1_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_audio::{DefaultAudioOutput, NativeAacDecoder};
 #[cfg(not(target_arch = "wasm32"))]
+#[doc(no_inline)]
 pub use previews::PreviewIndex;
+#[doc(inline)]
 pub use vp8::{native_vp8_video_decoder_factory, native_vp8_video_encoder_factory};
+#[doc(inline)]
 pub use vp9_decoder::native_vp9_video_decoder_factory;
+#[doc(inline)]
 pub use zvidlib_hevc_decoder::native_hevc_video_decoder_factory;
 #[cfg(not(target_arch = "wasm32"))]
+#[doc(inline)]
 pub use zvidlib_hevc_encoder::native_hevc_video_encoder_factory;

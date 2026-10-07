@@ -107,7 +107,7 @@ fn no_two_bench_targets_register_the_same_group_name() {
     // a collision rather than only the one that happened to be read second.
     let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (target, path) in &targets {
-        let source = std::fs::read_to_string(&path)
+        let source = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()));
         for name in group_names(&source) {
             owners.entry(name).or_default().push(target.clone());
@@ -165,8 +165,8 @@ fn a_group_name_is_read_from_every_shape_a_bench_target_writes_one_in() {
 
 #[test]
 fn the_collision_this_guard_exists_for_is_one_it_would_have_caught() {
-    // `benches/codec.rs` as it read before #414 renamed its group, against
-    // `benches/av1_decode.rs`'s unchanged one.
+    // `crates/zvidlib-av1/benches/codec.rs` as it read before #414 renamed its group, against
+    // `crates/zvidlib-av1-decoder/benches/av1_decode.rs`'s unchanged one.
     let codec_before = r#"IsaWorkload::new(
             "av1_deblock",
             FrameWork::new(1, ISA_WIDTH as u64, ISA_HEIGHT as u64),

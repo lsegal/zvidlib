@@ -382,7 +382,7 @@ pub struct SubLayerHrd {
     /// `cpb_cnt_minus1[i]` (`ue(v)`, range 0..=31); inferred to 0 when
     /// `low_delay_hrd_flag[i] == 1` (the syntax skips the `ue(v)` —
     /// pre-filled to match the spec text's "When not present, the value
-    /// of cpb_cnt_minus1[ i ] is inferred to be equal to 0").
+    /// of cpb_cnt_minus1\[ i \] is inferred to be equal to 0").
     pub cpb_cnt_minus1: u32,
     /// `sub_layer_hrd_parameters( i )` for the NAL HRD path; populated
     /// when the parent's `nal_hrd_parameters_present_flag == 1`.

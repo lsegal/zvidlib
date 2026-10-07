@@ -8,8 +8,8 @@
 //! the pages itself.
 //!
 //! The native encoder's packets are pinned bit for bit to libvorbis's by the
-//! unit tests in `src/vorbis_encoder/`; here they are read back through the
-//! decoder the way a demuxed track would be.
+//! unit tests in `crates/zvidlib-vorbis-encoder/src/vorbis_encoder/`; here they
+//! are read back through the decoder the way a demuxed track would be.
 
 use std::path::{Path, PathBuf};
 

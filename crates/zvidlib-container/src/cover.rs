@@ -2,7 +2,7 @@
 //!
 //! [`CoverArt`] from issue #502 is a picture the caller encodes. Most callers
 //! only want a file-browser thumbnail of the recording, and zvidlib already
-//! sees every frame, so [`MediaOutput`](crate::MediaOutput) captures one by
+//! sees every frame, so `zvidlib::MediaOutput` captures one by
 //! default and writes it as a PNG when the output finishes.
 //!
 //! The capture happens as frames are written rather than by decoding at
@@ -27,10 +27,9 @@ pub const DEFAULT_COVER_FRAME: u64 = 4;
 /// Larger frames are shrunk by a whole-number factor until they fit.
 pub const COVER_THUMBNAIL_MAX_EDGE: u32 = 512;
 
-/// Where the cover art of a [`MediaOutput`](crate::MediaOutput) comes from
-/// when the caller has not set one with
-/// [`MediaOutput::set_cover_art`](crate::MediaOutput::set_cover_art), which
-/// always takes precedence.
+/// Where the cover art of a `zvidlib::MediaOutput` comes from when the caller
+/// has not set one with `MediaOutput::set_cover_art`, which always takes
+/// precedence.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CoverSource {
     /// Write no generated cover.

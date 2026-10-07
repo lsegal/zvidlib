@@ -4,15 +4,15 @@
 //! every candidate partition, transform size, prediction mode and motion
 //! vector, so they are where it spends its time:
 //!
-//! - [`forward_transform_4x4`] and [`matrix_product`], the forward transforms:
+//! - `forward_transform_4x4` and `matrix_product`, the forward transforms:
 //!   libvpx's integer 4x4 DCT/ADST and the floating-point 8x8 to 32x32 ones.
-//! - [`quantize`], which turns transform coefficients into levels and the
+//! - `quantize`, which turns transform coefficients into levels and the
 //!   dequantized values the reconstruction adds back.
-//! - [`sad`], [`sse`] and [`residual`], the distortion metrics behind motion
+//! - `sad`, `sse` and `residual`, the distortion metrics behind motion
 //!   search, mode decisions and the loop filter level search.
-//! - [`predict_tm`] and [`convolve8`], the TM intra predictor and the 8-tap
+//! - `predict_tm` and `convolve8`, the TM intra predictor and the 8-tap
 //!   motion compensation, which must match the decoder bit for bit.
-//! - [`luma_row`] and [`chroma_row`], the RGBA/BGRA to YUV 4:2:0 input
+//! - `luma_row` and `chroma_row`, the RGBA/BGRA to YUV 4:2:0 input
 //!   conversion.
 //!
 //! Each dispatches once per call through cached runtime CPU feature detection

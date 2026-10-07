@@ -47,6 +47,7 @@ pub(crate) mod filters;
 pub(crate) mod transforms;
 pub(crate) use crate::simd::vector;
 
+#[doc(inline)]
 pub use crate::simd::{SimdIsa, available_isas, detected_isa, lanes};
 
 /// The instruction set the kernels will actually use.

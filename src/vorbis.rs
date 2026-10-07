@@ -11,5 +11,7 @@
 //! zvidlib's own port of the libvorbis encoder, so both work on every target
 //! zvidlib builds for, `wasm32` included.
 
+#[doc(inline)]
 pub use zvidlib_vorbis_decoder::{NativeVorbisDecoder, VORBIS_PREROLL_PACKETS, VorbisConfig};
+#[doc(inline)]
 pub use zvidlib_vorbis_encoder::native_vorbis_audio_encoder_factory;

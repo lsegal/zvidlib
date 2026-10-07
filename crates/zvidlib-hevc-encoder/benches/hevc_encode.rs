@@ -16,7 +16,7 @@
 //! Inputs are the synthetic sequences from `benches/support`, never a decoded
 //! file: decoding first would fold decoder cost into the encoder numbers.
 //!
-//! This is a second bench target rather than more groups in `benches/codec.rs`.
+//! This is a second bench target rather than more groups in `crates/zvidlib-av1/benches/codec.rs`.
 //! That target is one process so its decoded-fixture cache is paid once; these
 //! groups touch none of those fixtures, and the encoder's mode search is slow
 //! enough that keeping it out of the default `--bench codec` run is worth more

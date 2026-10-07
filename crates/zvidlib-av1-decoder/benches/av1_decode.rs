@@ -19,23 +19,26 @@
 //! | Group | Stage |
 //! | --- | --- |
 //! | `av1_decode_frame` | whole-frame decode through `native_av1_video_decoder_factory` |
-//! | `av1_inverse_dct_*`, `av1_inverse_adst_*` | inverse transforms, `src/av1_simd/transforms.rs` |
-//! | `av1_deblock*`, `av1_cdef`, `av1_wiener`, `av1_self_guided` | in-loop filters, `src/av1_simd/filters.rs` and `src/av1_filters.rs` |
-//! | `av1_mc_*` | inter prediction, `src/av1_mc.rs` |
-//! | `av1_intra_*` | intra prediction, `src/av1_intra_pred.rs` |
-//! | `av1_entropy_symbol` | arithmetic symbol decode, `src/av1_entropy.rs` |
+//! | `av1_inverse_dct_*`, `av1_inverse_adst_*` | inverse transforms, `crates/zvidlib-av1/src/av1_simd/transforms.rs` |
+//! | `av1_deblock*`, `av1_cdef`, `av1_wiener`, `av1_self_guided` | in-loop filters, `crates/zvidlib-av1/src/av1_simd/filters.rs` and `crates/zvidlib-av1/src/av1_filters.rs` |
+//! | `av1_mc_*` | inter prediction, `crates/zvidlib-av1/src/av1_mc.rs` |
+//! | `av1_intra_*` | intra prediction, `crates/zvidlib-av1/src/av1_intra_pred.rs` |
+//! | `av1_entropy_symbol` | arithmetic symbol decode, `crates/zvidlib-av1/src/av1_entropy.rs` |
 //!
 //! This target replaces the ad-hoc, `#[ignore]`d `tests/av1_simd_bench.rs`
 //! (issue #120): its input generators moved to `benches/support/mod.rs` and its
 //! hand-rolled timing loops became the criterion groups below, so the same
 //! measurements now produce stored baselines and can be tracked for
-//! regressions. The bit-exactness tests it sat next to — `tests/av1_simd_intra.rs`
-//! and `src/av1_simd/tests.rs` — are correctness checks and are unaffected.
+//! regressions. The bit-exactness tests it sat next to —
+//! `crates/zvidlib-av1/tests/av1_simd_intra.rs` and
+//! `crates/zvidlib-av1/src/av1_simd/tests.rs` — are correctness checks and are
+//! unaffected.
 //!
 //! The encoder-side forward transforms that file also timed are not here: they
-//! are measured by `benches/av1_encode.rs` (`cargo bench --bench av1_encode`),
-//! which is where encoder kernels belong. They share the `av1_simd` dispatch
-//! site with the inverse transforms above and nothing else.
+//! are measured by `crates/zvidlib-av1-encoder/benches/av1_encode.rs` (`cargo
+//! bench -p zvidlib-av1-encoder --bench av1_encode`), which is where encoder
+//! kernels belong. They share the `av1_simd` dispatch site with the inverse
+//! transforms above and nothing else.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 
@@ -71,9 +74,10 @@ const HEIGHT: usize = 1080;
 /// Criterion windows for the kernel groups.
 ///
 /// There are a dozen of them and each is measured once per available
-/// instruction set, so the default five-second window would put a plain
-/// `cargo bench --bench av1_decode` into the tens of minutes. Two seconds over
-/// a 1080p plane is still hundreds of iterations of work per sample.
+/// instruction set, so the default five-second window would put a plain `cargo
+/// bench -p zvidlib-av1-decoder --bench av1_decode` into the tens of minutes.
+/// Two seconds over a 1080p plane is still hundreds of iterations of work per
+/// sample.
 fn kernel_workload<'a>(codec: &'a str, work: FrameWork) -> IsaWorkload<'a> {
     IsaWorkload {
         measurement_time: Duration::from_secs(2),
@@ -143,7 +147,7 @@ fn av1_decode_frame(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Inverse transforms (src/av1_simd/transforms.rs)
+// Inverse transforms (crates/zvidlib-av1/src/av1_simd/transforms.rs)
 // ---------------------------------------------------------------------------
 
 /// Every inverse transform size and family the vector kernels cover, applied
@@ -185,7 +189,8 @@ fn av1_inverse_transforms(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// In-loop filters (src/av1_simd/filters.rs, src/av1_filters.rs)
+// In-loop filters (crates/zvidlib-av1/src/av1_simd/filters.rs,
+// crates/zvidlib-av1/src/av1_filters.rs)
 // ---------------------------------------------------------------------------
 
 /// Deblocking level shared by the three deblocking groups, high enough that
@@ -306,7 +311,7 @@ fn av1_self_guided(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Inter prediction (src/av1_mc.rs)
+// Inter prediction (crates/zvidlib-av1/src/av1_mc.rs)
 // ---------------------------------------------------------------------------
 
 /// Block size the motion-compensation groups predict in.
@@ -441,7 +446,7 @@ fn av1_mc_blend_mask(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Intra prediction (src/av1_intra_pred.rs)
+// Intra prediction (crates/zvidlib-av1/src/av1_intra_pred.rs)
 // ---------------------------------------------------------------------------
 
 /// Intra block size the prediction groups predict in.
@@ -537,7 +542,7 @@ fn av1_intra_prediction(criterion: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Entropy decode (src/av1_entropy.rs)
+// Entropy decode (crates/zvidlib-av1/src/av1_entropy.rs)
 // ---------------------------------------------------------------------------
 
 /// Symbols one entropy iteration decodes. Large enough that decoder
@@ -554,8 +559,8 @@ const ENTROPY_SYMBOLS: usize = 200_000;
 /// take away is its share of `av1_decode_frame`, not a speedup.
 ///
 /// There is no CDF-adaptation arm to measure alongside it: both AV1 decoders in
-/// this crate require `disable_cdf_update = 1` (see `src/av1_inter_decoder.rs`),
-/// so `src/av1_cdf.rs`'s tables are read but never adapted, and reading them is
+/// this crate require `disable_cdf_update = 1` (see `crates/zvidlib-av1/src/av1_inter_decoder.rs`),
+/// so `crates/zvidlib-av1/src/av1_cdf.rs`'s tables are read but never adapted, and reading them is
 /// exactly what the CDF argument below costs.
 fn av1_entropy_symbol(criterion: &mut Criterion) {
     // Deterministic pseudo-random payload. The range decoder never reads past

@@ -4,7 +4,7 @@
 //! The software backend encodes VP9 profile 0 (8-bit 4:2:0) with key frames and
 //! inter frames. A key frame starts every group of pictures, and each inter
 //! frame predicts from the frame before it, so every sample after a key frame
-//! up to the next one depends on the samples before it. See [`frame`] for the
+//! up to the next one depends on the samples before it. See `frame` for the
 //! coding tools.
 //!
 //! [`VideoEncoderConfig::configuration`] is either empty, which encodes at
@@ -12,7 +12,7 @@
 //! frames, a single nonzero `base_q_idx` byte, that byte followed by the key
 //! frame interval in frames as a big-endian `u16`, or those three bytes
 //! followed by a flags byte whose bit 0 ([`FLAG_ERROR_RESILIENT`]) makes every
-//! frame error resilient. See [`parse_configuration`]. A hardware encoder
+//! frame error resilient. See `parse_configuration`. A hardware encoder
 //! takes the same configuration without that flag: it is rate controlled by
 //! quality, which `base_q_idx` maps onto, instead of to a bitrate.
 

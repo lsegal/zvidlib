@@ -29,7 +29,7 @@
 //! of five interleaved rounds against [`Backend::Scalar`], from
 //! `bench_inverse_transform_and_dequant`. Both `transform_1d` columns
 //! are the kernel alone over an L1-resident buffer; "block path" is
-//! [`inverse_transform_with_backend`], which allocates a `Vec` per block
+//! `inverse_transform_with_backend`, which allocates a `Vec` per block
 //! and per intermediate and so compresses every ratio towards 1.00x.
 //!
 //! | `nTbS` | `dequant_block` | `transform_1d` dense | `transform_1d` sparse | block path |

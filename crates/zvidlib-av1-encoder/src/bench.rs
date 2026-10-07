@@ -1,17 +1,17 @@
 //! Benchmark-only access to the AV1 encoder's individual pipeline stages.
 //!
 //! `crate::av1_encoder` is a private module and criterion benchmarks are a
-//! separate crate, so the per-stage groups in `benches/av1_encode.rs` cannot
-//! reach the forward WHT, the symbol coder, the tile encoder, or the bitstream
-//! writers through the public API. The public
-//! [`crate::native_av1_video_encoder_factory`] runs all of them at once, which
-//! is exactly what a per-stage breakdown must avoid.
+//! separate crate, so the per-stage groups in
+//! `crates/zvidlib-av1-encoder/benches/av1_encode.rs` cannot reach the forward
+//! WHT, the symbol coder, the tile encoder, or the bitstream writers through
+//! the public API. The public [`crate::native_av1_video_encoder_factory`] runs
+//! all of them at once, which is exactly what a per-stage breakdown must avoid.
 //!
 //! This module is that access and nothing more: thin wrappers that own their
 //! inputs, return plain bytes, and add no logic the benchmark could
 //! accidentally measure instead of the encoder. It is `#[doc(hidden)]` and
 //! explicitly not part of the stable API, matching the
-//! [`crate::hevc_encoder_bench`] convention.
+//! `crate::hevc_encoder_bench` convention.
 //!
 //! Each wrapper returns the bytes that identify its result, because
 //! `benches/support/isa.rs` compares those bytes across instruction sets before

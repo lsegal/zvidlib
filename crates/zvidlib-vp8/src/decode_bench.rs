@@ -1,4 +1,4 @@
-//! Per-stage access to the VP8 decoder for `benches/vp8_decode.rs` (issue
+//! Per-stage access to the VP8 decoder for `crates/zvidlib-vp8/benches/vp8_decode.rs` (issue
 //! #568).
 //!
 //! Internal and unstable. The counterpart to [`super::bench`], which times the

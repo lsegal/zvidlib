@@ -1,6 +1,6 @@
 //! Prepared per-stage workloads for the HEVC decoder benchmark.
 //!
-//! `benches/codec.rs` is an external crate and the HEVC engine
+//! `crates/zvidlib-av1/benches/codec.rs` is an external crate and the HEVC engine
 //! (`crate::engine`) is crate-private, so a benchmark cannot reach the
 //! individual decode stages the way it reaches the public AV1 kernels. This
 //! module is the narrow surface that closes that gap: one prepared workload per
@@ -402,7 +402,7 @@ impl HevcStageInputs {
 
     /// Samples the SAO stage classifies per run, luma plus chroma.
     ///
-    /// Counts only the CTBs [`SAO_CTB_MIX`] leaves switched on, since a CTB
+    /// Counts only the CTBs `SAO_CTB_MIX` leaves switched on, since a CTB
     /// with `SaoTypeIdx == 0` is returned from before it reads a sample. On the
     /// measured mix that is a small minority of the picture, which is the
     /// point: the throughput this divides is the classifiers', not the frame's.
@@ -439,7 +439,7 @@ impl HevcStageInputs {
     /// those is a vectorized `filter_taps` / `combine_weighted` primitive.
     ///
     /// The unit sizes, the uni/bi split and the presence of chroma all come
-    /// from [`INTER_PU_MIX`], which is measured rather than chosen; see that
+    /// from `INTER_PU_MIX`, which is measured rather than chosen; see that
     /// constant for what the uniform 16x16 bi-predicted luma-only grid this
     /// replaced was getting wrong.
     ///
@@ -908,7 +908,8 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 ///
 /// Returns a fold over every decoded sample, for the harness's bit-exactness
 /// guard — the same fold [`decode_frames`] applies to the converted bytes, so
-/// neither group pays for identifying its output more than the other does. Pins no instruction set; the caller selects the arm through
+/// neither group pays for identifying its output more than the other does. Pins
+/// no instruction set; the caller selects the arm through
 /// [`crate::simd::set_override`] exactly as for an end-to-end decode.
 ///
 /// # Panics

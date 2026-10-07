@@ -1,10 +1,11 @@
 //! Benchmark-only access to the native VP9 encoder's pixel kernels.
 //!
 //! `crate::vp9_encoder` is a private module and criterion benchmarks are a
-//! separate crate, so the per-stage groups in `benches/vp9_encode.rs` cannot
-//! reach the forward transforms, the quantizer, the distortion metrics, the
-//! predictors or the input conversion through the public API, which runs them
-//! all at once inside the rate-distortion search.
+//! separate crate, so the per-stage groups in
+//! `crates/zvidlib-vp9-encoder/benches/vp9_encode.rs` cannot reach the forward
+//! transforms, the quantizer, the distortion metrics, the predictors or the
+//! input conversion through the public API, which runs them all at once inside
+//! the rate-distortion search.
 //!
 //! These are thin wrappers over whole planes: each walks a plane block by
 //! block, calls the encoder's own entry point for the stage (the same function

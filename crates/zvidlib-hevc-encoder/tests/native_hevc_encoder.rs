@@ -369,10 +369,11 @@ fn hardware_output_muxes_to_an_mp4_that_zvidlib_and_ffmpeg_both_decode() {
 
 /// Issue #495: the same 1080p `Mp4Muxer` file opened by AVFoundation, which
 /// QuickTime plays with and which is stricter about `hvc1` sample entries,
-/// `hvcC` contents and edit lists than ffmpeg is. The asset and its video
-/// track have to report playable, and `AVAssetReader` has to decode every
-/// frame through VideoToolbox's decoder over the one and a half seconds the
-/// track was written to cover. `tests/support/avfoundation_decode.swift` does
+/// `hvcC` contents and edit lists than ffmpeg is. The asset and its video track
+/// have to report playable, and `AVAssetReader` has to decode every frame
+/// through VideoToolbox's decoder over the one and a half seconds the track was
+/// written to cover.
+/// `crates/zvidlib-hevc-encoder/tests/support/avfoundation_decode.swift` does
 /// the reading; this test decides whether what it read is right.
 #[cfg(target_os = "macos")]
 #[test]
@@ -398,7 +399,7 @@ fn hardware_output_muxes_to_an_mp4_that_avfoundation_plays_and_decodes() {
     std::fs::write(&path, &bytes).unwrap();
     let _cleanup = RemoveOnDrop(path.clone());
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/support/avfoundation_decode.swift");
+        .join("crates/zvidlib-hevc-encoder/tests/support/avfoundation_decode.swift");
     // The Swift toolchain comes with the Xcode command line tools this crate
     // already needs to build its Swift bridge on macOS, so a missing `swift`
     // is a broken host rather than a reason to skip.

@@ -1,26 +1,27 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's pure-Rust VP9 software decoder.
 //!
-//! The VP9 counterpart of `benches/av1_decode.rs` and `benches/hevc_decode.rs`:
-//! how fast whole VP9 frames decode, and how fast each stage the `vp9_decode`
-//! dispatch site vectorizes runs on its own. Every group runs once per
-//! instruction set `zvidlib_core::simd::available()` reports, through the
-//! crate-wide override in [`zvidlib_core::simd`], and `benches/support/isa.rs`
-//! asserts that every arm is bit-exact with scalar before timing it and that
-//! the override really landed in every dispatch site.
+//! The VP9 counterpart of `crates/zvidlib-av1-decoder/benches/av1_decode.rs`
+//! and `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`: how fast whole VP9
+//! frames decode, and how fast each stage the `vp9_decode` dispatch site
+//! vectorizes runs on its own. Every group runs once per instruction set
+//! `zvidlib_core::simd::available()` reports, through the crate-wide override
+//! in [`zvidlib_core::simd`], and `benches/support/isa.rs` asserts that every
+//! arm is bit-exact with scalar before timing it and that the override really
+//! landed in every dispatch site.
 //!
 //! # Groups
 //!
 //! | Group | Stage |
 //! | --- | --- |
 //! | `vp9_decode_to_picture` | whole-frame decode of the bundled 256x144 libvpx stream, stopping at the YUV picture |
-//! | `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `src/vp9_simd/transforms.rs` |
+//! | `vp9_inverse_dct_{4x4,8x8,16x16,32x32}` | inverse DCT and add-to-prediction, `crates/zvidlib-vp9-decoder/src/vp9_simd/transforms.rs` |
 //! | `vp9_inverse_adst_{4x4,8x8,16x16}` | inverse ADST and add-to-prediction |
 //! | `vp9_inverse_wht_4x4` | the lossless Walsh-Hadamard transform |
-//! | `vp9_mc_{regular,smooth,sharp,bilinear}` | 16x16 sub-pixel inter prediction per filter, `src/vp9_simd/convolve.rs` |
+//! | `vp9_mc_{regular,smooth,sharp,bilinear}` | 16x16 sub-pixel inter prediction per filter, `crates/zvidlib-vp9-decoder/src/vp9_simd/convolve.rs` |
 //! | `vp9_mc_4x4` | 4x4 inter prediction, the narrowest block |
 //! | `vp9_mc_compound` | two predictions averaged, as a compound block is |
-//! | `vp9_intra_dc`, `vp9_intra_tm`, `vp9_intra_directional` | intra prediction, 4x4 to 32x32, `src/vp9_simd/intra.rs` |
-//! | `vp9_loop_filter_{4,8,16}` | `filter4`, `filter8` and the 16-wide filter on every edge of a plane, `src/vp9_simd/loopfilter.rs` |
+//! | `vp9_intra_dc`, `vp9_intra_tm`, `vp9_intra_directional` | intra prediction, 4x4 to 32x32, `crates/zvidlib-vp9-decoder/src/vp9_simd/intra.rs` |
+//! | `vp9_loop_filter_{4,8,16}` | `filter4`, `filter8` and the 16-wide filter on every edge of a plane, `crates/zvidlib-vp9-decoder/src/vp9_simd/loopfilter.rs` |
 //!
 //! The per-stage groups run over one 1080p luma plane each, through
 //! `zvidlib_vp9_decoder::vp9_simd::bench`, the narrow benchmark-only surface over the

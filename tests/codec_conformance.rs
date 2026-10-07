@@ -233,7 +233,7 @@ fn a_seek_that_skips_the_pictures_it_passes_still_decodes_the_frames_it_returns(
 
 /// Splits a low-overhead AV1 byte stream into temporal units, delimited by
 /// (and including) each `TemporalDelimiter` OBU (`obu_type == 2`). Mirrors
-/// the parsing `tests/av1_inter_decoder.rs` already uses for this fixture.
+/// the parsing `crates/zvidlib-av1/tests/av1_inter_decoder.rs` already uses for this fixture.
 fn av1_temporal_units(stream: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut cursor = 0usize;
@@ -273,7 +273,7 @@ fn av1_temporal_units(stream: &[u8]) -> Vec<&[u8]> {
 /// A minimal `av1C` box declaring an 8-bit monochrome Main-profile stream
 /// with no `configOBUs` (AV1 spec §5.9.16 does not require the sequence
 /// header to be repeated there; this decoder validates coded dimensions
-/// against each decoded frame instead, see `src/av1_decoder.rs`).
+/// against each decoded frame instead, see `crates/zvidlib-av1-decoder/src/lib.rs`).
 fn av1c_monochrome_main() -> Vec<u8> {
     let payload = [0x81_u8, 0x00, 0x1C, 0x00];
     let mut bytes = (8_u32 + payload.len() as u32).to_be_bytes().to_vec();
@@ -285,7 +285,7 @@ fn av1c_monochrome_main() -> Vec<u8> {
 #[test]
 fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // This low-overhead OBU sequence (also exercised directly against
-    // `Av1InterDecoder` in `tests/av1_inter_decoder.rs`) is generated from
+    // `Av1InterDecoder` in `crates/zvidlib-av1/tests/av1_inter_decoder.rs`) is generated from
     // the normative AV1 syntax tables and independently decoded by
     // FFmpeg/libdav1d; see `tests/fixtures/codec/README.md`. It contains a
     // key frame, two refreshed inter references, LAST/LAST2 average
@@ -293,7 +293,7 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
     // retained compound frame. The RGBA digests below are the canonical
     // output of this crate's own spec-documented, independently
     // unit-tested `convert_to_rgba8` BT.601 conversion (see
-    // `src/av1_filters.rs`) applied to that hermetically decoded YUV420
+    // `crates/zvidlib-av1/src/av1_filters.rs`) applied to that hermetically decoded YUV420
     // output.
     let stream_hex =
         include_str!("../crates/zvidlib-av1/tests/fixtures/av1_inter_show_existing_16x16.hex")

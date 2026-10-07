@@ -15,7 +15,7 @@
 //! instantiated per instruction set behind `#[target_feature]` wrappers. The
 //! convolution is the exception in its inner loop: one 8-byte load feeds
 //! eight outputs there, which `I32x` cannot express, so it is written over the
-//! few per-instruction-set primitives of [`convolve::Convolver`] instead. The
+//! few per-instruction-set primitives of `convolve::Convolver` instead. The
 //! transforms move data through four-lane register transposes and 4-pixel-
 //! wide predictions have no useful 256-bit form, so AVX2 runs those through
 //! the SSE4.1 instantiation.
@@ -25,11 +25,11 @@
 //! Every kernel reproduces its scalar reference exactly, not approximately.
 //! The scalar transforms are a transliteration of libvpx's C, computed in
 //! `i64` and wrapped to 16 and 32 bits where libvpx's storage types wrap;
-//! [`idct1d`] is the same text with each value a vector of `i32` lanes. Every
+//! `idct1d` is the same text with each value a vector of `i32` lanes. Every
 //! stage of the DCTs truncates to 16 bits, so their 32-bit lanes are exact
 //! for any input. The ADSTs carry wider values, so each is range-checked
 //! against the largest input for which no intermediate can leave `i32`
-//! ([`transforms::ADST4_INPUT_LIMIT`] and its siblings), and a block that
+//! (`transforms::ADST4_INPUT_LIMIT` and its siblings), and a block that
 //! exceeds it stays on the scalar path. Positions the vector loop filter
 //! cannot reach without reading outside the plane, scaled horizontal
 //! convolution, and anything else a kernel does not cover likewise stay

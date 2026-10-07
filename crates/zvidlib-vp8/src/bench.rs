@@ -1,4 +1,4 @@
-//! Per-stage access to the VP8 encoder for `benches/vp8_encode.rs`.
+//! Per-stage access to the VP8 encoder for `crates/zvidlib-vp8/benches/vp8_encode.rs`.
 //!
 //! Internal and unstable. The encoder's kernels are private to the crate, and a
 //! benchmark is a separate crate, so each function here runs one kernel over a

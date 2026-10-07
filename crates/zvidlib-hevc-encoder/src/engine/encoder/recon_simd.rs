@@ -11,7 +11,7 @@
 //!   edge-offset class — four full passes over the picture before the filter
 //!   itself runs.
 //!
-//! The search's band-offset half ([`band_offset_row`]) is a dispatch site here
+//! The search's band-offset half (`band_offset_row`) is a dispatch site here
 //! too, and the answer there depends on the instruction set: its 32-way scatter
 //! is not something SSE4.1, AVX2 or NEON can express, so only the
 //! classification in front of it vectorizes. That is enough on x86_64, where
@@ -25,7 +25,7 @@
 //! else, exactly as [`crate::engine::encoder::rdcost`] does for the
 //! distortion metrics. The crate-wide [`crate::simd::set_override`] is
 //! consulted ahead of the cached probe, so this module appears in
-//! [`crate::simd::active_by_site`] as `hevc_recon` and the benchmark harness's
+//! `crate::simd::active_by_site` as `hevc_recon` and the benchmark harness's
 //! override guard covers it.
 //!
 //! Every vectorized path is bit-identical to the scalar one: the reconstruction
@@ -556,14 +556,15 @@ pub(crate) fn band_offset_row(here: &[i32], src: &[u8], stats: &mut BandStats) {
 ///   registers, no memory histogram and no scatter at all.
 ///
 /// **The occupancy the transposed shape needs was measured first**, in
-/// `tests/sao_band_occupancy.rs`, because that shape's cost is proportional to
-/// the bands it visits and only the band *range* is derivable at a price it can
-/// pay. Real video is sparse: over 168,840 CTBs of the bundled 1080p sample the
-/// mean range is 6.4 and 38.4% of CTBs occupy 4 bands or fewer. The synthetic
-/// content `hevc_encode_640x352_reconstruct` searches is not, because its luma
-/// wraps a gradient at `& 0xff` — mean range 15.5, nothing at all at 8 or below,
-/// while its chroma is 3.4 everywhere. So the one shape with a sparse-CTB
-/// advantage has no sparse luma CTB to take it on in the group that decides.
+/// `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs`, because that
+/// shape's cost is proportional to the bands it visits and only the band
+/// *range* is derivable at a price it can pay. Real video is sparse: over
+/// 168,840 CTBs of the bundled 1080p sample the mean range is 6.4 and 38.4% of
+/// CTBs occupy 4 bands or fewer. The synthetic content
+/// `hevc_encode_640x352_reconstruct` searches is not, because its luma wraps a
+/// gradient at `& 0xff` — mean range 15.5, nothing at all at 8 or below, while
+/// its chroma is 3.4 everywhere. So the one shape with a sparse-CTB advantage
+/// has no sparse luma CTB to take it on in the group that decides.
 ///
 /// **Narrowing the accumulators is a loss on its own, which is the opposite of
 /// the premise.** `bench_band_offset_rect` times the two rectangles this entry
@@ -709,12 +710,13 @@ pub(crate) fn band_offset_row_scalar(here: &[i32], src: &[u8], stats: &mut BandS
 /// # Why it is split
 ///
 /// The scatter's cost is not the arithmetic, it is that consecutive samples
-/// landing in the same band form a dependent read-modify-write chain through one
-/// accumulator, and a CTB's samples are spatially coherent so they *do* land in
-/// the same band — the occupancy measurement in `tests/sao_band_occupancy.rs`
-/// reads a mean of 6.4 distinct bands per 256-sample CTB on real video. Two
-/// interleaved sets let two such chains run at once and are folded together at
-/// the end of the CTB, which costs 32 pairs of adds once rather than per row.
+/// landing in the same band form a dependent read-modify-write chain through
+/// one accumulator, and a CTB's samples are spatially coherent so they *do*
+/// land in the same band — the occupancy measurement in
+/// `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` reads a mean of
+/// 6.4 distinct bands per 256-sample CTB on real video. Two interleaved sets
+/// let two such chains run at once and are folded together at the end of the
+/// CTB, which costs 32 pairs of adds once rather than per row.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NarrowBandStats {
@@ -1427,14 +1429,14 @@ mod x86 {
     /// operations per sample, where the set of distinct occupied bands is not
     /// derivable at any price the pass can pay.
     ///
-    /// `tests/sao_band_occupancy.rs` measured that range before this kernel was
-    /// written. It is small on video — 38.4% of 168,840 CTBs of the bundled
-    /// 1080p sample occupy 4 bands or fewer and 68.6% occupy 8 or fewer — and it
-    /// is *not* small on the synthetic content the encoder groups search, whose
-    /// luma wraps a gradient at `& 0xff` and so spans a mean range of 15.5 with
-    /// nothing at all below 8. Its chroma is the opposite, at a range of 3.4
-    /// everywhere. See [`super::band_offset_rect`] for what that asymmetry did
-    /// to the result.
+    /// `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` measured that
+    /// range before this kernel was written. It is small on video — 38.4% of
+    /// 168,840 CTBs of the bundled 1080p sample occupy 4 bands or fewer and
+    /// 68.6% occupy 8 or fewer — and it is *not* small on the synthetic content
+    /// the encoder groups search, whose luma wraps a gradient at `& 0xff` and
+    /// so spans a mean range of 15.5 with nothing at all below 8. Its chroma is
+    /// the opposite, at a range of 3.4 everywhere. See
+    /// [`super::band_offset_rect`] for what that asymmetry did to the result.
     #[cfg(test)]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_rect_avx2_transposed(
@@ -2213,7 +2215,7 @@ mod tests {
 
     /// What the §8.7.3 band search costs *per CTB*, over the two CTB shapes the
     /// encoder actually asks for and over the band ranges
-    /// `tests/sao_band_occupancy.rs` measured real content to have.
+    /// `crates/zvidlib-hevc-encoder/tests/sao_band_occupancy.rs` measured real content to have.
     ///
     /// Ignored by default because it measures rather than asserts; run it with
     /// `cargo test -p zvidlib-hevc-encoder --release --lib

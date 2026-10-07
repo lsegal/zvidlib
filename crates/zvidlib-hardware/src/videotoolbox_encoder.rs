@@ -31,7 +31,7 @@
 //! # Cancellation
 //!
 //! `finish` completes every submitted frame. Dropping the encoder without finishing it - which is
-//! what an abandoned [`crate::MediaOutput`] or a dropped encode future amounts to - cancels
+//! what an abandoned `crate::MediaOutput` or a dropped encode future amounts to - cancels
 //! instead: the session is invalidated at once, and VideoToolbox discards what it had not yet
 //! emitted rather than being waited on.
 

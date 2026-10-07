@@ -9,7 +9,7 @@
 //! [`VideoEncoderConfig::configuration`]: an empty configuration (the default)
 //! encodes losslessly with the 4x4 WHT, and a single-byte configuration
 //! carrying a nonzero `base_q_idx` encodes non-lossless, which is what gives
-//! [`transform::forward_transform`] a caller. See [`parse_base_q_idx`].
+//! [`transform::forward_transform`] a caller. See `parse_base_q_idx`.
 
 pub mod bench;
 #[allow(dead_code)]

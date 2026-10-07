@@ -6,13 +6,13 @@
 //!
 //! **Status:** the decoder is end-to-end. [`decode_annexb_sequence`] /
 //! [`SequenceDecoder`] decode whole Annex B byte streams to
-//! output-order pictures, and [`make_decoder`] exposes the same driver
-//! through the [`oxideav_core::Decoder`] registry contract (registered
-//! by [`register`] under `"h265"` / `"hevc"`, accepting Annex B and
+//! output-order pictures, and `make_decoder` exposes the same driver
+//! through the `oxideav_core::Decoder` registry contract (registered
+//! by `register` under `"h265"` / `"hevc"`, accepting Annex B and
 //! `hvcC` / length-prefixed transport). Every Annex B bitstream in the
 //! staged 16-fixture conformance corpus decodes byte-exact, plus
 //! self-built pins for explicit weighted prediction, PCM, dependent
-//! slice segments and per-slice loop-filter flags. [`make_encoder`] is
+//! slice segments and per-slice loop-filter flags. `make_encoder` is
 //! the PCM-only IDR encoder bootstrap (lossless, conformant, every
 //! packet a random access point) over the write-side stack in
 //! [`encoder`] (bit writer, NAL encapsulation, the §9.3.5 CABAC
@@ -512,7 +512,7 @@ pub use vui::{
 /// walker and parameter-set parsers surface their own [`NalError`] /
 /// [`VpsError`] types directly; the decode drivers use
 /// [`sequence::SequenceError`] and the registry decoder maps into
-/// [`oxideav_core::Error`]).
+/// `oxideav_core::Error`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The requested functionality is not implemented (the encoder,

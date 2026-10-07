@@ -1,7 +1,7 @@
 //! Benchmark-only access to the VP9 decoder's individual stages.
 //!
 //! `crate::vp9_dec` is a private module and criterion benchmarks are a
-//! separate crate, so `benches/vp9_decode.rs` cannot otherwise reach the
+//! separate crate, so `crates/zvidlib-vp9-decoder/benches/vp9_decode.rs` cannot otherwise reach the
 //! inverse transforms, the convolution, the intra predictors or the loop
 //! filter on their own, nor a decode that stops at the YUV picture rather
 //! than paying for the RGBA conversion the public decoder ends with, which is

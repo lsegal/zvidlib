@@ -438,7 +438,7 @@ fn native_av1_passes_the_shared_encoder_conformance_runner() {
 /// `native_av1_video_decoder_factory` directly and compares against the
 /// exact RGBA value a `Gray8` sample maps to under full-range BT.601 with
 /// neutral (monochrome) chroma: `(y, y, y, 255)` for every pixel (see the
-/// `convert_to_rgba8` derivation in `src/av1_filters.rs`, where a neutral
+/// `convert_to_rgba8` derivation in `crates/zvidlib-av1/src/av1_filters.rs`, where a neutral
 /// chroma sample makes R, G, and B all equal to the luma sample regardless
 /// of the matrix coefficients).
 #[test]

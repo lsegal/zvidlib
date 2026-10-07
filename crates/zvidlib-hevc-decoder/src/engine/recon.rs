@@ -1854,7 +1854,7 @@ pub struct PlacedCtu<'a> {
     /// `SliceAddrRs` — the raster address of the first CTB of the
     /// independent slice segment that owns this CTB. `0` for a
     /// single-slice picture; the multi-slice driver
-    /// ([`reconstruct_intra_multislice_picture`]) sets it to the slice's
+    /// (`reconstruct_intra_multislice_picture`) sets it to the slice's
     /// `slice_segment_address` so cross-slice neighbours are denied.
     pub slice_addr_rs: u32,
     /// The decoded coding tree unit.

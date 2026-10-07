@@ -9,7 +9,11 @@
 
 #[doc(hidden)]
 pub mod color_convert;
+// On wasm32 only the scalar path exists, so the vector kernels' scalar tails
+// go unused there; the HEVC engine module this came from allowed that for the
+// whole engine.
 #[doc(hidden)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub mod colorconv;
 pub mod frame;
 #[doc(hidden)]

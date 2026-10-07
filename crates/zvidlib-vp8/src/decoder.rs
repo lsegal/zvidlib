@@ -3,7 +3,7 @@
 //! frame management.
 //!
 //! The decoding process matches libvpx's, which is what the conformance
-//! vectors in `tests/fixtures/codec/vp8/` are checked against, including the
+//! vectors in `crates/zvidlib-vp8/tests/fixtures/vp8/` are checked against, including the
 //! places where the RFC's reference decoder differs from it: loop-filter
 //! deltas that a frame does not update keep their previous values, and the
 //! segment of a macroblock is only consulted while segmentation is enabled.

@@ -21,7 +21,7 @@
 //! intra-only frames, reference frames of a different size (scaled motion
 //! compensation), tiles, segmentation, lossless coding and every
 //! interpolation filter are decoded. Malformed input returns
-//! [`ErrorKind::MalformedMedia`] rather than panicking.
+//! `ErrorKind::MalformedMedia` rather than panicking.
 
 // The processes below follow libvpx's C, which indexes several parallel
 // arrays with one loop variable; keeping that shape makes each function

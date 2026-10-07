@@ -335,7 +335,7 @@ impl EntryPointOffsets {
 /// (§7.4.7.2). When `ref_pic_list_modification_flag_lX == 0` the
 /// corresponding entry list is empty; the implicit derivation of
 /// §8.3.4 applies (each `list_entry_lX[i]` is inferred to 0 per the
-/// §7.4.7.2 paragraph "When the syntax element list_entry_lX[i] is
+/// §7.4.7.2 paragraph "When the syntax element list_entry_lX\[i\] is
 /// not present in the slice header, it is inferred to be equal to 0",
 /// but the inference is exercised by §8.3.4, not surfaced here).
 ///
@@ -723,7 +723,7 @@ pub struct PredWeightEntry {
 /// flag is signalled. For inter-layer / SCC self-reference cases the
 /// gate is `false` for some `i`, and the parser must skip the
 /// corresponding flag bit and infer it to `0` (§7.4.7.3 "When
-/// luma_weight_lX_flag[ i ] is not present, it is inferred to be equal
+/// luma_weight_lX_flag\[ i \] is not present, it is inferred to be equal
 /// to 0").
 ///
 /// The caller resolves the DPB-driven gate and passes the per-i

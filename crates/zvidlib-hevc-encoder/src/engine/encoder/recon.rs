@@ -12,7 +12,7 @@
 //!
 //! ## Lossless and lossy reconstruction
 //!
-//! [`ReconConfig::quantized_residual`] selects which writer this
+//! `ReconConfig::quantized_residual` selects which writer this
 //! reconstruction models. Cleared, the residual is coded exactly, matching the
 //! PCM writer in [`crate::engine::encoder::pcm`] whose coding units are
 //! all `pcm_flag == 1` blocks: the reconstruction is then bit-identical to the
@@ -32,7 +32,7 @@
 //!
 //! ## What the in-loop filters do here
 //!
-//! [`ReconConfig`] mirrors the loop-filter shape of the access unit the writer
+//! `ReconConfig` mirrors the loop-filter shape of the access unit the writer
 //! emits, so the encoder's reconstruction is always the picture a conforming
 //! decoder derives from that access unit — never an approximation of it. With
 //! the shipped [`crate::engine::encoder::pcm::PcmAuOptions`] defaults

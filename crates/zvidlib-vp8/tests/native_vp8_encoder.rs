@@ -4,7 +4,7 @@
 //! `native_vp8_video_encoder_factory`, and written with `WebmMuxer`. The
 //! written file must index one cue per key frame, return every frame exactly
 //! through `ExactFrameReader` whatever order it is asked for in, and look like
-//! the frames it was made from. `src/vp8/tests.rs` holds the same output to
+//! the frames it was made from. `crates/zvidlib-vp8/src/tests.rs` holds the same output to
 //! libvpx's decode where ffmpeg is installed.
 #![cfg(not(target_arch = "wasm32"))]
 

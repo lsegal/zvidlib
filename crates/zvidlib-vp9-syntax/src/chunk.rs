@@ -4,10 +4,8 @@
 //! The platform decoders decode the chunk; this reads only the start of each frame's
 //! uncompressed header (section 6.2), as far as the frame size, and follows the reference slots
 //! so that `show_existing_frame` and a size taken from a reference resolve as the software
-//! decoder resolves them. It accepts and refuses exactly the profile 0 streams [`Decoder`]
+//! decoder resolves them. It accepts and refuses exactly the profile 0 streams the VP9 decoder
 //! does at that depth.
-//!
-//! [`Decoder`]: super::Decoder
 
 use super::bits::BitReader;
 use super::{malformed, read_render_size, read_sync_code, superframe_index, unsupported};
@@ -39,7 +37,7 @@ pub struct FrameInfo {
     pub refresh_frame_flags: u8,
 }
 
-/// Follows a VP9 stream chunk by chunk, as a [`Decoder`](super::Decoder) would, without
+/// Follows a VP9 stream chunk by chunk, as the VP9 decoder would, without
 /// decoding it.
 #[derive(Debug, Default)]
 pub struct ChunkInspector {

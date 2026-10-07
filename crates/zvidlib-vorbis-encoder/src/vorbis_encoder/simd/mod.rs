@@ -1,6 +1,6 @@
 //! Runtime-dispatched vector kernels for the Vorbis encoder's analysis stages
 //! (issue #573), registered as the `vorbis_encode` site of
-//! [`crate::simd::active_by_site`].
+//! `crate::simd::active_by_site`.
 //!
 //! # What is vectorized, and why only that
 //!
@@ -24,7 +24,7 @@
 //! differently from C: it finds each pass's segment boundaries first and
 //! evaluates whole segments, where C runs three loops that stop at the first
 //! bin of the next shape. [`SimdIsa::Scalar`] keeps C's arrangement
-//! (`psy::bark_noise_hybridmp_scalar`, chosen through [`has_kernels`]), so
+//! (`psy::bark_noise_hybridmp_scalar`, chosen through `has_kernels`), so
 //! the scalar arm, and with it `wasm32`, runs exactly the code it ran before.
 //!
 //! The rest stays scalar on purpose. Tone masking is a scatter-max of masking
@@ -40,9 +40,10 @@
 //! Measured on one x86_64 desktop, interleaved and best of nine, the vector
 //! arms run the MDCT 2.5-2.9x, the FFT 2.2-2.3x, the log spectra 2-3x, the
 //! envelope search 1.6-1.7x, floor fitting 1.3-1.45x and the noise mask
-//! 1.1-1.3x faster than scalar, which makes a whole encode 1.2-1.3x faster:
-//! the stages left scalar are most of what remains. `benches/vorbis_encode.rs`
-//! times whole encodes per instruction set.
+//! 1.1-1.3x faster than scalar, which makes a whole encode 1.2-1.3x faster: the
+//! stages left scalar are most of what remains.
+//! `crates/zvidlib-vorbis-encoder/benches/vorbis_encode.rs` times whole encodes
+//! per instruction set.
 //!
 //! # Bit-exactness
 //!

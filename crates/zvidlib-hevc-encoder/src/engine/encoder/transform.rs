@@ -276,8 +276,8 @@ fn qbits(q_p: u32, bit_depth: u8, log2: u32, extended_precision: bool) -> i32 {
 ///   [`crate::engine::transform::scale_coefficients`] takes it.
 /// * `bit_depth` / `extended_precision` — fix `bdShift` and the
 ///   `coeffMin` / `coeffMax` clip, exactly as they do on the decode side.
-/// * `intra` — selects the rounding offset ([`INTRA_ROUND`] vs
-///   [`INTER_ROUND`]).
+/// * `intra` — selects the rounding offset (`INTRA_ROUND` vs
+///   `INTER_ROUND`).
 /// * `scaling` — the per-position `ScalingFactor` matrix `m[ x ][ y ]`
 ///   when `scaling_list_enabled_flag == 1`, else `None` for the flat 16.
 ///   It is inverted into a per-position quantization factor here, so the

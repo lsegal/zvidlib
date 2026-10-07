@@ -19,7 +19,8 @@
 #[doc(hidden)]
 pub mod audiotoolbox;
 #[cfg(windows)]
-pub(crate) mod windows_mf;
+#[doc(hidden)]
+pub mod windows_mf;
 
 #[allow(unused_imports)]
 use zvidlib_core::*;

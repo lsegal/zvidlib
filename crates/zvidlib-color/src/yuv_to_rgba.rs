@@ -2,7 +2,7 @@
 //! YUV-to-RGBA output conversion (issue #574).
 //!
 //! Every picture those three decoders return passes through
-//! [`crate::av1_filters::convert_to_rgba8`], which applies the signalled colour
+//! `crate::av1_filters::convert_to_rgba8`, which applies the signalled colour
 //! range and matrix coefficients to each pixel. Its definition is a
 //! floating-point one: normalize each sample, apply the matrix in `f64`, clamp
 //! to `0..=1`, scale by 255 and round half away from zero. That definition is
@@ -34,7 +34,7 @@
 //! rounding and the reference's own `f64` rounding can each land on either
 //! side of it (`1.772 · 125 = 221.5` under BT.601 full range is one), and the
 //! two disagree by one. So the kernel flags every component whose Q20 value is
-//! within [`TIE_MARGIN`] of a boundary and recomputes that pixel with
+//! within `TIE_MARGIN` of a boundary and recomputes that pixel with
 //! [`Conversion::reference`].
 //!
 //! The margin is provably wide enough. Each of the four Q20 terms is off by at
@@ -47,7 +47,7 @@
 //! triples under every range and matrix, and around 0.1-0.9% of uniformly
 //! random pixels take the fallback.
 //!
-//! The vector backends are bit-exact with [`convert_row_scalar`]: the same
+//! The vector backends are bit-exact with `convert_row_scalar`: the same
 //! `i32` arithmetic in the same order, an arithmetic `>> 20`, and the same
 //! tie test, after which the scalar code redoes any vector holding a flagged
 //! pixel. The largest `|X|` any range and matrix can form is below `2^30.2`,
@@ -59,7 +59,7 @@
 //! [`detected_isa`] resolves the backend once per process, and consults
 //! [`crate::simd::override_isa`] ahead of that cache on every call, so
 //! `simd::set_override` reaches this kernel the way it reaches every other. The
-//! site is reported as `yuv_to_rgba` by [`crate::simd::active_by_site`], on
+//! site is reported as `yuv_to_rgba` by `crate::simd::active_by_site`, on
 //! every target: `wasm32` and any other architecture without a vector backend
 //! report and run [`crate::simd::SimdIsa::Scalar`].
 

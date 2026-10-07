@@ -15,7 +15,7 @@
 //! adaptation, no bypass alignment, no extended precision. Each of those is a
 //! range-extension or PPS flag the encoder's own parameter sets clear, and
 //! leaving them out keeps the driver readable — the decoder still parses all
-//! of them, so nothing is lost on the read side. [`ResidualWriteParams`]
+//! of them, so nothing is lost on the read side. `ResidualWriteParams`
 //! carries only what the emitted streams vary: the block size, the component,
 //! and the §7.4.9.11 scan order.
 //!

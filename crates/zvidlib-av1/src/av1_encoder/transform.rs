@@ -19,7 +19,7 @@
 //! `b`, so a forward/inverse round trip is well defined by construction. The
 //! basis is held at the inverse kernels' own 2^14 fixed-point scale and is
 //! generated from the same `cos(j*pi/64)` and `sin(j*pi/9)` constants those
-//! kernels multiply by ([`COSPI_64`], [`SINPI_9`]):
+//! kernels multiply by (`COSPI_64`, `SINPI_9`):
 //!
 //! ```text
 //! DCT,  N points:  b(k, n) = c(k) * cos(pi * (2n + 1) * k / (2N)),  c(0) = 1/sqrt(2), else 1
@@ -40,8 +40,8 @@
 //! has gain `N / 2`, so a 2-D round trip has gain `(N / 2)^2` while the
 //! inverse applies its own `>> transform_shift(N)`. The forward pass therefore
 //! carries the difference, `2^transform_shift(N) / (N / 2)^2`, as a left shift
-//! of the input ([`pre_shift`]) and a rounding right shift between the two
-//! passes ([`mid_shift`]):
+//! of the input (`pre_shift`) and a rounding right shift between the two
+//! passes (`mid_shift`):
 //!
 //! | `N` | `pre_shift` | `mid_shift` | net scale |
 //! |-----|-------------|-------------|-----------|

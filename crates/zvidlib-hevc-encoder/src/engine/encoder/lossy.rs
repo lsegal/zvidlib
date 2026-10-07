@@ -17,13 +17,13 @@
 //! returns the reconstructed picture alongside the access unit. That
 //! reconstruction is the decoder's own output by construction: the prediction
 //! comes from [`crate::engine::intra_pred`] and the residual from
-//! [`crate::engine::encoder::quant::reconstruct_residual`], which is the
+//! `crate::engine::encoder::quant::reconstruct_residual`, which is the
 //! decoder's §8.6.2 process run on the levels that were actually written.
 //!
 //! ## What is coded
 //!
 //! Every coding unit carries the intra luma mode
-//! [`crate::engine::encoder::rdo::decide_intra_luma_mode`] picked for it
+//! `crate::engine::encoder::rdo::decide_intra_luma_mode` picked for it
 //! out of all 35 Table 8-1 directions, searched against the same reference
 //! samples the block is then coded from, and signalled per §7.3.8.5: a
 //! `prev_intra_luma_pred_flag == 1` plus `mpm_idx` when the mode is in the
@@ -38,18 +38,18 @@
 //! The §8.7.2 deblocking filter runs: the PPS carries
 //! `pps_deblocking_filter_disabled_flag == 0` and the writer runs the
 //! decoder's own §8.7.2 driver over its reconstruction, so what
-//! [`write_idr_residual_slice`] returns is still exactly what a decoder holds.
+//! `write_idr_residual_slice` returns is still exactly what a decoder holds.
 //! It runs as a whole-picture pass after the last coding unit is coded rather
 //! than interleaved into coding order, because §8.4.4.2.2 intra prediction
 //! reads its neighbouring samples *prior to* the in-loop filter process — the
 //! filtered samples are the picture's output and the next picture's reference,
 //! never this picture's own prediction input. See
-//! [`crate::engine::encoder::recon::deblock_reconstruction`].
+//! `crate::engine::encoder::recon::deblock_reconstruction`.
 //!
 //! §8.7.3 SAO runs behind it, in the §8.7.1 order: the SPS carries
 //! `sample_adaptive_offset_enabled_flag == 1`, the writer searches both
 //! §8.7.3.2 types per CTB over the *deblocked* reconstruction
-//! ([`crate::engine::encoder::recon::sao_reconstruction`]) and codes the
+//! (`crate::engine::encoder::recon::sao_reconstruction`) and codes the
 //! §7.3.8.3 `sao( )` structure it found at the head of each CTB's slice data.
 //! Both types, because they reach different error: the four edge-offset
 //! classes shape the error around a local edge, while band offset shapes it
@@ -78,14 +78,14 @@
 //! same bits on a finer quantizer, so what those bits are worth is a property
 //! of the picture rather than of the QP, and the closed form misses this
 //! picture's own slope by 0.4x to 2.5x over the sweep. So it is measured:
-//! [`curve_point`] codes the same picture one QP finer, and
-//! [`calibrated_sao_lambda_q8`] reads off the curve through those two points
+//! `curve_point` codes the same picture one QP finer, and
+//! `calibrated_sao_lambda_q8` reads off the curve through those two points
 //! what `sao_bits` more of it is worth. When SAO does not clear that, the
 //! reconstruction reverts to the deblocked one and `slice_sao_luma_flag` /
 //! `slice_sao_chroma_flag` go out as 0, which §7.3.8.3 reads as "code
 //! nothing", leaving the cost at the two header bits.
 //!
-//! The probe is a second decision pass, so [`keeps_sao`] takes it only where
+//! The probe is a second decision pass, so `keeps_sao` takes it only where
 //! it can still change the answer — outside the band the calibrated
 //! multiplier is clamped to, the closed form settles the decision on its own,
 //! which over the sweep is half the pictures. Where the probe does run it
@@ -119,7 +119,7 @@
 //! bins outweigh what a value-range bias is worth.
 //!
 //! Those band-only bins carry no charge of their own any more. The per-CTB
-//! search is given [`coding_bins`](super::recon::coding_bins) itself, so
+//! search is given `coding_bins` itself, so
 //! every candidate is scored at what `code_sao` will really write for it —
 //! one §7.3.8.3 merge flag when the cell equals a decided neighbour, and the
 //! declined flags plus the whole structure when it does not — and the two
@@ -137,12 +137,12 @@
 //!
 //! Pricing SAO correctly makes it cheaper, and #400 is where the slice-level
 //! rule then had to answer for grids it used to decline. What it was getting
-//! wrong is not [`SAO_ACCEPTANCE_RESOLUTION_NUM`]: it is that the two-point
+//! wrong is not `SAO_ACCEPTANCE_RESOLUTION_NUM`: it is that the two-point
 //! model was being *extrapolated* past the one quantizer step the probe
 //! measures, on a curve that is steeper further out. See
-//! [`bracketed_reachable_sse`], which walks further rungs of the picture's own
+//! `bracketed_reachable_sse`, which walks further rungs of the picture's own
 //! ladder until the rate being judged is bracketed, and
-//! [`sao_search_lambda_q8`] and [`sao_spent_lambda_q8`], which are the
+//! `sao_search_lambda_q8` and `sao_spent_lambda_q8`, which are the
 //! search's own price and the re-read of it at the rate the grid it produced
 //! actually spends.
 //!

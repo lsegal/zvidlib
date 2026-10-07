@@ -27,7 +27,7 @@ pub mod vp9_dec;
 #[doc(hidden)]
 pub mod vp9_simd;
 
-use crate::vp9_dec::{DecodedPicture, Decoder};
+use crate::vp9_dec::Decoder;
 use crate::{
     CancellationToken, Codec, CodecImplementation, CodecProfile, CodecSupport, DecodedVideoFrame,
     EncodedVideoSample, Error, ErrorKind, HardwarePreference, Limits, PixelFormat, Result,
@@ -216,7 +216,11 @@ fn create_videotoolbox(
 
 /// Decodes `history` and then `chunk`, returning the picture `chunk` outputs.
 #[cfg(target_os = "macos")]
-fn replay(limits: &Limits, history: &[Vec<u8>], chunk: &[u8]) -> Result<DecodedPicture> {
+fn replay(
+    limits: &Limits,
+    history: &[Vec<u8>],
+    chunk: &[u8],
+) -> Result<zvidlib_vp9_syntax::DecodedPicture> {
     let mut decoder = Decoder::new(*limits);
     decoder.set_output_wanted(false);
     for earlier in history {
@@ -463,13 +467,14 @@ mod tests {
 
     /// Each hardware backend on its own, held to the software decoder.
     ///
-    /// `tests/vp9_hardware.rs` checks whichever backend the factory selects,
-    /// which is NVDEC on a host that has both it and Media Foundation; this
-    /// reaches every backend the host has. For each fixture, every frame of one
-    /// uninterrupted decode and of `ExactFrameReader`'s sequential, reverse and
-    /// alternating seeks must match the software decoder's, and so must every
-    /// reference slot shown again by `show_existing_frame`. A backend the host
-    /// lacks is skipped with the reason.
+    /// `crates/zvidlib-vp9-encoder/tests/vp9_hardware.rs` checks whichever
+    /// backend the factory selects, which is NVDEC on a host that has both it
+    /// and Media Foundation; this reaches every backend the host has. For each
+    /// fixture, every frame of one uninterrupted decode and of
+    /// `ExactFrameReader`'s sequential, reverse and alternating seeks must
+    /// match the software decoder's, and so must every reference slot shown
+    /// again by `show_existing_frame`. A backend the host lacks is skipped with
+    /// the reason.
     #[cfg(any(
         windows,
         all(target_os = "linux", target_pointer_width = "64"),

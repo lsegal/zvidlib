@@ -1,6 +1,6 @@
 # Third-party notices
 
-The NVIDIA NVDEC ABI declarations in `src/hevc/nvdec.rs` are derived from the
+The NVIDIA NVDEC ABI declarations in `crates/zvidlib-hardware/src/nvdec.rs` are derived from the
 `nvcuvid.h` and `cuviddec.h` headers in NVIDIA's Video Codec SDK samples.
 
 Copyright (c) 2010-2018 NVIDIA Corporation
@@ -24,7 +24,8 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ---
 
-Portions of `src/av1_encoder/` are adapted from the M0 lossless AV1 intra-keyframe
+Portions of `crates/zvidlib-av1-encoder/src/` and of the encoder-side transforms in
+`crates/zvidlib-av1/src/av1_encoder/` are adapted from the M0 lossless AV1 intra-keyframe
 encoder in [gamut](https://github.com/justin13888/gamut), commit
 `50e76fd1c8a315c02808d74c95ca9eb6e97a0e8d`. Those portions were modified for
 zvidlib's dependency-free monochrome AV1 Main-profile backend.
@@ -52,10 +53,10 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ---
 
-The VP8 probability, quantizer and mode tables in `src/vp8/tables.rs` are
+The VP8 probability, quantizer and mode tables in `crates/zvidlib-vp8/src/tables.rs` are
 transcribed from the reference decoder published in RFC 6386 section 20, and
-`src/vp8/` follows that decoder's structure. The VP8 test vectors and their MD5
-files in `tests/fixtures/codec/vp8/` are from the libvpx project. Both are
+`crates/zvidlib-vp8/src/` follows that decoder's structure. The VP8 test vectors and their MD5
+files in `crates/zvidlib-vp8/tests/fixtures/vp8/` are from the libvpx project. Both are
 distributed under the following license.
 
 
@@ -92,16 +93,16 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-The VP9 decoder's constant tables (`src/vp9_dec/tables.rs`) and its
-one-dimensional inverse transforms (`src/vp9_dec/idct1d.rs`) are generated
+The VP9 decoder's constant tables (`crates/zvidlib-vp9-decoder/src/vp9_dec/tables.rs`) and its
+one-dimensional inverse transforms (`crates/zvidlib-vp9-decoder/src/vp9_dec/idct1d.rs`) are generated
 from libvpx's `vp9/common` and `vpx_dsp` sources, and the rest of
-`src/vp9_dec/` follows the structure of libvpx's VP9 decoder, so that it
+`crates/zvidlib-vp9-decoder/src/vp9_dec/` follows the structure of libvpx's VP9 decoder, so that it
 decodes bit for bit as libvpx does.
 
 The VP9 default probability, quantizer and interpolation filter tables in
-`src/vp9_encoder/tables.rs` are generated from [libvpx](https://chromium.googlesource.com/webm/libvpx)
+`crates/zvidlib-vp9-encoder/src/tables.rs` are generated from [libvpx](https://chromium.googlesource.com/webm/libvpx)
 (`vp9/common/vp9_entropy.c`, `vp9_entropymode.c`, `vp9_quant_common.c` and
-`vp9_filter.c`), and the 4x4 forward transform in `src/vp9_encoder/dsp.rs`
+`vp9_filter.c`), and the 4x4 forward transform in `crates/zvidlib-vp9-encoder/src/dsp.rs`
 follows its `vp9/encoder/vp9_dct.c`.
 
 Copyright (c) 2010, The WebM Project authors. All rights reserved.
@@ -137,12 +138,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-`src/vorbis_decoder/` is the Vorbis decoder of
+`crates/zvidlib-vorbis-decoder/src/vorbis_decoder/` is the Vorbis decoder of
 [Symphonia](https://github.com/pdeljanov/Symphonia), `symphonia-codec-vorbis`
 0.5.5, modified by zvidlib to decode streams of more than two channels
 correctly and in the Vorbis channel order; the changes are listed at the top of
-`src/vorbis_decoder/mod.rs`. `src/vorbis_simd/kernels.rs` and
-`src/vorbis_simd/imdct.rs` restructure its synthesis loops and
+`crates/zvidlib-vorbis-decoder/src/vorbis_decoder/mod.rs`. `crates/zvidlib-vorbis-decoder/src/vorbis_simd/kernels.rs` and
+`crates/zvidlib-vorbis-decoder/src/vorbis_simd/imdct.rs` restructure its synthesis loops and
 `symphonia-core` 0.5.5's inverse MDCT for runtime-dispatched SIMD. Those files
 are covered by the Mozilla Public License, version 2.0, and keep its notice. A copy of the license is at
 <https://mozilla.org/MPL/2.0/>, and their source, as modified, is the files
@@ -152,7 +153,7 @@ Copyright (c) 2019-2022 The Project Symphonia Developers.
 
 ---
 
-`src/vorbis_encoder/` is a port of the encoder in libvorbis 1.3.7
+`crates/zvidlib-vorbis-encoder/src/vorbis_encoder/` is a port of the encoder in libvorbis 1.3.7
 (https://xiph.org/vorbis/), and its `tables/gen_*.rs` files are generated from
 libvorbis's own tables by `tools/vorbis_encoder/gen_tables.py`. The tools under
 `tools/vorbis_encoder/` build the unmodified libvorbis the port is checked

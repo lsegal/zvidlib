@@ -20,9 +20,10 @@
 //! The whole encode is the unit on purpose. The vector kernels cover the
 //! forward MDCT, the real FFT, the noise-mask fits, floor fitting and the log
 //! spectra; tone masking, coupling/quantization and residue coding are serial
-//! and stay scalar (see `src/vorbis_encoder/simd/mod.rs`). A whole-encode
-//! ratio is therefore the speedup a caller actually gets, diluted by the
-//! scalar stages, rather than a kernel-level ratio that overstates it.
+//! and stay scalar (see
+//! `crates/zvidlib-vorbis-encoder/src/vorbis_encoder/simd/mod.rs`). A
+//! whole-encode ratio is therefore the speedup a caller actually gets, diluted
+//! by the scalar stages, rather than a kernel-level ratio that overstates it.
 //!
 //! See `benches/README.md` for how to run and filter the suite.
 

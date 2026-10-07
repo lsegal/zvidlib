@@ -20,7 +20,7 @@
 //! bit on randomized and edge-case input for every instruction set the host
 //! supports.
 //!
-//! The inverse MDCT is this crate's own ([`Imdct`]) rather than
+//! The inverse MDCT is this crate's own (`Imdct`) rather than
 //! `symphonia_core`'s, which is the open question issue #572 settled: the only
 //! vector FFT Symphonia offers is `rustfft`'s, which chooses its own
 //! instruction set where [`crate::simd::set_override`] cannot reach it and
@@ -29,7 +29,7 @@
 //! # Selecting an instruction set
 //!
 //! The kernels follow the crate-wide [`crate::simd`] override, reported as the
-//! `vorbis_decode` site of [`crate::simd::active_by_site`].
+//! `vorbis_decode` site of `crate::simd::active_by_site`.
 
 // Targets with no vector implementation (`wasm32` in particular) never
 // instantiate the generic kernels, so the resulting unused-code warnings are

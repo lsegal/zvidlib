@@ -1,6 +1,6 @@
 //! Exact-frame VP8 decoding through the registered factory.
 //!
-//! `src/vp8/tests.rs` holds the decoder to libvpx's own MD5 of every shown
+//! `crates/zvidlib-vp8/src/tests.rs` holds the decoder to libvpx's own MD5 of every shown
 //! frame of the `vp80-00-comprehensive` vectors in `fixtures/codec/vp8/`.
 //! This checks the other half of the guarantee: that every frame comes back
 //! the same through `ExactFrameReader` whatever order it is asked for in, so
@@ -272,7 +272,7 @@ fn assert_every_order_matches(
 #[test]
 fn a_webm_vp8_track_skips_its_hidden_alternate_references() {
     // Issue #537: three of this track's 43 blocks are hidden alternate
-    // references. `src/vp8/tests.rs` holds the 40 shown frames to libvpx's
+    // references. `crates/zvidlib-vp8/src/tests.rs` holds the 40 shown frames to libvpx's
     // MD5s.
     let source = zvidlib::io::MemorySource::new(
         include_bytes!("../crates/zvidlib-vp8/tests/fixtures/vp8/vp8_altref_98x66.webm").to_vec(),

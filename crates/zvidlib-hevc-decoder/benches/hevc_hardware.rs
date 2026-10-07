@@ -2,12 +2,12 @@
 //!
 //! Its own `[[bench]]` target, like the other per-codec targets: it shares
 //! `benches/support/` with them but none of their decoded-frame fixtures, and
-//! `cargo bench --bench hevc_hardware` is its entry point.
+//! `cargo bench -p zvidlib-hevc-decoder --bench hevc_hardware` is its entry point.
 //!
 //! zvidlib ships three fixed-function HEVC backends behind
-//! `native_hevc_video_decoder_factory` — NVDEC (`src/hevc/nvdec.rs`), Windows
-//! Media Foundation (`src/hevc/windows_mf.rs`), and VideoToolbox
-//! (`src/hevc/videotoolbox.rs`) — with the pure-Rust software decoder as the
+//! `native_hevc_video_decoder_factory` — NVDEC (`crates/zvidlib-hardware/src/nvdec.rs`), Windows
+//! Media Foundation (`crates/zvidlib-hardware/src/windows_mf.rs`), and VideoToolbox
+//! (`crates/zvidlib-hardware/src/videotoolbox.rs`) — with the pure-Rust software decoder as the
 //! fallback. This group quantifies what that fallback costs on whichever
 //! backend the host actually provides.
 //!
@@ -45,7 +45,7 @@
 //! "where the backend exposes one". No backend exposed one, because the whole
 //! readback happens inside `submit`: `VideoDecoder` hands back a host-side
 //! [`zvidlib_core::VideoFrame`], the decoder configuration only accepts
-//! `PixelFormat::Rgba8` (`src/hevc/mod.rs`), and each backend maps its own
+//! `PixelFormat::Rgba8` (`crates/zvidlib-hevc-decoder/src/lib.rs`), and each backend maps its own
 //! surface and converts to RGBA before returning. Issue #283 settled what to do
 //! about that: not a public zero-copy output path — three platform handle types
 //! and an NV12 output family the crate cannot keep stable across drivers it
@@ -68,7 +68,7 @@
 //! the fixed-function backends; the software decoder's own conversion cost is
 //! already attributed by `zvidlib_hevc_decoder::decode_profile`'s `color_convert`
 //! stage and measured directly by `hevc_color_convert` in
-//! `benches/hevc_decode.rs`.
+//! `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`.
 //!
 //! # Hardware encode
 //!
@@ -115,7 +115,7 @@ const COMPARISON_FRAMES: u64 = 32;
 /// Environment variable that opts into the slow software comparison arm.
 ///
 /// Shared with the other groups that decode the bundled 1080p sample through
-/// the software decoder; see `benches/hevc_decode.rs`.
+/// the software decoder; see `crates/zvidlib-hevc-decoder/benches/hevc_decode.rs`.
 const LARGE_GROUP_ENV: &str = "ZVIDLIB_BENCH_LARGE";
 
 /// The backends compiled in for this target, for the group's log lines.
@@ -332,8 +332,8 @@ fn bench_readback(criterion: &mut Criterion, configuration: &VideoDecoderConfig,
 /// sample.
 ///
 /// Skips with a message rather than failing when the host has no hardware
-/// decoder, the way `tests/native_hevc_hardware.rs` does: a dev box without
-/// NVDEC must still be able to run `cargo bench`.
+/// decoder, the way `crates/zvidlib-hevc-encoder/tests/native_hevc_hardware.rs`
+/// does: a dev box without NVDEC must still be able to run `cargo bench`.
 fn hevc_hardware(criterion: &mut Criterion) {
     let factory = native_hevc_video_decoder_factory();
     let hardware = configuration(HardwarePreference::Require);
@@ -453,9 +453,10 @@ fn timed_encode(configuration: &VideoEncoderConfig, frames: &[VideoFrame]) -> (D
 /// Hardware HEVC encode of synthetic 1080p RGBA at 30 fps, as encoder session
 /// setup and as encode throughput through `finish`.
 ///
-/// The native encoder is not a comparison arm: at 1080p it spends seconds on
-/// a frame, and `benches/hevc_encode.rs` already measures it. Skips with a
-/// message when the host has no hardware encoder, as the decode group does.
+/// The native encoder is not a comparison arm: at 1080p it spends seconds on a
+/// frame, and `crates/zvidlib-hevc-encoder/benches/hevc_encode.rs` already
+/// measures it. Skips with a message when the host has no hardware encoder, as
+/// the decode group does.
 fn hevc_hardware_encode(criterion: &mut Criterion) {
     let configuration = encode_configuration();
     let factory = native_hevc_video_encoder_factory();

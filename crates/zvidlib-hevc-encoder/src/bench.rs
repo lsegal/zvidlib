@@ -1,9 +1,10 @@
 //! Benchmark-only access to the HEVC encoder's individual pipeline stages.
 //!
 //! `crate::hevc` is a private module, and criterion benchmarks are a separate
-//! crate, so the per-stage encoder groups in `benches/hevc_encode.rs` cannot
-//! reach `rdo::decide_picture`, the CABAC encoding engine, or the PCM
-//! bitstream writer through the public API. The public
+//! crate, so the per-stage encoder groups in
+//! `crates/zvidlib-hevc-encoder/benches/hevc_encode.rs` cannot reach
+//! `rdo::decide_picture`, the CABAC encoding engine, or the PCM bitstream
+//! writer through the public API. The public
 //! [`crate::native_hevc_video_encoder_factory`] runs all of them at once, which
 //! is exactly what a per-stage breakdown must avoid.
 //!

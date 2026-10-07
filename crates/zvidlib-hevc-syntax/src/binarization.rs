@@ -4069,7 +4069,7 @@ where
 /// **non-extended-precision** suffix branch
 /// (`extended_precision_processing_flag == 0`). The persistent and
 /// extended-precision branches are left for follow-up rounds; their
-/// inputs (StatCoeff[sbType], the §9.3.3.4 limited EGk shape) require
+/// inputs (StatCoeff\[sbType\], the §9.3.3.4 limited EGk shape) require
 /// trace material beyond what this round covers.
 pub fn decode_coeff_abs_level_remaining(
     engine: &mut CabacEngine<'_>,
@@ -4170,7 +4170,7 @@ pub fn signed_level_from_sign_flag(abs_level: u32, sign_flag: u8) -> i32 {
 /// columns are `na` since the FL `cMax = 1` binarization is one bin).
 ///
 /// Table 9-4 maps the element to its `Table 9-23` context bank; per
-/// [`SliceContexts`] this is the single-entry `abs_mvd_greater0_flag`
+/// `SliceContexts` this is the single-entry `abs_mvd_greater0_flag`
 /// array (inter slices only). The caller passes the corresponding
 /// [`ContextModel`]; this function returns the fixed `ctxInc`.
 #[must_use]
@@ -4318,7 +4318,7 @@ where
 /// CABAC engine.
 ///
 /// `ctx_greater0` and `ctx_greater1` are the caller's
-/// [`SliceContexts::abs_mvd_greater0_flag`] / `abs_mvd_greater1_flag`
+/// `SliceContexts::abs_mvd_greater0_flag` / `abs_mvd_greater1_flag`
 /// single-entry context models (Table 9-23 banks); they are mutated in
 /// place per the §9.3.4.3.2.2 state transition. The `abs_mvd_minus2`
 /// EG1 escape and the `mvd_sign_flag` bit are read via
