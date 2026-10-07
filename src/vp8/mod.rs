@@ -33,10 +33,10 @@
 //! decoding is exact, so all three produce the same pixels. VideoToolbox
 //! exposes no VP8 decoder, so macOS decodes in software.
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod bench;
 mod bool_decoder;
 mod bool_encoder;
+pub mod decode_bench;
 mod decoder;
 mod encoder;
 mod frame_encoder;

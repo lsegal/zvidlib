@@ -11,8 +11,8 @@
 use super::bool_decoder::BoolDecoder;
 use super::loop_filter::{FrameFilter, MacroblockFilter, filter_frame};
 use super::predict::{
-    Edges, Plane, idct_add, idct_dc_add, inverse_walsh, macroblock_edges, predict_block,
-    predict_inter, predict_subblock,
+    Edges, Plane, idct_add, idct_dc_add, idct_dc_add_row, inverse_walsh, macroblock_edges,
+    predict_block, predict_inter, predict_subblock,
 };
 use super::tables::*;
 use crate::{Error, ErrorKind, Limits, Result};
@@ -1234,9 +1234,23 @@ fn read_tokens(
 /// plane at `origin`.
 fn add_residual(blocks: &[[i16; 16]], plane: &mut Plane, origin: usize, per_row: usize) {
     let stride = plane.width;
-    for (index, block) in blocks.iter().enumerate() {
-        let offset = origin + (index / per_row) * 4 * stride + (index % per_row) * 4;
-        add_block_residual(block, &mut plane.data, offset, stride);
+    for (row, blocks) in blocks.chunks_exact(per_row).enumerate() {
+        let offset = origin + row * 4 * stride;
+        if blocks
+            .iter()
+            .all(|block| block[1..].iter().all(|&value| value == 0))
+        {
+            // A row of DC-only blocks, the common case at low rates, is one
+            // call rather than `per_row`.
+            let dcs: [i16; 4] = std::array::from_fn(|index| blocks.get(index).map_or(0, |b| b[0]));
+            if dcs.iter().any(|&dc| dc != 0) {
+                idct_dc_add_row(&dcs[..per_row], &mut plane.data, offset, stride);
+            }
+            continue;
+        }
+        for (index, block) in blocks.iter().enumerate() {
+            add_block_residual(block, &mut plane.data, offset + index * 4, stride);
+        }
     }
 }
 

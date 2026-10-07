@@ -1,30 +1,30 @@
 //! Scalar-versus-SIMD benchmarks for zvidlib's pure-Rust VP8 software decoder
 //! (issue #568).
 //!
-//! The VP8 counterpart to `benches/av1_decode.rs` and `benches/hevc_decode.rs`.
-//! Every group runs once per instruction set `zvidlib::simd::available()`
-//! reports, through the crate-wide override in [`zvidlib::simd`], and
+//! The decode-side counterpart to `benches/vp8_encode.rs`, which times the
+//! reconstruction kernels the encoder and decoder share (`vp8_recon`). This
+//! target times what only the decoder runs, and the decoder as a whole. Every
+//! group runs once per instruction set `zvidlib::simd::available()` reports,
+//! through the crate-wide override in [`zvidlib::simd`], and
 //! `benches/support/isa.rs` asserts both that each arm is bit-exact with scalar
 //! before timing it and that the override really landed in every dispatch
-//! family, `vp8_decode` included.
+//! family.
 //!
 //! # Groups
 //!
-//! | Group | Stage | Vectorized |
+//! | Group | Stage | Site |
 //! | --- | --- | --- |
-//! | `vp8_decode_720p` | whole-frame decode of a synthetic 1280x720 stream, to the decoded planes | n/a |
-//! | `vp8_decode_conformance` | whole-frame decode of all 18 `vp80-00-comprehensive` vectors | n/a |
-//! | `vp8_inverse_transform` | inverse WHT, inverse DCT and its DC-only shortcut, added to the prediction | yes |
-//! | `vp8_inter_pred_sixtap` | six-tap sub-pixel prediction of 16x16, 8x8 and 4x4 blocks | yes |
-//! | `vp8_inter_pred_bilinear` | bilinear sub-pixel prediction of the same blocks | yes |
-//! | `vp8_intra_pred` | 16x16 and 8x8 TM prediction and the ten 4x4 subblock modes | yes |
-//! | `vp8_loop_filter_normal` | the normal loop filter over a whole frame, macroblock and subblock edges | yes |
-//! | `vp8_loop_filter_simple` | the simple loop filter over a whole frame's luma | yes |
+//! | `vp8_decode_720p` | whole-frame decode of a synthetic 1280x720 stream, to the decoded planes | every VP8 site |
+//! | `vp8_decode_conformance` | whole-frame decode of all 18 `vp80-00-comprehensive` vectors | every VP8 site |
+//! | `vp8_decode_stage_subblock_pred` | the ten 4x4 subblock intra predictors over a whole 1280x720 luma plane | `vp8_decode` |
+//! | `vp8_decode_stage_dc_idct` | the DC-only inverse DCT over every 4x4 block of a frame | `vp8_decode` |
+//! | `vp8_decode_stage_bilinear` | bilinear sub-pixel prediction (bitstream versions 1-3) of 16x16, 8x8 and 4x4 blocks | `vp8_recon` |
+//! | `vp8_decode_stage_loop_filter_simple` | the simple loop filter over a whole frame's luma | `vp8_recon` |
 //!
 //! The whole-frame groups include the boolean entropy decoder, which is serial
-//! and has no vector path, so their ratio is below the per-stage ones by however
-//! much of a decode that owns. Neither converts to RGBA: that is the shared
-//! `convert_to_rgba8`, tracked separately.
+//! and has no vector path, and neither converts to RGBA (that is
+//! `vpx_decode`'s `vp8_decode_frame`), so their ratio sits below the per-stage
+//! ones.
 //!
 //! The per-stage inputs come from `zvidlib::vp8_decoder_bench`, a narrow public
 //! surface over the otherwise crate-private decoder.
@@ -124,7 +124,9 @@ fn vp8_decode_conformance(criterion: &mut Criterion) {
     let vectors = conformance_vectors();
     let frames: u64 = vectors.iter().map(|frames| frames.len() as u64).sum();
     let workload = IsaWorkload {
-        measurement_time: Duration::from_secs(5),
+        // One pass is over half a second, so criterion's ten samples need
+        // more than its default window.
+        measurement_time: Duration::from_secs(15),
         ..IsaWorkload::new("vp8_decode_conformance", FrameWork::new(frames, 176, 144))
     };
     bench_across_isas(criterion, &workload, || {
@@ -140,43 +142,27 @@ fn vp8_decode_conformance(criterion: &mut Criterion) {
 // Per-stage groups
 // ---------------------------------------------------------------------------
 
-fn vp8_inverse_transform(criterion: &mut Criterion) {
-    let inputs = stage_inputs();
-    bench_across_isas(criterion, &kernel_workload("vp8_inverse_transform"), || {
-        inputs.inverse_transforms()
-    });
-}
-
-fn vp8_inter_pred(criterion: &mut Criterion) {
-    let inputs = stage_inputs();
-    bench_across_isas(criterion, &kernel_workload("vp8_inter_pred_sixtap"), || {
-        inputs.inter_prediction(false)
-    });
-    bench_across_isas(
-        criterion,
-        &kernel_workload("vp8_inter_pred_bilinear"),
-        || inputs.inter_prediction(true),
-    );
-}
-
-fn vp8_intra_pred(criterion: &mut Criterion) {
-    let inputs = stage_inputs();
-    bench_across_isas(criterion, &kernel_workload("vp8_intra_pred"), || {
-        inputs.intra_prediction()
-    });
-}
-
-fn vp8_loop_filter(criterion: &mut Criterion) {
+fn vp8_decode_stages(criterion: &mut Criterion) {
     let inputs = stage_inputs();
     bench_across_isas(
         criterion,
-        &kernel_workload("vp8_loop_filter_normal"),
-        || inputs.loop_filter(false),
+        &kernel_workload("vp8_decode_stage_subblock_pred"),
+        || inputs.subblock_prediction(),
     );
     bench_across_isas(
         criterion,
-        &kernel_workload("vp8_loop_filter_simple"),
-        || inputs.loop_filter(true),
+        &kernel_workload("vp8_decode_stage_dc_idct"),
+        || inputs.dc_inverse_dct(),
+    );
+    bench_across_isas(
+        criterion,
+        &kernel_workload("vp8_decode_stage_bilinear"),
+        || inputs.bilinear_prediction(),
+    );
+    bench_across_isas(
+        criterion,
+        &kernel_workload("vp8_decode_stage_loop_filter_simple"),
+        || inputs.simple_loop_filter(),
     );
 }
 
@@ -185,9 +171,6 @@ criterion_group!(
     log_host_isas,
     vp8_decode_720p,
     vp8_decode_conformance,
-    vp8_inverse_transform,
-    vp8_inter_pred,
-    vp8_intra_pred,
-    vp8_loop_filter
+    vp8_decode_stages
 );
 criterion_main!(benches);

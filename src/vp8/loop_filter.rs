@@ -1,12 +1,8 @@
 //! The VP8 loop filter (RFC 6386 section 15), applied to a whole frame after
 //! every macroblock has been reconstructed.
-//!
-//! Each edge is filtered by the vector kernels in [`super::simd`] where the
-//! host has them, many segments of the edge per instruction;
-//! [`filter_edge_scalar`] is the reference they are bit-exact with.
 
 use super::predict::Plane;
-use super::simd::{self, EdgeThresholds};
+use super::simd::{self, EdgeLimits};
 
 /// Per-macroblock filter parameters, already adjusted for segment and mode.
 #[derive(Clone, Copy, Debug, Default)]
@@ -170,8 +166,7 @@ fn limits(level: u8, frame: FrameFilter) -> Limits {
 }
 
 /// Filters `count` segments across one edge. `at` is the first `q0` index,
-/// `step` crosses the edge and `advance` moves along it; one of the two is
-/// 1 and the other the plane's stride.
+/// `step` crosses the edge and `advance` moves along it.
 #[allow(clippy::too_many_arguments)]
 fn filter_edge(
     data: &mut [u8],
@@ -183,53 +178,28 @@ fn filter_edge(
     limits: Limits,
     simple: bool,
 ) {
-    let thresholds = EdgeThresholds {
-        edge_limit: if macroblock_edge {
-            limits.macroblock_edge
-        } else {
-            limits.subblock_edge
-        },
+    let edge_limit = if macroblock_edge {
+        limits.macroblock_edge
+    } else {
+        limits.subblock_edge
+    };
+    // The segments along an edge are independent of each other, so the
+    // vector kernels filter a vector of them at a time.
+    let vector = EdgeLimits {
+        edge: edge_limit,
         interior: limits.interior,
         hev_threshold: limits.hev_threshold,
-    };
-    let stride = step.max(advance);
-    if !simd::filter_edge(
-        simd::active_isa(),
-        data,
-        at,
-        step,
-        stride,
-        count,
         macroblock_edge,
-        thresholds,
         simple,
-    ) {
-        filter_edge_scalar(
-            data,
-            at,
-            step,
-            advance,
-            count,
-            macroblock_edge,
-            thresholds,
-            simple,
-        );
+    };
+    let vectorized = if step == 1 {
+        simd::filter_vertical_edge(data, at, advance, count, vector)
+    } else {
+        simd::filter_horizontal_edge(data, at, step, count, vector)
+    };
+    if vectorized {
+        return;
     }
-}
-
-/// The scalar reference for [`simd::filter_edge`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn filter_edge_scalar(
-    data: &mut [u8],
-    at: usize,
-    step: usize,
-    advance: usize,
-    count: usize,
-    macroblock_edge: bool,
-    thresholds: EdgeThresholds,
-    simple: bool,
-) {
-    let edge_limit = thresholds.edge_limit;
     for index in 0..count {
         let mut segment = Segment {
             data: &mut *data,
@@ -240,8 +210,8 @@ pub(crate) fn filter_edge_scalar(
             if segment.simple_threshold(edge_limit) {
                 segment.common(true);
             }
-        } else if segment.normal_threshold(edge_limit, thresholds.interior) {
-            let hev = segment.high_edge_variance(thresholds.hev_threshold);
+        } else if segment.normal_threshold(edge_limit, limits.interior) {
+            let hev = segment.high_edge_variance(limits.hev_threshold);
             if macroblock_edge && !hev {
                 segment.macroblock();
             } else {

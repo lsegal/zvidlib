@@ -120,15 +120,15 @@ fn decodes_every_test_vector_exactly_as_libvpx_does() {
 }
 
 /// The vectors again under every instruction set the host has, pinned through
-/// the crate-wide override, so the scalar reference and each vector arm are
-/// all held to libvpx rather than only whichever one detection picks
-/// (issue #568).
+/// the crate-wide override, so the scalar reference and each vector arm of
+/// the `vp8_recon` and `vp8_decode` kernels are all held to libvpx rather than
+/// only whichever one detection picks (issue #568).
 #[test]
 fn every_instruction_set_decodes_every_test_vector_exactly_as_libvpx_does() {
     let _guard = crate::simd::test_lock();
     for isa in crate::simd::available() {
         crate::simd::set_override(Some(isa));
-        assert_eq!(super::simd::active_isa(), isa);
+        assert_eq!(super::simd::decode_isa(), isa);
         check_every_test_vector(isa.name());
     }
     crate::simd::set_override(None);

@@ -54,14 +54,6 @@ name = "av1_decode"
 path = "benches/av1_decode.rs"
 harness = false
 
-# The VP8 software decoder's own scalar-vs-SIMD suite (issue #568): its
-# whole-frame decode and the per-stage groups behind the `vp8_decode` dispatch
-# site. A separate target for the same reason `av1_decode` is one.
-[[bench]]
-name = "vp8_decode"
-path = "benches/vp8_decode.rs"
-harness = false
-
 # The AV1 encoder's own scalar-vs-SIMD suite. Encoder kernels are measured
 # separately from `av1_decode` so neither target's name overstates its scope,
 # and separately from `codec` because it shares none of that target's
@@ -82,6 +74,14 @@ harness = false
 [[bench]]
 name = "hevc_decode"
 path = "benches/hevc_decode.rs"
+harness = false
+
+# The native Vorbis encoder's scalar-vs-SIMD suite (issue #573): whole encodes
+# through the public factory, one arm per instruction set. Synthetic input
+# only, so it shares nothing with `codec`'s decoded-fixture cache.
+[[bench]]
+name = "vorbis_encode"
+path = "benches/vorbis_encode.rs"
 harness = false
 
 # The audio decode path is a separate target rather than another group in
@@ -128,6 +128,23 @@ harness = false
 [[bench]]
 name = "hevc_hardware"
 path = "benches/hevc_hardware.rs"
+harness = false
+
+# The VP8 software decoder's scalar-vs-SIMD suite (issue #568): its whole-frame
+# decode and the stages only the decoder runs. The kernels it shares with the
+# encoder are timed by `vp8_encode`.
+[[bench]]
+name = "vp8_decode"
+path = "benches/vp8_decode.rs"
+harness = false
+
+# The native VP8 encoder's scalar-vs-SIMD suite: whole frames through the
+# public encoder and each of its `vp8_encode` and `vp8_recon` kernels. Its own
+# target for the same reason as `av1_encode`: it shares none of `codec`'s
+# decoded-frame fixtures, and its name says what it measures.
+[[bench]]
+name = "vp8_encode"
+path = "benches/vp8_encode.rs"
 harness = false
 
 # Issue #395's measurement: what an exact frame at an arbitrary point of a track

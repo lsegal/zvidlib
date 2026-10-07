@@ -117,6 +117,7 @@ impl Backend {
         let modenumber = vb.w;
         let info = &self.ci.maps[modenumber];
         let psy_index = vb.blocktype + if vb.w != 0 { 2 } else { 0 };
+        let isa = super::simd::active_isa();
         let mut global_ampmax = *ampmax;
         let mut local_ampmax = vec![0f32; channels];
         let mut nonzero = vec![false; channels];
@@ -145,23 +146,18 @@ impl Backend {
             apply_window(pcm, &self.window, &self.ci.blocksizes, vb.lw, vb.w, vb.nw);
 
             // transform the PCM data; only MDCT right now....
-            self.transform[vb.w].forward(pcm, &mut sc.gmdct[i], &mut sc.mdct_w);
+            self.transform[vb.w].forward(isa, pcm, &mut sc.gmdct[i], &mut sc.mdct_w);
 
             // FFT yields more accurate tonal estimation (not phase sensitive)
-            self.fft_look[vb.w].forward(pcm, &mut sc.fft_ch);
+            self.fft_look[vb.w].forward(isa, pcm, &mut sc.fft_ch);
             // logfft aliases pcm (written in place, as in C)
             pcm[0] = (f64::from(scale_db + todb(pcm[0])) + 0.345) as f32;
             *lamp = pcm[0];
-            let mut j = 1;
-            while j < n - 1 {
-                let temp = pcm[j] * pcm[j] + pcm[j + 1] * pcm[j + 1];
-                // C: temp=logfft[(j+1)>>1]=scale_dB+.5f*todB(&temp) + .345;
-                let temp = (f64::from(scale_db + 0.5 * todb(temp)) + 0.345) as f32;
-                pcm[(j + 1) >> 1] = temp;
+            super::simd::log_fft(isa, pcm, n, scale_db);
+            for &temp in &pcm[1..n / 2] {
                 if temp > *lamp {
                     *lamp = temp;
                 }
-                j += 2;
             }
 
             if *lamp > 0. {
@@ -183,12 +179,10 @@ impl Backend {
             let mdct = &mut sc.gmdct[i];
             let (logfft, logmdct) = vb.pcm[i].split_at_mut(half);
 
-            for j in 0..half {
-                logmdct[j] = (f64::from(todb(mdct[j])) + 0.345) as f32;
-            }
+            super::simd::log_mdct(isa, &mdct[..half], &mut logmdct[..half]);
 
             // first step; noise masking
-            psy_look.noisemask(&mut sc.psy, logmdct, &mut sc.noise);
+            psy_look.noisemask(isa, &mut sc.psy, logmdct, &mut sc.noise);
 
             // second step: 'all the other crap'; tone masking, peak limiting and ATH
             psy_look.tonemask(&mut sc.psy, logfft, &mut sc.tone, global_ampmax, lamp);
@@ -199,7 +193,7 @@ impl Backend {
 
             // this algorithm is hardwired to floor 1 for now
             let floor = &self.flr[info.floorsubmap[submap] as usize];
-            floor_posts.push(floor.fit(logmdct, logfft));
+            floor_posts.push(floor.fit(isa, logmdct, logfft));
         }
 
         *ampmax = global_ampmax;
@@ -275,5 +269,26 @@ impl Backend {
                 &mut sc.res_work,
             );
         }
+    }
+}
+
+/// `logmdct[j] = todB(mdct[j]) + .345` from bin `from` on (C promotes the
+/// sum to double).
+pub(super) fn log_mdct_scalar(mdct: &[f32], logmdct: &mut [f32], from: usize) {
+    for j in from..logmdct.len() {
+        logmdct[j] = (f64::from(todb(mdct[j])) + 0.345) as f32;
+    }
+}
+
+/// The power spectrum of a packed real FFT, bins `from..n/2`, in place: bin
+/// `k` is `scale_dB + .5 * todB(re^2 + im^2) + .345` of floats `2k-1` and
+/// `2k`. The running maximum C keeps alongside is taken by the caller.
+pub(super) fn log_fft_scalar(pcm: &mut [f32], n: usize, scale_db: f32, from: usize) {
+    let mut j = 2 * from - 1;
+    while j < n - 1 {
+        let temp = pcm[j] * pcm[j] + pcm[j + 1] * pcm[j + 1];
+        // C: temp=logfft[(j+1)>>1]=scale_dB+.5f*todB(&temp) + .345;
+        pcm[(j + 1) >> 1] = (f64::from(scale_db + 0.5 * todb(temp)) + 0.345) as f32;
+        j += 2;
     }
 }
