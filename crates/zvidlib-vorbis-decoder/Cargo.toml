@@ -1,0 +1,13 @@
+[package]
+name = "zvidlib-vorbis-decoder"
+description = "Pure-Rust Vorbis decoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+symphonia-core = { workspace = true }

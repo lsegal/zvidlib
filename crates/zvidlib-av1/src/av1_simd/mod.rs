@@ -1,0 +1,833 @@
+//! Runtime-dispatched SIMD kernels for the AV1 transforms and in-loop filters.
+//!
+//! The AV1 encoder and decoder in this crate are dependency-free pure Rust, so
+//! their per-sample inner loops (transform butterflies, deblocking, CDEF, and
+//! loop restoration) are where nearly all of the frame time goes. This module
+//! adds vectorized implementations of those kernels for SSE4.1 and AVX2 on
+//! `x86_64` and NEON on `aarch64`, selected once per process by runtime CPU
+//! feature detection, with the existing scalar code kept as the fallback for
+//! every other target (including `wasm32`) and for the edge cases the vector
+//! kernels deliberately do not cover.
+//!
+//! # Bit-exactness
+//!
+//! Every kernel here is a lane-by-lane transliteration of the scalar routine it
+//! replaces, so the two produce identical output rather than merely similar
+//! output. Where the scalar reference accumulates in `i64`, the vector kernel
+//! either proves the `i32` range is sufficient for 8-bit input (the filters) or
+//! range-checks its input and defers to the scalar path when the check fails
+//! (the transforms; see `transforms::WHT_INPUT_LIMIT` and
+//! `transforms::input_limit`). Positions whose taps would need edge
+//! clamping stay on the scalar path as well, so the vector kernels never read
+//! outside a plane. `tests/av1_simd.rs` asserts equality against the scalar
+//! path for every instruction set the host supports.
+//!
+//! # Selecting an instruction set
+//!
+//! [`active_isa`] reports what the kernels will use. [`set_active_isa`] forces
+//! a specific one (or restores automatic detection with `None`); it exists for
+//! the bit-exactness tests and the benchmark, both of which need to run the
+//! same input through more than one implementation, and it is safe to call at
+//! any time because all implementations agree.
+
+// Targets with no vector implementation (`wasm32` in particular) never
+// instantiate the generic kernels and never reach the dispatchers' vector
+// arms, so the resulting unused-code warnings are silenced there and only
+// there.
+#![cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code, unused_variables, unreachable_code)
+)]
+
+use crate::av1_intra::Tx1d;
+
+#[doc(hidden)]
+pub mod coeff;
+pub(crate) mod filters;
+pub(crate) mod transforms;
+pub(crate) use crate::simd::vector;
+
+pub use crate::simd::{SimdIsa, available_isas, detected_isa, lanes};
+
+/// The instruction set the kernels will actually use.
+///
+/// This is the crate-wide [`crate::simd::active`] value; the override lives in
+/// [`crate::simd`] so that pinning an instruction set reaches the HEVC kernels
+/// and the other AV1 dispatch sites too, not just this module.
+#[must_use]
+pub fn active_isa() -> SimdIsa {
+    crate::simd::active()
+}
+
+/// Forces every SIMD kernel in the crate onto `isa`, or restores automatic
+/// detection with `None`.
+///
+/// Retained as the historical AV1-facing spelling of
+/// [`crate::simd::set_override`], which it delegates to; prefer that entry
+/// point in new code.
+///
+/// Every implementation is bit-exact with every other, so this only changes
+/// performance, never output. Passing an instruction set this host does not
+/// support pins the scalar path instead.
+pub fn set_active_isa(isa: Option<SimdIsa>) {
+    crate::simd::set_override(isa);
+}
+
+// ---------------------------------------------------------------------
+// Per-instruction-set entry points
+//
+// Each kernel gets one `#[target_feature]` wrapper per instruction set. The
+// wrappers are what make the generic kernel bodies legal to run: the intrinsics
+// they inline are only valid once the feature is known present, which the
+// dispatchers below establish through `active_isa`.
+//
+// Every kernel a wrapper names is `#[inline(always)]`, and that is a
+// correctness-of-codegen requirement rather than a speed hint. A
+// `#[target_feature]` attribute applies to the function it is written on, not
+// to what that function calls, so a generic kernel body is only compiled with
+// the feature enabled when it is inlined *into* the wrapper. A copy the
+// inliner declined - which is what happened to the large kernels, the
+// deblocking pair and the transform drivers, once they outgrew its size
+// budget - is instead built at the target's baseline instruction set. There
+// the intrinsics cannot be lowered inline and each becomes an out-of-line call
+// through `core::core_arch` with its operand spilled to the stack, so the
+// "vector" kernel runs several times slower than the scalar reference it
+// replaces. On `aarch64` this is invisible, because NEON is in the baseline
+// and every intrinsic lowers inline either way; on `x86_64` it cost the AVX2
+// deblocking arms roughly eight times scalar and the SSE4.1 transforms four
+// times (issue #336).
+//
+// The 4- and 8-point transforms have no useful 256-bit shape (a whole 8x8
+// coefficient block is four AVX2 registers), so AVX2 hosts run them through the
+// SSE4.1 path and spend the wider registers on the pixel filters instead.
+//
+// Nothing in the type system enforces that, and a kernel that loses the
+// attribute stays bit-exact, so no test here notices - only the ratio against
+// scalar on an x86_64 host does.
+// `.github/scripts/check_simd_target_features.py` reads it off the emitted
+// assembly instead, failing on an out-of-line `core::core_arch` intrinsic or on
+// a generic kernel left standing as its own symbol, and CI runs it on the
+// x86_64 job.
+// ---------------------------------------------------------------------
+
+macro_rules! simd_entry_points {
+    (
+        $(#[$meta:meta])*
+        fn [$sse:ident, $avx:ident, $neon:ident]($($arg:ident : $ty:ty),* $(,)?) $(-> $ret:ty)?
+            = $module:ident::$kernel:ident, avx2 = $avx_vector:ident;
+    ) => {
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "sse4.1")]
+        $(#[$meta])*
+        unsafe fn $sse($($arg: $ty),*) $(-> $ret)? {
+            unsafe { $module::$kernel::<vector::Sse4>($($arg),*) }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2")]
+        $(#[$meta])*
+        unsafe fn $avx($($arg: $ty),*) $(-> $ret)? {
+            unsafe { $module::$kernel::<vector::$avx_vector>($($arg),*) }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[target_feature(enable = "neon")]
+        $(#[$meta])*
+        unsafe fn $neon($($arg: $ty),*) $(-> $ret)? {
+            unsafe { $module::$kernel::<vector::Neon>($($arg),*) }
+        }
+    };
+}
+
+simd_entry_points! {
+    fn [iwht4x4_sse41, iwht4x4_avx2, iwht4x4_neon](quant: &[i32; 16]) -> [i32; 16]
+        = transforms::iwht4x4, avx2 = Sse4;
+}
+simd_entry_points! {
+    fn [fwht4x4_sse41, fwht4x4_avx2, fwht4x4_neon](residual: &[i32; 16]) -> [i32; 16]
+        = transforms::fwht4x4, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx4_sse41, tx4_avx2, tx4_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform4, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx8_sse41, tx8_avx2, tx8_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform8, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx16_sse41, tx16_avx2, tx16_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform16, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx32_sse41, tx32_avx2, tx32_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform32, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [tx64_sse41, tx64_avx2, tx64_neon](
+        dequantized: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i16]
+    ) -> bool = transforms::inverse_transform64, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd4_sse41, fwd4_avx2, fwd4_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform4, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd8_sse41, fwd8_avx2, fwd8_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform8, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd16_sse41, fwd16_avx2, fwd16_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform16, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn [fwd32_sse41, fwd32_avx2, fwd32_neon](
+        residual: &[i32], column: Tx1d, row: Tx1d,
+        lr_flip: bool, ud_flip: bool, out: &mut [i32]
+    ) -> bool = transforms::forward_transform32, avx2 = Sse4;
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
+        data: &mut [u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
+    ) = filters::deblock_edge_horizontal, avx2 = Avx2;
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [deblock_v_sse41, deblock_v_avx2, deblock_v_neon](
+        data: &mut [u8], geom: filters::Geometry, x: usize, y0: usize, count: usize,
+        limit: i32, blimit: i32, thresh: i32, sizes: &[i32]
+    ) = filters::deblock_edge_vertical, avx2 = Avx2;
+}
+simd_entry_points! {
+    fn [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](
+        data: &[u8], geom: filters::Geometry, x0: usize, y0: usize, dr: i32, dc: i32
+    ) -> (i32, i32) = filters::cdef_direction_stats, avx2 = Avx2;
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [cdef_row_sse41, cdef_row_avx2, cdef_row_neon](
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        primary: &[filters::CdefTap], primary_strength: i32, primary_damping_adj: i32,
+        secondary: &[filters::CdefTap], secondary_strength: i32, secondary_damping_adj: i32,
+        total_weight: i32, dst: &mut [u8]
+    ) = filters::cdef_filter_row, avx2 = Avx2;
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [wiener_h_sse41, wiener_h_avx2, wiener_h_neon](
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        taps: [i32; 3], center_tap: i32, out: &mut [i32]
+    ) = filters::wiener_horizontal_row, avx2 = Avx2;
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [wiener_v_sse41, wiener_v_avx2, wiener_v_neon](
+        intermediate: &[i32], width: usize, height: usize, row: usize, column: usize,
+        count: usize, taps: [i32; 3], center_tap: i32, dst: &mut [u8]
+    ) = filters::wiener_vertical_row, avx2 = Avx2;
+}
+simd_entry_points! {
+    fn [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](
+        plane: &[i32], size: usize, base_out: &mut [i32], br_out: &mut [i32]
+    ) = coeff::block_contexts, avx2 = Avx2;
+}
+
+/// The row-pair AVX2 arm of [`coeff_contexts`], for the one block shape the
+/// row-at-a-time kernel cannot fill: a row exactly half the vector's width.
+///
+/// This is its own wrapper rather than a fourth arm of `simd_entry_points!`
+/// because the kernel it wraps is not the generic one - it needs
+/// [`vector::HalfPairs`], which only the 256-bit vector implements. The
+/// `#[inline(always)]` on the kernel is load-bearing here for the same codegen
+/// reason as everywhere else in this module.
+///
+/// # Safety
+///
+/// The caller must have established AVX2 support and `size * 2 == 8`, which
+/// [`coeff_ctx_row_pairs`] is what decides.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn coeff_ctx_pairs_avx2(
+    plane: &[i32],
+    size: usize,
+    base_out: &mut [i32],
+    br_out: &mut [i32],
+) {
+    unsafe { coeff::block_contexts_row_pairs::<vector::Avx2>(plane, size, base_out, br_out) }
+}
+simd_entry_points! {
+    #[allow(clippy::too_many_arguments)]
+    fn [box_stats_sse41, box_stats_avx2, box_stats_neon](
+        data: &[u8], geom: filters::Geometry, x0: usize, y: usize, count: usize,
+        radius: usize, sums: &mut [i32], sums_sq: &mut [i32]
+    ) = filters::box_stats_row, avx2 = Avx2;
+}
+
+/// Expands to a `match` over `$isa` that calls the matching wrapper, evaluating
+/// to `$fallback` on scalar or on an instruction set this build cannot reach.
+macro_rules! dispatch {
+    ($isa:expr, [$sse:ident, $avx:ident, $neon:ident]($($arg:expr),* $(,)?), $fallback:expr) => {
+        match $isa {
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Sse41 => unsafe { $sse($($arg),*) },
+            #[cfg(target_arch = "x86_64")]
+            SimdIsa::Avx2 => unsafe { $avx($($arg),*) },
+            #[cfg(target_arch = "aarch64")]
+            SimdIsa::Neon => unsafe { $neon($($arg),*) },
+            _ => $fallback,
+        }
+    };
+}
+
+// ---------------------------------------------------------------------
+// Safe dispatchers used by the AV1 transform and filter modules
+// ---------------------------------------------------------------------
+
+/// Whether a `size x size` block under `isa` runs the row-pair kernel
+/// [`coeff::block_contexts_row_pairs`] rather than the row-at-a-time
+/// [`coeff::block_contexts`].
+///
+/// That kernel packs rows `r` and `r + 1` into the two halves of one vector, so
+/// it applies exactly when a row is half the vector's width: AVX2's eight lanes
+/// against a 4-wide block, the shape #362 measured as AVX2's worst and the only
+/// narrow one `choose_tx_size` can actually pick. Everything else - every other
+/// size, every other instruction set - keeps the generic kernel.
+#[cfg(target_arch = "x86_64")]
+fn coeff_ctx_row_pairs(isa: SimdIsa, size: usize) -> bool {
+    use vector::I32x as _;
+    isa == SimdIsa::Avx2 && size * 2 == vector::Avx2::LANES
+}
+
+/// The instruction set [`coeff_contexts`] runs a `size x size` block under,
+/// which is `isa` itself everywhere except the one case below.
+///
+/// x86_64 blocks narrower than AVX2's eight lanes run the SSE4.1 kernel even on
+/// an AVX2 host, the way [`fwht4x4`] keeps x86_64 on its scalar reference for
+/// #337 / #342 — **unless** [`coeff_ctx_row_pairs`] covers them, which at size
+/// 4 it now does.
+///
+/// The redirect exists because the row-at-a-time kernel steps along a *row* of
+/// the block, so a row shorter than the vector cannot be split across more than
+/// one iteration however wide the vector is: a 4x4 block is one iteration per
+/// row under SSE4.1 *and* under AVX2, four of AVX2's eight lanes idle in every
+/// one of them. Identical work at twice the width is at best a tie, and it is
+/// not even that, because the tail store is the one thing the widths do not
+/// share: `store_masked` forwards a full vector straight to the store
+/// instruction and stages a partial one through a stack buffer, so at
+/// `size == 4` SSE4.1's four lanes are exactly full while AVX2 pays a 32-byte
+/// spill plus a 16-byte copy on *every* store, twice a row. That is the
+/// 3.04x-against-2.50x #362 was reported against, in the x86_64 table drawn at
+/// `b284c38a6391`; the table that replaces it reads this group at 3.66x `avx2`
+/// against 3.07x `sse4.1`, which is the row-pair kernel below rather than the
+/// redirect.
+///
+/// #371 removes both halves of that at size 4 rather than routing around them:
+/// the row-pair kernel does a whole block-row-pair per iteration and stores it
+/// with one native full-width store, so AVX2 keeps size 4 on its own kernel —
+/// on its own measurement, which is what the redirect was taken on. On an AMD
+/// EPYC 9V74 80-Core, `av1_encode_stage_coeff_ctx` reads 937.520 µs under
+/// `avx2` against 1.165 ms under `sse4.1`, and 8.643 ms against 10.738 ms at
+/// 1080p: 24% at both sizes, where #362's round had the two arms 0.13% apart
+/// because they were the same kernel. `benches/README.md` carries the round, and
+/// its committed x86_64 table now carries the result on its own host as well:
+/// 1.181 ms `avx2` against 1.409 ms `sse4.1`, a 19% gap on an AMD EPYC 7763.
+/// The sizes below 8 that remain redirected — 1 to 3 and 5 to 7 — are shapes
+/// the encoder never codes and no vector width fits, so they stay on SSE4.1.
+///
+/// From `size == 8` up the two arms stop being the same work: AVX2 halves the
+/// iterations per row and its stores are full vectors, so the wider kernel is
+/// kept for every size the encoder's `choose_tx_size` can also pick.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn coeff_ctx_isa(isa: SimdIsa, size: usize) -> SimdIsa {
+    #[cfg(target_arch = "x86_64")]
+    if isa == SimdIsa::Avx2
+        && size < 8
+        && !coeff_ctx_row_pairs(isa, size)
+        && std::is_x86_feature_detected!("sse4.1")
+    {
+        // AVX2 implies SSE4.1 on every CPU that has ever shipped, but the probe
+        // is a cached load next to a whole block's context derivation, so the
+        // redirect is checked rather than assumed.
+        return SimdIsa::Sse41;
+    }
+    isa
+}
+
+/// Vectorized §8.3.2 `coeff_base` / `coeff_br` context derivation for one
+/// `size x size` transform block, reading the padded level plane
+/// [`coeff::fill_padded_levels`] wrote.
+///
+/// Returns `false` without touching the outputs when `isa` has no vector kernel
+/// in this build and the caller should derive the contexts scalar-side.
+#[doc(hidden)]
+pub fn coeff_contexts(
+    isa: SimdIsa,
+    plane: &[i32],
+    size: usize,
+    base_out: &mut [i32],
+    br_out: &mut [i32],
+) -> bool {
+    debug_assert_eq!(plane.len(), coeff::padded_len(size));
+    debug_assert_eq!(base_out.len(), size * size);
+    debug_assert_eq!(br_out.len(), size * size);
+    let routed = coeff_ctx_isa(isa, size);
+    #[cfg(target_arch = "x86_64")]
+    if coeff_ctx_row_pairs(routed, size) {
+        // `routed` is AVX2, so the host has it; the size condition is the
+        // wrapper's other precondition and is what this just checked.
+        unsafe { coeff_ctx_pairs_avx2(plane, size, base_out, br_out) };
+        return true;
+    }
+    dispatch!(
+        routed,
+        [coeff_ctx_sse41, coeff_ctx_avx2, coeff_ctx_neon](plane, size, base_out, br_out),
+        return false
+    );
+    true
+}
+
+/// Vectorized [`crate::av1_encoder`] inverse WHT, or `None` when the caller
+/// should use the scalar path.
+pub(crate) fn iwht4x4(isa: SimdIsa, quant: &[i32; 16]) -> Option<[i32; 16]> {
+    // x86_64 stays on the scalar reference, for the same reason the forward
+    // direction below does — but on this kernel's own measurement rather than
+    // on that one's. `av1_encode_stage_iwht` (#342) reads 331.600 µs scalar
+    // against 399.630 µs under `sse4.1` and 371.650 µs under `avx2` at
+    // 320x180, and 3.064 ms against 3.682 ms and 3.424 ms at 1080p: 0.83x and
+    // 0.89x, the same pair at both sizes. Elementwise minimum of three rounds
+    // on one AMD EPYC 7763 64-Core, the host the committed x86_64 table was
+    // measured on. The inverse runs two `transpose4`s where the forward runs
+    // three, so it is the cheaper of the two — and it still loses, because
+    // sixteen shuffle micro-operations contending for one or two shuffle ports
+    // are still sixteen more than the scalar loop LLVM auto-vectorizes out of
+    // `av1_encoder::wht`, which has none. `neon` keeps the kernel, where the
+    // shuffle issue width is what makes it win.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, SimdIsa::Sse41 | SimdIsa::Avx2) {
+        return None;
+    }
+    if !transforms::within_limit(quant, transforms::WHT_INPUT_LIMIT) {
+        return None;
+    }
+    let residual: [i32; 16] = dispatch!(
+        isa,
+        [iwht4x4_sse41, iwht4x4_avx2, iwht4x4_neon](quant),
+        return None
+    );
+    Some(residual)
+}
+
+/// Vectorized [`crate::av1_encoder`] forward WHT, or `None` when the caller
+/// should use the scalar path.
+pub(crate) fn fwht4x4(isa: SimdIsa, residual: &[i32; 16]) -> Option<[i32; 16]> {
+    // x86_64 stays on the scalar reference. This is the one kernel the #336
+    // codegen repair did not lift over parity: `av1_encode_stage_wht` read
+    // 0.67x of scalar at 320x180 and 0.70x at 1080p on an AMD EPYC 7763 after
+    // the repair, the same figures the pre-repair table recorded, so its arms
+    // were never the ones the inlining defect was costing. The shape says why.
+    // A 4x4 WHT is fourteen adds, subtracts and shifts per pass and nothing
+    // else, all of them SSE2-baseline operations that LLVM already
+    // auto-vectorizes out of `av1_encoder::wht`; what the hand kernel adds on
+    // top is three `transpose4`s, twenty-four shuffle micro-operations that
+    // contend for one or two shuffle ports, against a scalar loop that has no
+    // shuffles at all. `neon` keeps the kernel, but not the 2.72x this comment
+    // used to cite for it: the aarch64 table re-drawn by #368 reads
+    // `av1_encode_stage_wht` at 1.03x, so on that host the kernel is at parity
+    // rather than above it. At parity is not below it, which is the whole of
+    // what this early return turns on.
+    #[cfg(target_arch = "x86_64")]
+    if matches!(isa, SimdIsa::Sse41 | SimdIsa::Avx2) {
+        return None;
+    }
+    if !transforms::within_limit(residual, transforms::WHT_INPUT_LIMIT) {
+        return None;
+    }
+    let coefficients: [i32; 16] = dispatch!(
+        isa,
+        [fwht4x4_sse41, fwht4x4_avx2, fwht4x4_neon](residual),
+        return None
+    );
+    Some(coefficients)
+}
+
+/// Vectorized non-lossless inverse transform for one `size x size` block.
+///
+/// `column` and `row` are the vertical and horizontal 1-D kernels and
+/// `lr_flip`/`ud_flip` the flipped-ADST output reversals, as reported by
+/// [`crate::av1_intra::Av1TxType::kernels`]. Returns `false` (leaving `out`
+/// untouched) when the caller should use the scalar path: an unsupported
+/// size, an instruction set this build cannot reach, or coefficients large
+/// enough that a 32-bit lane could overflow.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub(crate) fn inverse_transform(
+    isa: SimdIsa,
+    dequantized: &[i32],
+    size: usize,
+    column: Tx1d,
+    row: Tx1d,
+    lr_flip: bool,
+    ud_flip: bool,
+    out: &mut [i16],
+) -> bool {
+    if !transforms::within_limit(dequantized, transforms::input_limit(size)) {
+        return false;
+    }
+    let arguments = (dequantized, column, row, lr_flip, ud_flip, out);
+    match size {
+        4 => dispatch!(
+            isa,
+            [tx4_sse41, tx4_avx2, tx4_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        8 => dispatch!(
+            isa,
+            [tx8_sse41, tx8_avx2, tx8_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        16 => dispatch!(
+            isa,
+            [tx16_sse41, tx16_avx2, tx16_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        32 => dispatch!(
+            isa,
+            [tx32_sse41, tx32_avx2, tx32_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        64 => dispatch!(
+            isa,
+            [tx64_sse41, tx64_avx2, tx64_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        _ => false,
+    }
+}
+
+/// Vectorized non-lossless forward transform for one `size x size` block.
+///
+/// The encoder-side counterpart of [`inverse_transform`]: `column` and `row`
+/// are the vertical and horizontal 1-D kernels and `lr_flip`/`ud_flip` the
+/// flipped-ADST reversals, as reported by
+/// [`crate::av1_intra::Av1TxType::kernels`]. Returns `false` (leaving `out`
+/// untouched) when the caller should use the scalar path: an unsupported
+/// size, an instruction set this build cannot reach, or a residual large
+/// enough that a 32-bit lane could overflow.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+pub(crate) fn forward_transform(
+    isa: SimdIsa,
+    residual: &[i32],
+    size: usize,
+    column: Tx1d,
+    row: Tx1d,
+    lr_flip: bool,
+    ud_flip: bool,
+    out: &mut [i32],
+) -> bool {
+    if !transforms::within_limit(residual, crate::av1_encoder::transform::input_limit(size)) {
+        return false;
+    }
+    let arguments = (residual, column, row, lr_flip, ud_flip, out);
+    match size {
+        4 => dispatch!(
+            isa,
+            [fwd4_sse41, fwd4_avx2, fwd4_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        8 => dispatch!(
+            isa,
+            [fwd8_sse41, fwd8_avx2, fwd8_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        16 => dispatch!(
+            isa,
+            [fwd16_sse41, fwd16_avx2, fwd16_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        32 => dispatch!(
+            isa,
+            [fwd32_sse41, fwd32_avx2, fwd32_neon](
+                arguments.0,
+                arguments.1,
+                arguments.2,
+                arguments.3,
+                arguments.4,
+                arguments.5
+            ),
+            false
+        ),
+        _ => false,
+    }
+}
+
+/// Filters `count` consecutive positions of the horizontal edge above row `y`,
+/// including positions whose filter window leaves the plane; `sizes` gives each
+/// position's §7.14.5 filter length, or is empty when every edge is narrow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deblock_edge_horizontal(
+    isa: SimdIsa,
+    data: &mut [u8],
+    geom: filters::Geometry,
+    x0: usize,
+    y: usize,
+    count: usize,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+    sizes: &[i32],
+) {
+    dispatch!(
+        isa,
+        [deblock_h_sse41, deblock_h_avx2, deblock_h_neon](
+            data, geom, x0, y, count, limit, blimit, thresh, sizes
+        ),
+        ()
+    )
+}
+
+/// Filters `count` consecutive positions of the vertical edge left of column
+/// `x`, including positions whose filter window leaves the plane; `sizes` gives
+/// each position's §7.14.5 filter length, or is empty when every edge is
+/// narrow.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deblock_edge_vertical(
+    isa: SimdIsa,
+    data: &mut [u8],
+    geom: filters::Geometry,
+    x: usize,
+    y0: usize,
+    count: usize,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+    sizes: &[i32],
+) {
+    dispatch!(
+        isa,
+        [deblock_v_sse41, deblock_v_avx2, deblock_v_neon](
+            data, geom, x, y0, count, limit, blimit, thresh, sizes
+        ),
+        ()
+    )
+}
+
+/// CDEF direction-search statistics for one 8x8 block along `(dr, dc)`, or
+/// `None` when the caller should use the scalar path.
+pub(crate) fn cdef_direction_stats(
+    isa: SimdIsa,
+    data: &[u8],
+    geom: filters::Geometry,
+    x0: usize,
+    y0: usize,
+    dr: i32,
+    dc: i32,
+) -> Option<(i32, i32)> {
+    let stats: (i32, i32) = dispatch!(
+        isa,
+        [cdef_stats_sse41, cdef_stats_avx2, cdef_stats_neon](data, geom, x0, y0, dr, dc),
+        return None
+    );
+    Some(stats)
+}
+
+/// CDEF-filters `count` consecutive samples of row `y` starting at column `x0`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cdef_filter_row(
+    isa: SimdIsa,
+    data: &[u8],
+    geom: filters::Geometry,
+    x0: usize,
+    y: usize,
+    count: usize,
+    primary: &[filters::CdefTap],
+    primary_strength: i32,
+    secondary: &[filters::CdefTap],
+    secondary_strength: i32,
+    damping: i32,
+    total_weight: i32,
+    dst: &mut [u8],
+) {
+    let primary_adj = filters::constrain_damping_adjustment(primary_strength, damping);
+    let secondary_adj = filters::constrain_damping_adjustment(secondary_strength, damping);
+    dispatch!(
+        isa,
+        [cdef_row_sse41, cdef_row_avx2, cdef_row_neon](
+            data,
+            geom,
+            x0,
+            y,
+            count,
+            primary,
+            primary_strength,
+            primary_adj,
+            secondary,
+            secondary_strength,
+            secondary_adj,
+            total_weight,
+            dst
+        ),
+        ()
+    )
+}
+
+/// Wiener horizontal pass for `count` consecutive samples of row `y`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wiener_horizontal_row(
+    isa: SimdIsa,
+    data: &[u8],
+    geom: filters::Geometry,
+    x0: usize,
+    y: usize,
+    count: usize,
+    taps: [i32; 3],
+    center_tap: i32,
+    out: &mut [i32],
+) {
+    dispatch!(
+        isa,
+        [wiener_h_sse41, wiener_h_avx2, wiener_h_neon](
+            data, geom, x0, y, count, taps, center_tap, out
+        ),
+        ()
+    )
+}
+
+/// Wiener vertical pass for `count` consecutive columns of `row`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wiener_vertical_row(
+    isa: SimdIsa,
+    intermediate: &[i32],
+    width: usize,
+    height: usize,
+    row: usize,
+    column: usize,
+    count: usize,
+    taps: [i32; 3],
+    center_tap: i32,
+    dst: &mut [u8],
+) {
+    dispatch!(
+        isa,
+        [wiener_v_sse41, wiener_v_avx2, wiener_v_neon](
+            intermediate,
+            width,
+            height,
+            row,
+            column,
+            count,
+            taps,
+            center_tap,
+            dst
+        ),
+        ()
+    )
+}
+
+/// Self-guided box statistics for `count` consecutive samples of row `y`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn box_stats_row(
+    isa: SimdIsa,
+    data: &[u8],
+    geom: filters::Geometry,
+    x0: usize,
+    y: usize,
+    count: usize,
+    radius: usize,
+    sums: &mut [i32],
+    sums_sq: &mut [i32],
+) {
+    dispatch!(
+        isa,
+        [box_stats_sse41, box_stats_avx2, box_stats_neon](
+            data, geom, x0, y, count, radius, sums, sums_sq
+        ),
+        ()
+    )
+}
+
+/// Widest lane count any implementation uses; the size scratch buffers need.
+pub(crate) const MAX_LANES: usize = vector::MAX_LANES;
+
+#[cfg(test)]
+mod tests;

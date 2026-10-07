@@ -1,13 +1,68 @@
-[package]
-name = "zvidlib"
+# The library is split into a workspace of codec, container and shared-core
+# crates (#604) so a change to one codec recompiles, tests and benchmarks only
+# that codec and what depends on it. `zvidlib` is still the only crate a user
+# depends on: it re-exports the subcrates' public items under the paths they
+# always had. Every library crate here is published alongside it, at the same
+# version, which is why each workspace dependency below pins the version
+# exactly as well as the path.
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Frame-accurate video and audio I/O for native and WebAssembly applications"
 repository = "https://github.com/lsegal/zvidlib"
-readme = "README.md"
 keywords = ["video", "audio", "webassembly", "webgl", "mp4"]
 categories = ["multimedia", "wasm"]
+
+[workspace.dependencies]
+zvidlib-core = { path = "crates/zvidlib-core", version = "=0.3.0" }
+zvidlib-color = { path = "crates/zvidlib-color", version = "=0.3.0" }
+zvidlib-av1-syntax = { path = "crates/zvidlib-av1-syntax", version = "=0.3.0" }
+zvidlib-av1 = { path = "crates/zvidlib-av1", version = "=0.3.0" }
+zvidlib-av1-decoder = { path = "crates/zvidlib-av1-decoder", version = "=0.3.0" }
+zvidlib-av1-encoder = { path = "crates/zvidlib-av1-encoder", version = "=0.3.0" }
+zvidlib-vp9-syntax = { path = "crates/zvidlib-vp9-syntax", version = "=0.3.0" }
+zvidlib-hevc-syntax = { path = "crates/zvidlib-hevc-syntax", version = "=0.3.0" }
+zvidlib-hardware = { path = "crates/zvidlib-hardware", version = "=0.3.0" }
+zvidlib-vp8 = { path = "crates/zvidlib-vp8", version = "=0.3.0" }
+zvidlib-vp9-decoder = { path = "crates/zvidlib-vp9-decoder", version = "=0.3.0" }
+zvidlib-vp9-encoder = { path = "crates/zvidlib-vp9-encoder", version = "=0.3.0" }
+zvidlib-hevc-decoder = { path = "crates/zvidlib-hevc-decoder", version = "=0.3.0" }
+zvidlib-hevc-encoder = { path = "crates/zvidlib-hevc-encoder", version = "=0.3.0" }
+zvidlib-opus = { path = "crates/zvidlib-opus", version = "=0.3.0" }
+zvidlib-vorbis-decoder = { path = "crates/zvidlib-vorbis-decoder", version = "=0.3.0" }
+zvidlib-vorbis-encoder = { path = "crates/zvidlib-vorbis-encoder", version = "=0.3.0" }
+zvidlib-aac-encoder = { path = "crates/zvidlib-aac-encoder", version = "=0.3.0" }
+zvidlib-container = { path = "crates/zvidlib-container", version = "=0.3.0" }
+
+opus-pure = "0.2.2"
+symphonia-core = "0.5.5"
+libloading = "0.8.9"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+apple-cf = { version = "0.9.3", default-features = false, features = ["cm", "cv"] }
+videotoolbox = { version = "0.18.1", default-features = false, features = ["decompression"] }
+
+[package]
+name = "zvidlib"
+description = "Frame-accurate video and audio I/O for native and WebAssembly applications"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 # Integration fixtures and browser demo videos are not needed to build the
 # published crate. Keep the MP4 sample used by the library's inline tests.
 exclude = ["/tests", "/examples/media/BigBuckBunny.av1.mp4", "/examples/web_canvas/*.mp4"]
@@ -184,12 +239,25 @@ web = [
 ]
 
 [dependencies]
-# Pure-Rust Opus decoding (a port of libopus 1.6), and the DSP and bit readers
-# the Vorbis decoder vendored in `src/vorbis_decoder/` builds on. Both build for
-# `wasm32` as well as native targets, so the browser build's software audio
-# fallback runs the same decoders native callers do.
-opus-pure = "0.2.2"
-symphonia-core = "0.5.5"
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }
+zvidlib-av1 = { workspace = true }
+zvidlib-av1-decoder = { workspace = true }
+zvidlib-av1-encoder = { workspace = true }
+zvidlib-vp9-syntax = { workspace = true }
+zvidlib-hevc-syntax = { workspace = true }
+zvidlib-hardware = { workspace = true }
+zvidlib-vp8 = { workspace = true }
+zvidlib-vp9-decoder = { workspace = true }
+zvidlib-vp9-encoder = { workspace = true }
+zvidlib-hevc-decoder = { workspace = true }
+zvidlib-hevc-encoder = { workspace = true }
+zvidlib-opus = { workspace = true }
+zvidlib-vorbis-decoder = { workspace = true }
+zvidlib-vorbis-encoder = { workspace = true }
+zvidlib-aac-encoder = { workspace = true }
+zvidlib-container = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = { version = "0.3.104", optional = true }
@@ -263,25 +331,10 @@ cpal = "0.15.3"
 # only Linux and the other native targets carry Symphonia's (issue #561).
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
 symphonia-codec-aac = "0.5.5"
-
-[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
-libloading = "0.8.9"
+symphonia-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Media_MediaFoundation",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_System_Variant",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-cf = { version = "0.9.3", default-features = false, features = ["cm", "cv"] }
-videotoolbox = { version = "0.18.1", default-features = false, features = ["decompression"] }
+windows = { workspace = true }
 
 # The native HEVC/AV1 decoders are pure-Rust software codecs with no fast path at opt-level 0,
 # so an unoptimized debug build is unusably slow. opt-level 2 keeps debug assertions and fast

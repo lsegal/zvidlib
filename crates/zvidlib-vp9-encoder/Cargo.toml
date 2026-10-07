@@ -1,0 +1,16 @@
+[package]
+name = "zvidlib-vp9-encoder"
+description = "Pure-Rust VP9 software encoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-vp9-syntax = { workspace = true }
+zvidlib-vp9-decoder = { workspace = true }
+zvidlib-hardware = { workspace = true }

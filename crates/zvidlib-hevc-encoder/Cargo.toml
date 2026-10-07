@@ -1,0 +1,16 @@
+[package]
+name = "zvidlib-hevc-encoder"
+description = "Pure-Rust HEVC software encoder for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-hevc-syntax = { workspace = true }
+zvidlib-hevc-decoder = { workspace = true }
+zvidlib-hardware = { workspace = true }

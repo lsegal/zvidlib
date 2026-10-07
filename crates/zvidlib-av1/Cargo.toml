@@ -1,0 +1,14 @@
+[package]
+name = "zvidlib-av1"
+description = "AV1 coding tools shared by zvidlib's AV1 encoder and reference decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+zvidlib-color = { workspace = true }
+zvidlib-av1-syntax = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "zvidlib-aac-encoder"
+description = "Platform AAC encoding (AudioToolbox, Media Foundation) for zvidlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zvidlib-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
