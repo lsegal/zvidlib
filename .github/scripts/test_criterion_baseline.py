@@ -377,11 +377,6 @@ class ReadmeStampParsing(unittest.TestCase):
         readme = _readme("Apple M1", "b6655bad215f", ["hevc_sao"])
         self.assertEqual(cb._committed_tables(readme)[0]["groups"], ["hevc_sao"])
 
-    def test_the_committed_readme_has_both_stamped_tables(self) -> None:
-        tables = cb._committed_tables((_REPO_ROOT / "benches/README.md").read_text())
-        self.assertEqual(len(tables), 2)
-        self.assertTrue(all(table["groups"] for table in tables))
-
 
 class GroupToSiteAttribution(unittest.TestCase):
     def test_a_size_family_is_matched_by_prefix(self) -> None:

@@ -62,8 +62,6 @@ jobs:
       # repeats both: a crate already on crates.io at this version is skipped,
       # so a re-run resumes after a partial publish. A tag pushed before the
       # token secret exists still gets its GitHub release.
-      # `tests/ci_release_publishes_every_crate.rs` holds what it publishes to
-      # the packages that do not declare `publish = false`.
       - name: Publish the crates to crates.io
         # A first release of a dozen new crates waits about ten minutes
         # between uploads once crates.io's burst of five is spent.
