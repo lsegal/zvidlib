@@ -20,8 +20,8 @@ A crate already on crates.io at the release version is skipped, so a re-run
 continues where the last one stopped. Every upload, skip, and wait is logged,
 with the time a wait ends, so a slow run cannot be mistaken for a hung one.
 
-    publish --version 0.4.0
-    publish --version 0.4.0 --dry-run
+    publish --version X.Y.Z
+    publish --version X.Y.Z --dry-run
 
 Standard library only, like the other scripts here, so a runner can execute it
 without an install step.

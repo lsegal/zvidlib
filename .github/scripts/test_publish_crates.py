@@ -24,7 +24,7 @@ from publish_crates import Bucket, Publisher, publish_order, retry_after
 START = dt.datetime(2026, 10, 7, 17, 0, tzinfo=dt.timezone.utc)
 
 TOO_MANY_NEW = (
-    "error: failed to publish zvidlib-opus v0.4.0 to registry at https://crates.io\n"
+    "error: failed to publish zvidlib-opus v1.2.3 to registry at https://crates.io\n"
     "Caused by:\n"
     "  the remote server responded with an error (status 429 Too Many Requests): "
     "You have published too many new crates in a short period of time. Please try "
@@ -67,12 +67,12 @@ class FakeRegistry:
         self.uploads.append((name, self.now))
         status, output = self.answers.pop(0) if self.answers else (0, "")
         if status == 0:
-            self.published.setdefault(name, set()).add("0.4.0")
+            self.published.setdefault(name, set()).add("1.2.3")
         return status, output
 
     def publisher(self) -> Publisher:
         return Publisher(
-            "0.4.0", lookup=self.lookup, run=self.run, sleep=self.sleep, clock=self.clock
+            "1.2.3", lookup=self.lookup, run=self.run, sleep=self.sleep, clock=self.clock
         )
 
 
@@ -173,14 +173,14 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual(len(registry.uploads), 21)
 
     def test_a_crate_already_at_the_version_is_skipped(self):
-        registry = FakeRegistry({"zvidlib-core": {"0.4.0"}})
+        registry = FakeRegistry({"zvidlib-core": {"1.2.3"}})
         result, _ = quietly(lambda: registry.publisher().publish("zvidlib-core"))
         self.assertEqual(result, "skipped")
         self.assertEqual(registry.uploads, [])
 
     def test_an_upload_the_index_has_not_shown_yet_is_skipped(self):
         registry = FakeRegistry(
-            {}, answers=[(101, "error: crate zvidlib-opus@0.4.0 already exists on crates.io index")]
+            {}, answers=[(101, "error: crate zvidlib-opus@1.2.3 already exists on crates.io index")]
         )
         result, _ = quietly(lambda: registry.publisher().publish("zvidlib-opus"))
         self.assertEqual(result, "skipped")
