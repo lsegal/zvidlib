@@ -4,7 +4,7 @@
 //! runtime-detected vector kernels in several independent places: the AV1
 //! transforms and in-loop filters ([`crate::av1_simd`]), AV1 inter prediction
 //! ([`crate::av1_mc`]), AV1 intra prediction ([`crate::av1_intra_pred`]), the
-//! VP8 decoder's transforms, prediction and loop filter ([`crate::vp8`]),
+//! VP8 decoder's transforms, prediction and loop filter (`crate::vp8::simd`),
 //! the HEVC engine's inter/intra prediction, in-loop filters, inverse
 //! transforms, encoder-side distortion metrics, and encoder-side color
 //! conversion, the AV1, VP8 and VP9 decoders' shared output color
