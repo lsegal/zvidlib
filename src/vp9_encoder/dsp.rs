@@ -268,13 +268,21 @@ fn accumulate(
     frequencies: impl Iterator<Item = usize>,
     output: &mut [f64],
 ) {
+    // Eight columns at a time, so the sums stay in registers across the rows;
+    // every transform this runs is at least 8 wide.
+    const LANES: usize = 8;
     for frequency in frequencies {
         let out = &mut output[frequency * n..][..n];
-        for (i, row) in rows.chunks_exact(n).enumerate() {
-            let weight = basis[i * n + frequency];
-            for (out, &sample) in out.iter_mut().zip(row) {
-                *out += weight * sample;
+        for (start, out) in (0..n).step_by(LANES).zip(out.chunks_exact_mut(LANES)) {
+            let mut sums = [0.0; LANES];
+            sums.copy_from_slice(out);
+            for (i, row) in rows.chunks_exact(n).enumerate() {
+                let weight = basis[i * n + frequency];
+                for (sum, &sample) in sums.iter_mut().zip(&row[start..start + LANES]) {
+                    *sum += weight * sample;
+                }
             }
+            out.copy_from_slice(&sums);
         }
     }
 }
