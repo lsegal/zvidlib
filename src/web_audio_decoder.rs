@@ -144,6 +144,7 @@ impl WebAudioDecodeSession {
         let config = WebAudioDecoderConfig::for_track(&track)?;
         let packets = track.to_encoded_audio_samples(&source, limits).await?;
         let (software, preroll): (Option<Box<dyn AudioDecoder>>, usize) = match track.codec {
+            #[cfg(feature = "opus-decoder")]
             Codec::Opus => (
                 Some(Box::new(crate::NativeOpusDecoder::new(
                     &track.opus_config()?,
@@ -151,6 +152,11 @@ impl WebAudioDecodeSession {
                 )?)),
                 crate::opus_preroll_packets(&packets),
             ),
+            // A build without the codec's feature has only WebCodecs to decode
+            // it with.
+            #[cfg(not(feature = "opus-decoder"))]
+            Codec::Opus => (None, crate::opus_preroll_packets(&packets)),
+            #[cfg(feature = "vorbis-decoder")]
             Codec::Vorbis => (
                 Some(Box::new(crate::NativeVorbisDecoder::new(
                     &track.vorbis_config()?,
@@ -158,6 +164,8 @@ impl WebAudioDecodeSession {
                 )?)),
                 crate::VORBIS_PREROLL_PACKETS,
             ),
+            #[cfg(not(feature = "vorbis-decoder"))]
+            Codec::Vorbis => (None, crate::VORBIS_PREROLL_PACKETS),
             _ => (None, AAC_PREROLL_PACKETS),
         };
 

@@ -84,23 +84,34 @@ pub use zvidlib_core::simd::{SimdIsa, active, available, detected, set_override}
 /// | `vorbis_decode` | Vorbis inverse MDCT, overlap-add, inverse coupling and floor product |
 ///
 /// The `hevc_*` sites are absent on `wasm32`, where the HEVC kernels have no
-/// vector backend and always run the scalar path.
+/// vector backend and always run the scalar path. A codec's sites are listed
+/// only when the Cargo feature that builds it is enabled.
 #[must_use]
 pub fn active_by_site() -> Vec<(&'static str, SimdIsa)> {
-    let mut sites = zvidlib_av1::simd_sites();
+    #[allow(unused_mut)]
+    let mut sites = Vec::new();
+    #[cfg(any(feature = "av1-decoder", feature = "av1-encoder"))]
+    sites.extend(zvidlib_av1::simd_sites());
+    #[cfg(feature = "vorbis-encoder")]
     sites.extend(zvidlib_vorbis_encoder::simd_sites());
+    #[cfg(any(feature = "vp8-decoder", feature = "vp8-encoder"))]
     sites.extend(zvidlib_vp8::simd_sites());
+    #[cfg(feature = "vp9-decoder")]
     sites.extend(zvidlib_vp9_decoder::simd_sites());
+    #[cfg(feature = "vp9-encoder")]
     sites.extend(zvidlib_vp9_encoder::simd_sites());
+    #[cfg(feature = "hevc-decoder")]
     sites.extend(zvidlib_hevc_decoder::simd_sites());
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "hevc-encoder", not(target_arch = "wasm32")))]
     sites.extend(zvidlib_hevc_encoder::simd_sites());
     sites.extend(zvidlib_color::simd_sites());
+    #[cfg(feature = "vorbis-decoder")]
     sites.extend(zvidlib_vorbis_decoder::simd_sites());
     sites
 }
 
-#[cfg(test)]
+// The tests pin and compare every codec's dispatch site at once.
+#[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
 

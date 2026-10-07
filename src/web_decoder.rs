@@ -292,15 +292,20 @@ impl WebVideoDecodeSession {
 /// The crate's own software decoder for `codec`.
 fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>> {
     match codec {
+        #[cfg(feature = "hevc-decoder")]
         Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
+        #[cfg(feature = "av1-decoder")]
         Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
+        #[cfg(feature = "vp8-decoder")]
         Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
+        #[cfg(feature = "vp9-decoder")]
         Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        // Uncompressed video, H.264, the audio codecs, and any codec a later
-        // zvidlib-core adds.
+        // Uncompressed video, H.264, the audio codecs, any codec a later
+        // zvidlib-core adds, and a decoder whose Cargo feature is off.
         _ => Err(Error::new(
             ErrorKind::Unsupported,
-            "only HEVC, AV1, VP8 and VP9 have a software decoder backend",
+            "only HEVC, AV1, VP8 and VP9 have a software decoder backend, each with its \
+             <codec>-decoder Cargo feature",
         )),
     }
 }

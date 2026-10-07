@@ -20,7 +20,7 @@ use crate::{
 #[allow(unused_imports)]
 use zvidlib_core::*;
 #[allow(unused_imports)]
-use zvidlib_vorbis_decoder::*;
+use zvidlib_vorbis_syntax::*;
 
 /// The quality the native encoder uses when its configuration names no bit
 /// rate: libvorbis's `-q 4`, about 128 kb/s for 44.1 kHz stereo.

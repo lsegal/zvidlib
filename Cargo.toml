@@ -34,6 +34,8 @@ zvidlib-vp9-encoder = { path = "crates/zvidlib-vp9-encoder", version = "=0.4.0" 
 zvidlib-hevc-decoder = { path = "crates/zvidlib-hevc-decoder", version = "=0.4.0" }
 zvidlib-hevc-encoder = { path = "crates/zvidlib-hevc-encoder", version = "=0.4.0" }
 zvidlib-opus = { path = "crates/zvidlib-opus", version = "=0.4.0" }
+zvidlib-opus-syntax = { path = "crates/zvidlib-opus-syntax", version = "=0.4.0" }
+zvidlib-vorbis-syntax = { path = "crates/zvidlib-vorbis-syntax", version = "=0.4.0" }
 zvidlib-vorbis-decoder = { path = "crates/zvidlib-vorbis-decoder", version = "=0.4.0" }
 zvidlib-vorbis-encoder = { path = "crates/zvidlib-vorbis-encoder", version = "=0.4.0" }
 zvidlib-aac-encoder = { path = "crates/zvidlib-aac-encoder", version = "=0.4.0" }
@@ -141,7 +143,48 @@ harness = false
 zvidlib-build = { workspace = true }
 
 [features]
-default = []
+# Every codec, so `zvidlib = "..."` keeps the whole matrix. Depend on zvidlib
+# with `default-features = false` and name the codec features below to build
+# only the codecs and directions an application uses (#635).
+default = ["all"]
+all = [
+    "av1-decoder",
+    "av1-encoder",
+    "vp8-decoder",
+    "vp8-encoder",
+    "vp9-decoder",
+    "vp9-encoder",
+    "hevc-decoder",
+    "hevc-encoder",
+    "opus-decoder",
+    "opus-encoder",
+    "vorbis-decoder",
+    "vorbis-encoder",
+    "aac-decoder",
+    "aac-encoder",
+]
+# The native codecs, one feature per codec and direction. Each is additive and
+# enables only the crates that direction needs; where one crate implements both
+# directions (VP8, Opus), both features enable it. The containers, the shared
+# core and the codec syntax crates they write configuration records with are
+# built in every configuration.
+av1-decoder = ["dep:zvidlib-av1", "dep:zvidlib-av1-decoder"]
+av1-encoder = ["dep:zvidlib-av1", "dep:zvidlib-av1-encoder"]
+vp8-decoder = ["dep:zvidlib-vp8"]
+vp8-encoder = ["dep:zvidlib-vp8"]
+vp9-decoder = ["dep:zvidlib-vp9-decoder"]
+vp9-encoder = ["dep:zvidlib-vp9-encoder"]
+hevc-decoder = ["dep:zvidlib-hevc-decoder", "dep:zvidlib-hardware"]
+hevc-encoder = ["dep:zvidlib-hevc-encoder"]
+opus-decoder = ["dep:zvidlib-opus"]
+opus-encoder = ["dep:zvidlib-opus"]
+vorbis-decoder = ["dep:zvidlib-vorbis-decoder"]
+vorbis-encoder = ["dep:zvidlib-vorbis-encoder"]
+# AAC decodes through the platform's decoder (AudioToolbox on macOS, Media
+# Foundation on Windows), whose bindings it shares with the AAC encoder, and
+# through Symphonia's on Linux and the other native targets.
+aac-decoder = ["dep:zvidlib-aac-encoder", "dep:symphonia-codec-aac", "dep:symphonia-core"]
+aac-encoder = ["dep:zvidlib-aac-encoder"]
 # Additive, off by default. The crate's SIMD kernels dispatch at run time rather
 # than at compile time, so this feature intentionally gates no code today: it is
 # the switch the per-codec benchmark tickets code against, and the benchmark
@@ -161,21 +204,23 @@ web = [
 zvidlib-core = { workspace = true }
 zvidlib-color = { workspace = true }
 zvidlib-av1-syntax = { workspace = true }
-zvidlib-av1 = { workspace = true }
-zvidlib-av1-decoder = { workspace = true }
-zvidlib-av1-encoder = { workspace = true }
+zvidlib-av1 = { workspace = true, optional = true }
+zvidlib-av1-decoder = { workspace = true, optional = true }
+zvidlib-av1-encoder = { workspace = true, optional = true }
 zvidlib-vp9-syntax = { workspace = true }
 zvidlib-hevc-syntax = { workspace = true }
-zvidlib-hardware = { workspace = true }
-zvidlib-vp8 = { workspace = true }
-zvidlib-vp9-decoder = { workspace = true }
-zvidlib-vp9-encoder = { workspace = true }
-zvidlib-hevc-decoder = { workspace = true }
-zvidlib-hevc-encoder = { workspace = true }
-zvidlib-opus = { workspace = true }
-zvidlib-vorbis-decoder = { workspace = true }
-zvidlib-vorbis-encoder = { workspace = true }
-zvidlib-aac-encoder = { workspace = true }
+zvidlib-hardware = { workspace = true, optional = true }
+zvidlib-vp8 = { workspace = true, optional = true }
+zvidlib-vp9-decoder = { workspace = true, optional = true }
+zvidlib-vp9-encoder = { workspace = true, optional = true }
+zvidlib-hevc-decoder = { workspace = true, optional = true }
+zvidlib-hevc-encoder = { workspace = true, optional = true }
+zvidlib-opus-syntax = { workspace = true }
+zvidlib-opus = { workspace = true, optional = true }
+zvidlib-vorbis-syntax = { workspace = true }
+zvidlib-vorbis-decoder = { workspace = true, optional = true }
+zvidlib-vorbis-encoder = { workspace = true, optional = true }
+zvidlib-aac-encoder = { workspace = true, optional = true }
 zvidlib-container = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -250,8 +295,8 @@ cpal = "0.15.3"
 # macOS decodes through AudioToolbox and Windows through Media Foundation, so
 # only Linux and the other native targets carry Symphonia's (issue #561).
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "macos", windows)))'.dependencies]
-symphonia-codec-aac = "0.5.5"
-symphonia-core = { workspace = true }
+symphonia-codec-aac = { version = "0.5.5", optional = true }
+symphonia-core = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

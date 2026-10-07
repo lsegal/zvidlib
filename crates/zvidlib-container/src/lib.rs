@@ -23,13 +23,13 @@ use zvidlib_av1_syntax::*;
 #[allow(unused_imports)]
 use zvidlib_core::*;
 #[allow(unused_imports)]
-use zvidlib_opus as opus;
+use zvidlib_opus_syntax as opus;
 #[allow(unused_imports)]
-use zvidlib_opus::*;
+use zvidlib_opus_syntax::*;
 #[allow(unused_imports)]
-use zvidlib_vorbis_decoder as vorbis;
+use zvidlib_vorbis_syntax as vorbis;
 #[allow(unused_imports)]
-use zvidlib_vorbis_decoder::*;
+use zvidlib_vorbis_syntax::*;
 
 pub use codec_config::{DerivedCodecString, derive_codec_string};
 pub use conformance::{

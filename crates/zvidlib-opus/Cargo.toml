@@ -13,6 +13,7 @@ exclude = ["/tests"]
 
 [dependencies]
 zvidlib-core = { workspace = true }
+zvidlib-opus-syntax = { workspace = true }
 opus-pure = { workspace = true }
 
 [dev-dependencies]

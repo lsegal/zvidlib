@@ -2200,6 +2200,38 @@ fn encodes_in_software(codec: Codec) -> bool {
     }
 }
 
+/// The crate's own software encoder for a browser audio track's `codec`, Opus
+/// or Vorbis, when the build carries the feature for it.
+fn software_audio_encoder(
+    codec: Codec,
+    configuration: &crate::AudioEncoderConfig,
+) -> crate::Result<Box<dyn crate::AudioEncoder>> {
+    match codec {
+        #[cfg(feature = "vorbis-encoder")]
+        Codec::Vorbis => crate::AudioEncoderFactory::create(
+            &crate::native_vorbis_audio_encoder_factory(),
+            configuration,
+            &Limits::default(),
+        ),
+        #[cfg(feature = "opus-encoder")]
+        Codec::Opus => crate::AudioEncoderFactory::create(
+            &crate::native_opus_audio_encoder_factory(),
+            configuration,
+            &Limits::default(),
+        ),
+        _ => {
+            let _ = configuration;
+            Err(crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                format!(
+                    "{codec:?} audio has no software encoder in this build; enable zvidlib's \
+                     opus-encoder or vorbis-encoder feature"
+                ),
+            ))
+        }
+    }
+}
+
 /// Encodes one buffer through zvidlib's own Opus or Vorbis encoder, creating
 /// it on the first call.
 async fn encode_software_audio_frame(
@@ -2227,19 +2259,7 @@ async fn encode_software_audio_frame(
                     timescale: sample_rate,
                     configuration: Vec::new(),
                 };
-                let encoder = if state.codec == Codec::Vorbis {
-                    crate::AudioEncoderFactory::create(
-                        &crate::native_vorbis_audio_encoder_factory(),
-                        &configuration,
-                        &Limits::default(),
-                    )?
-                } else {
-                    crate::AudioEncoderFactory::create(
-                        &crate::native_opus_audio_encoder_factory(),
-                        &configuration,
-                        &Limits::default(),
-                    )?
-                };
+                let encoder = software_audio_encoder(state.codec, &configuration)?;
                 state.sample_rate = Some(sample_rate);
                 state.channels = Some(channels);
                 state.decoder_config = Some(encoder.config().decoder_config.clone());
