@@ -821,6 +821,14 @@ fn parse_on_demand_options(
     })
 }
 
+fn missing_audio_context() -> JsValue {
+    js_error(
+        ErrorKind::InvalidInput,
+        "on-demand playback of an input with audio requires an audioContext, which plays the \
+         audio and whose clock times it",
+    )
+}
+
 fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Mp4Track> {
     demuxer.tracks.iter().find(|track| track.kind == kind)
 }
@@ -863,12 +871,9 @@ impl WasmOnDemandPlayback {
             .ok_or_else(|| js_error(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
         let audio = first_track(&demuxer, TrackKind::Audio).cloned();
+        // Checked before any audio is read, rather than once it has been.
         if audio.is_some() && options.audio_context.is_none() {
-            return Err(js_error(
-                ErrorKind::InvalidInput,
-                "on-demand playback of an input with audio requires an audioContext, which \
-                 plays the audio and whose clock times it",
-            ));
+            return Err(missing_audio_context());
         }
 
         let dimensions = video
@@ -927,19 +932,24 @@ impl WasmOnDemandPlayback {
 
         let timeline = IndexedPresentationTimeline::from_mp4_track(&video, clock_rate, &limits)
             .map_err(core_error)?;
-        let (audio_source, output) = match (audio_source, options.audio_context) {
-            (Some(audio), Some(context)) => (
+        let (audio_source, output) = match audio_source {
+            Some(audio) => (
                 PlaybackAudio::Track(audio),
-                BrowserOutput::Audio(AudioContextBackend::new(context, clock_rate)),
+                BrowserOutput::Audio(AudioContextBackend::new(
+                    options.audio_context.ok_or_else(missing_audio_context)?,
+                    clock_rate,
+                )),
             ),
-            (_, context) => (
+            None => (
                 PlaybackAudio::Silent(SilentAudioSource {
                     sample_rate: clock_rate,
                     length: timeline.end_sample(),
                     limits,
                 }),
                 BrowserOutput::Clock(ClockBackend {
-                    clock: context.map_or(Clock::Page, Clock::AudioContext),
+                    clock: options
+                        .audio_context
+                        .map_or(Clock::Page, Clock::AudioContext),
                     rate: clock_rate,
                 }),
             ),
@@ -1642,10 +1652,25 @@ mod tests {
             .collect()
     }
 
+    thread_local! {
+        /// [`small_mp4`]'s files, without and with Opus, once encoded.
+        static SMALL: RefCell<[Option<Rc<Vec<u8>>>; 2]> = const { RefCell::new([None, None]) };
+    }
+
     /// Three seconds of lossless monochrome 32x18 AV1 at 30 fps, which
     /// decodes quickly and exactly, and with `opus`, three seconds of Opus
-    /// muxed beside it with its pre-skip and end trim.
-    async fn small_mp4(opus: bool) -> Vec<u8> {
+    /// muxed beside it with its pre-skip and end trim. Encoded once and
+    /// shared, as [`eager_frames`] is.
+    async fn small_mp4(opus: bool) -> Rc<Vec<u8>> {
+        if let Some(bytes) = SMALL.with_borrow(|small| small[usize::from(opus)].clone()) {
+            return bytes;
+        }
+        let bytes = Rc::new(encode_small_mp4(opus).await);
+        SMALL.with_borrow_mut(|small| small[usize::from(opus)] = Some(Rc::clone(&bytes)));
+        bytes
+    }
+
+    async fn encode_small_mp4(opus: bool) -> Vec<u8> {
         use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
         use crate::io::MemorySink;
         use crate::media::{ColorRange, PixelFormat, Plane, VideoDimensions};
@@ -1757,7 +1782,7 @@ mod tests {
     #[wasm_bindgen_test(async)]
     async fn opus_audio_reads_load_packets_on_demand_and_match_an_eager_decode() {
         let bytes = small_mp4(true).await;
-        let source = MemorySource::new(bytes.clone());
+        let source = MemorySource::new(bytes.to_vec());
         let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
             .await
             .unwrap();

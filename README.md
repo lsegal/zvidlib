@@ -217,7 +217,7 @@ function render() {
 requestAnimationFrame(render);
 ```
 
-The server must answer range requests and, cross-origin, expose `Content-Range` through CORS. Video decodes on zvidlib's software decoders and AAC audio through WebCodecs.
+The server must answer range requests and, cross-origin, expose `Content-Range` through CORS. Video decodes on zvidlib's software decoders, AAC audio through WebCodecs, and Opus audio through WebCodecs or zvidlib's software decoder. A video with no audio track needs no `audioContext`: it plays on `performance.now()`, or on the context's clock when one is given.
 
 Record a canvas to WebM (or `"mp4"`) with synchronized Opus audio:
 
