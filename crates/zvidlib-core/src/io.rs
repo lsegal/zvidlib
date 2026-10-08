@@ -80,6 +80,92 @@ impl ByteSource for MemorySource {
     }
 }
 
+/// A file on the local file system, read in place at the offsets asked for.
+///
+/// Every read completes before its future is first polled, so a synchronous
+/// caller such as [`crate::codec::ExactFrameReader`] over an on-demand provider
+/// can drive it directly. Clones share the open file, and no read moves a
+/// cursor another one depends on.
+#[cfg(any(unix, windows))]
+#[derive(Clone, Debug)]
+pub struct FileSource {
+    file: std::sync::Arc<std::fs::File>,
+    length: u64,
+}
+
+#[cfg(any(unix, windows))]
+impl FileSource {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot open {}: {error}", path.display()),
+            )
+        })?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: std::fs::File) -> Result<Self> {
+        let length = file
+            .metadata()
+            .map_err(|error| Error::new(ErrorKind::Io, format!("cannot read file size: {error}")))?
+            .len();
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+            length,
+        })
+    }
+
+    fn read_some(&self, offset: u64, destination: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(&*self.file, destination, offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(&*self.file, destination, offset)
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl ByteSource for FileSource {
+    fn len(&self) -> Option<u64> {
+        Some(self.length)
+    }
+
+    fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
+        let result = if offset > self.length {
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                "read offset is beyond the source",
+            ))
+        } else {
+            // A positional read may return fewer bytes than asked for short of
+            // the end, so read until the destination is full or the file ends.
+            let mut filled = 0;
+            loop {
+                if filled == destination.len() {
+                    break Ok(filled);
+                }
+                match self.read_some(offset + filled as u64, &mut destination[filled..]) {
+                    Ok(0) => break Ok(filled),
+                    Ok(read) => filled += read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        break Err(Error::new(
+                            ErrorKind::Io,
+                            format!("cannot read file: {error}"),
+                        ));
+                    }
+                }
+            }
+        };
+        Box::pin(async move { result })
+    }
+}
+
 /// A seekable in-memory sink useful for portable callers and deterministic tests.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MemorySink {

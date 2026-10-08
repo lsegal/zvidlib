@@ -82,6 +82,29 @@ macro_rules! output_adapter {
 output_adapter!(NativeAudioOutput, AudioOutputKind::Native);
 output_adapter!(WebAudioOutput, AudioOutputKind::WebAudio);
 
+/// A boxed output, so a controller's output can be chosen at run time: a
+/// device for an input with audio, or only a clock for one without.
+impl<O: PlaybackAudioOutput + ?Sized> PlaybackAudioOutput for Box<O> {
+    fn kind(&self) -> AudioOutputKind {
+        (**self).kind()
+    }
+    fn clock_samples(&self) -> u64 {
+        (**self).clock_samples()
+    }
+    fn start(&mut self, media_sample: u64) -> Result<()> {
+        (**self).start(media_sample)
+    }
+    fn schedule(&mut self, buffer: AudioBuffer, generation: u64) -> Result<()> {
+        (**self).schedule(buffer, generation)
+    }
+    fn cancel_queued(&mut self, generation: u64) -> Result<()> {
+        (**self).cancel_queued(generation)
+    }
+    fn stop(&mut self) -> Result<()> {
+        (**self).stop()
+    }
+}
+
 pub trait PlaybackAudioSource {
     fn sample_rate(&self) -> u32;
     fn presentation_length(&self) -> u64;
@@ -561,6 +584,59 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         Ok(())
     }
 
+    /// Swaps the audio source and its output for others, such as another
+    /// language's track, keeping the frame playback is on and whether it is
+    /// playing (issue #689). Returns the old source and output, stopped.
+    ///
+    /// `timeline` maps the video's frames onto the new source's samples, which
+    /// may come at a different rate than the old one's. The video source is not
+    /// reset, so the frame on screen stays valid and playback goes on from it
+    /// without decoding its way back. While playing, audio resumes at the start
+    /// of the current frame's interval.
+    pub fn replace_audio(
+        &mut self,
+        audio: A,
+        output: O,
+        timeline: IndexedPresentationTimeline,
+    ) -> Result<(A, O)> {
+        let frame = self.current_frame_index()?;
+        let target = timeline.audio_interval_for_frame(frame)?.start;
+        if target > audio.presentation_length() {
+            return Err(invalid(
+                "the replacement audio ends before the current frame",
+            ));
+        }
+        let playing = self.playing;
+        if playing {
+            self.output.stop()?;
+        }
+        self.cancellation.cancel();
+        self.cancellation = CancellationToken::new();
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("playback generation overflow"))?;
+        let old_audio = std::mem::replace(&mut self.audio, audio);
+        let old_output = std::mem::replace(&mut self.output, output);
+        self.timeline = PlaybackTimeline::Indexed(timeline);
+        self.media_anchor = target;
+        self.clock_anchor = self.output.clock_samples();
+        self.queued_until = target;
+        // Paused until the new output has started, should it fail to.
+        self.playing = false;
+        if playing {
+            self.output.start(target)?;
+            self.playing = true;
+            match self.fill_audio() {
+                // As after a seek: the next `present` or `pump_audio` tops the
+                // queue up once the source has loaded what it needs.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                result => result?,
+            }
+        }
+        Ok((old_audio, old_output))
+    }
+
     pub fn present(&mut self) -> Result<(Presentation, Option<VideoFrame>)> {
         if !self.playing {
             return Err(Error::new(
@@ -632,6 +708,14 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
 
     pub fn output_kind(&self) -> AudioOutputKind {
         self.output.kind()
+    }
+
+    pub fn video(&self) -> &V {
+        &self.video
+    }
+
+    pub fn audio(&self) -> &A {
+        &self.audio
     }
 
     fn current_sample(&self) -> u64 {
@@ -1254,6 +1338,7 @@ mod tests {
                 dimensions: None,
                 channels: Some(1),
                 sample_rate: Some(SAMPLE_RATE),
+                language: None,
                 decoder_config: Vec::new(),
                 edits: Vec::new(),
                 presentation_order: (0..samples.len()).collect(),

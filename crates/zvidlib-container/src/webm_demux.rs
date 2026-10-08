@@ -1299,6 +1299,7 @@ fn finish(
             dimensions,
             channels,
             sample_rate,
+            language: None,
             decoder_config: track.decoder_config,
             edits: Vec::new(),
             samples,

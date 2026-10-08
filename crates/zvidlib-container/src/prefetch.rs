@@ -600,6 +600,7 @@ mod tests {
             dimensions: None,
             channels: None,
             sample_rate: None,
+            language: None,
             decoder_config: Vec::new(),
             edits: Vec::new(),
             presentation_order: (0..sizes.len()).collect(),

@@ -41,14 +41,17 @@
 //! the page's `performance.now()` otherwise. [`SilentAudioSource`] stands in
 //! for the audio the controller schedules against it.
 
-use crate::audio::{
-    AudioDecoder, AudioPacketProvider, AudioSampleReader, AudioTrackTiming, EncodedAudioSample,
-};
-use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
+use crate::audio::{AudioDecoder, AudioSampleReader, AudioTrackTiming, EncodedAudioSample};
+use crate::codec::{CancellationToken, HardwarePreference};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
 use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions};
+use crate::on_demand::{
+    AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
+    SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, VIDEO_READAHEAD_SAMPLES, audio_packets,
+    crate_video_source, first_track,
+};
 use crate::playback::{
     AudioOutputBackend, IndexedPresentationTimeline, OnDemandVideoSource, PlaybackAudioSource,
     PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
@@ -60,17 +63,12 @@ use crate::wasm_api::{
     MAX_SAFE_INTEGER, WasmVideoFrame, bigint_u64, ensure_open, js_error, owned_u8_array, parse_u64,
     property,
 };
-use crate::web_audio_decoder::{
-    AAC_PREROLL_PACKETS, NoSoftwareDecoder, WebAudioDecoderConfig, WebCodecsAudioDecoder,
-};
+use crate::web_audio_decoder::{NoSoftwareDecoder, WebAudioDecoderConfig, WebCodecsAudioDecoder};
 use crate::web_decoder::{
-    WebCodecsDecoder, js_to_promise, normalize_js_error, packed_rgba, software_video_decoder,
-    webcodecs_config, webcodecs_supports,
+    WebCodecsDecoder, js_to_promise, normalize_js_error, packed_rgba, webcodecs_config,
+    webcodecs_supports,
 };
-use crate::{
-    Error, ErrorKind, Limits, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider, Result,
-    TrackKind, TrackSampleLoader, VORBIS_PREROLL_PACKETS,
-};
+use crate::{Error, ErrorKind, Limits, Result, TrackKind, TrackSampleLoader};
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -99,33 +97,14 @@ extern "C" {
     fn clock_seconds() -> f64;
 }
 
-/// The compressed video a playback may hold when the page does not say:
-/// several seconds of a 1080p stream, and room for its largest key frames.
-const DEFAULT_VIDEO_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-
-/// The compressed audio a playback may hold when the page does not say: well
-/// over a minute of ordinary AAC.
-const DEFAULT_AUDIO_BUDGET_BYTES: u64 = 1024 * 1024;
-
-/// Decode-order video samples a prefetch loads past the ones the current frame
-/// needs, so the frames after it play without reporting anything missing.
-const VIDEO_READAHEAD_SAMPLES: usize = 24;
-
 /// Presentation frames a `WebCodecs` prefetch decodes from the one it is
 /// asked for, and so the most decoded pictures a playback holds at once: a
 /// third of a second at 24 frames a second.
 const DECODED_VIDEO_FRAMES: u64 = 8;
 
-/// Audio packets a prefetch loads past the ones it decodes.
-const AUDIO_READAHEAD_PACKETS: usize = 16;
-
 /// How many prefetch passes an audio decode may take to load packets the plan
 /// missed before giving up on the request.
 const MAX_AUDIO_LOAD_PASSES: usize = 8;
-
-/// The ticks per second of the clock that times an input with no audio track,
-/// standing in for an audio sample rate.
-const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 
 fn core_error(error: Error) -> JsValue {
     js_error(error.kind(), error.message())
@@ -394,17 +373,8 @@ impl BrowserAudioSource {
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
-        let codec = audio.codec;
         let loader = TrackSampleLoader::new(audio, source, budget_bytes)?;
-        let (packets, preroll) = match codec {
-            Codec::Opus => {
-                let packets = loader.opus_packet_provider().await?;
-                let preroll = opus_preroll_packets(&packets);
-                (packets, preroll)
-            }
-            Codec::Vorbis => (loader.vorbis_packet_provider()?, VORBIS_PREROLL_PACKETS),
-            _ => (loader.aac_packet_provider()?, AAC_PREROLL_PACKETS),
-        };
+        let (packets, preroll) = audio_packets(&loader).await?;
         let has_software = software.is_some();
         let reader = AudioSampleReader::from_provider(
             software.unwrap_or_else(|| Box::new(NoSoftwareDecoder)),
@@ -519,18 +489,6 @@ fn software_audio_decoder(track: &Track, limits: Limits) -> Result<Option<Box<dy
             Ok(None)
         }
     }
-}
-
-/// How many packets an Opus read decodes ahead of the first one it needs:
-/// enough to cover [`OPUS_PREROLL_SAMPLES`] even at the track's shortest
-/// packet, as [`crate::opus_preroll_packets`] counts for packets in memory.
-fn opus_preroll_packets(packets: &PrefetchedAudioPacketProvider) -> usize {
-    let shortest = (0..packets.len())
-        .map(|index| packets.decoded_range(index).len())
-        .filter(|&length| length > 0)
-        .min()
-        .unwrap_or(u64::from(OPUS_PREROLL_SAMPLES));
-    usize::try_from(u64::from(OPUS_PREROLL_SAMPLES).div_ceil(shortest)).unwrap_or(usize::MAX)
 }
 
 impl PlaybackAudioSource for BrowserAudioSource {
@@ -779,44 +737,6 @@ impl PrefetchVideoSource for BrowserVideoSource {
     }
 }
 
-/// Silence for as long as the video lasts, standing in for the audio of an
-/// input that has none, so the controller's clock runs over the whole video.
-pub(crate) struct SilentAudioSource {
-    sample_rate: u32,
-    length: u64,
-    limits: Limits,
-}
-
-impl PlaybackAudioSource for SilentAudioSource {
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn presentation_length(&self) -> u64 {
-        self.length
-    }
-
-    fn read(&mut self, range: SampleRange, _: &CancellationToken) -> Result<AudioBuffer> {
-        AudioBuffer::new(
-            range,
-            self.sample_rate,
-            1,
-            vec![0.0; range.len() as usize],
-            &self.limits,
-        )
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl PrefetchAudioSource for SilentAudioSource {
-    fn prefetch(&mut self, _: SampleRange) -> IoFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// What a playback's audio comes from: the input's audio track, or silence
 /// when it has none.
 pub(crate) enum PlaybackAudio {
@@ -1001,10 +921,6 @@ fn missing_audio_context() -> JsValue {
     )
 }
 
-fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Track> {
-    demuxer.tracks.iter().find(|track| track.kind == kind)
-}
-
 /// Which video decoders [`WasmOnDemandPlayback::open_with`] may choose between.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VideoBackend {
@@ -1074,9 +990,6 @@ impl WasmOnDemandPlayback {
             .ok_or_else(|| js_error(ErrorKind::MalformedMedia, "video track has no dimensions"))?;
         let derived =
             derive_codec_string(video.codec, &video.decoder_config).map_err(core_error)?;
-        let video_loader =
-            TrackSampleLoader::new(video.clone(), source.clone(), options.video_budget_bytes)
-                .map_err(core_error)?;
         // A codec `WebCodecs` has no registration for here falls to the
         // software decoder, which reports it if it cannot decode it either.
         let webcodecs = match webcodecs_config(&video, &derived, dimensions) {
@@ -1087,44 +1000,28 @@ impl WasmOnDemandPlayback {
             _ => None,
         };
         let video_source = match webcodecs {
-            Some(config) => BrowserVideoSource::WebCodecs(
-                WebCodecsVideoSource::new(config, video_loader, limits).map_err(core_error)?,
-            ),
-            None => {
-                // An AV1 or VP9 track's color range may be read from its
-                // first sample.
-                let mut leading = Vec::new();
-                if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
-                    let first = video.samples.first().ok_or_else(|| {
-                        js_error(ErrorKind::MalformedMedia, "video track contains no samples")
-                    })?;
-                    let mut data = vec![0_u8; first.size as usize];
-                    video
-                        .read_sample_into(&source, 0, &mut data)
-                        .await
-                        .map_err(core_error)?;
-                    leading.push(EncodedVideoSample {
-                        presentation_index: FrameIndex(0),
-                        random_access: first.is_sync,
-                        data,
-                    });
-                }
-                let (factory, configuration) =
-                    software_video_decoder(&video, derived.profile, dimensions, &leading, &limits)
-                        .map_err(core_error)?;
-                let video_reader = ExactFrameReader::from_provider(
-                    factory.as_ref(),
-                    configuration,
-                    Box::new(video_loader.sample_provider().map_err(core_error)?),
-                    limits,
+            Some(config) => {
+                let video_loader = TrackSampleLoader::new(
+                    video.clone(),
+                    source.clone(),
+                    options.video_budget_bytes,
                 )
                 .map_err(core_error)?;
-                BrowserVideoSource::Software(OnDemandVideoSource::new(
-                    video_reader,
-                    video_loader,
-                    VIDEO_READAHEAD_SAMPLES,
-                ))
+                BrowserVideoSource::WebCodecs(
+                    WebCodecsVideoSource::new(config, video_loader, limits).map_err(core_error)?,
+                )
             }
+            None => BrowserVideoSource::Software(
+                crate_video_source(
+                    &video,
+                    source.clone(),
+                    options.video_budget_bytes,
+                    HardwarePreference::Avoid,
+                    limits,
+                )
+                .await
+                .map_err(core_error)?,
+            ),
         };
         let webcodecs_video = matches!(video_source, BrowserVideoSource::WebCodecs(_));
         let frame_count = video.presentation_order.len() as u64;
@@ -1564,16 +1461,17 @@ mod tests {
             .await
             .unwrap();
         let derived = derive_codec_string(video.codec, &video.decoder_config).unwrap();
-        let (factory, configuration) = software_video_decoder(
+        let (factory, configuration) = crate::on_demand::crate_video_decoder(
             video,
             derived.profile,
             video.dimensions.unwrap(),
             &samples,
+            HardwarePreference::Avoid,
             &limits,
         )
         .unwrap();
         let mut reader =
-            ExactFrameReader::new(factory.as_ref(), configuration, samples, limits).unwrap();
+            crate::ExactFrameReader::new(factory.as_ref(), configuration, samples, limits).unwrap();
         let cancellation = CancellationToken::new();
         let mut decoded = Vec::new();
         for frame in 0..EAGER_FRAMES {
