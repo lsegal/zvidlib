@@ -1,7 +1,7 @@
 //! Bounded, read-only ISO BMFF/MP4 probing and sample indexing.
 
 use crate::audio::{AudioEdit, AudioTrackTiming, EncodedAudioSample};
-use crate::codec::{EncodedVideoSample, SampleDependency, TrackKind};
+use crate::codec::{EncodedVideoSample, SampleDependency, SampleProvider, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
 use crate::mp4::{CoverArt, CoverArtFormat};
@@ -9,7 +9,9 @@ use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
 use crate::timeline::FrameIndex;
 use crate::vorbis::VorbisConfig;
 use crate::{Error, ErrorKind, Limits, Result};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 
 const HEADER_SIZE: usize = 8;
 
@@ -104,6 +106,33 @@ impl Mp4Track {
         read_exact(source, sample.offset, destination).await
     }
 
+    /// The presentation identity, in [`FrameIndex`] terms, of every
+    /// decode-order sample: [`Self::presentation_order`]'s inverse, with a
+    /// decode-only sample (one `presentation_order` does not list) given an
+    /// identity past the last presentation frame so it never collides with
+    /// a frame a caller asks for. Reads no sample data.
+    fn presentation_index_by_decode(&self) -> Result<Vec<u64>> {
+        let mut presentation_index_by_decode = vec![None; self.samples.len()];
+        for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
+            let presentation_index = u64::try_from(presentation_index)
+                .map_err(|_| limit("presentation index overflow"))?;
+            *presentation_index_by_decode
+                .get_mut(decode_index)
+                .ok_or_else(|| malformed("presentation order references a missing sample"))? =
+                Some(presentation_index);
+        }
+        let mut next_decode_only = self.presentation_order.len() as u64;
+        Ok(presentation_index_by_decode
+            .into_iter()
+            .map(|index| {
+                index.unwrap_or_else(|| {
+                    next_decode_only += 1;
+                    next_decode_only - 1
+                })
+            })
+            .collect())
+    }
+
     /// Reads every decode-order sample and returns owned
     /// [`EncodedVideoSample`] values keyed by presentation order, ready for
     /// a [`crate::codec::VideoDecoderFactory`] backend.
@@ -123,25 +152,7 @@ impl Mp4Track {
         if self.kind != TrackKind::Video {
             return Err(unsupported("encoded video samples require a video track"));
         }
-        let mut presentation_index_by_decode = vec![None; self.samples.len()];
-        for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
-            let presentation_index = u64::try_from(presentation_index)
-                .map_err(|_| limit("presentation index overflow"))?;
-            *presentation_index_by_decode
-                .get_mut(decode_index)
-                .ok_or_else(|| malformed("presentation order references a missing sample"))? =
-                Some(presentation_index);
-        }
-        let mut next_decode_only = self.presentation_order.len() as u64;
-        let presentation_index_by_decode: Vec<u64> = presentation_index_by_decode
-            .into_iter()
-            .map(|index| {
-                index.unwrap_or_else(|| {
-                    next_decode_only += 1;
-                    next_decode_only - 1
-                })
-            })
-            .collect();
+        let presentation_index_by_decode = self.presentation_index_by_decode()?;
 
         let mut total_bytes = 0_u64;
         let mut samples = Vec::with_capacity(self.samples.len());
@@ -374,6 +385,105 @@ impl Mp4Track {
             track_offset: 0,
             edits,
         })
+    }
+}
+
+/// A [`SampleProvider`] that reads a video track's compressed bytes from a
+/// [`ByteSource`] on demand, holding only `track`'s index (and whatever `S`
+/// itself caches) rather than every sample's bytes.
+///
+/// Built from a shared MP4/WebM [`Mp4Track`] index, so it works over either
+/// container.
+///
+/// `S::read_at`'s future must resolve the first time it is polled: this
+/// provider is used from [`ExactFrameReader::get`][crate::codec::ExactFrameReader::get],
+/// which is synchronous, so [`Self::read`] polls the read once and reports
+/// [`ErrorKind::Unsupported`] rather than blocking if the source does not
+/// finish immediately. [`MemorySource`][crate::io::MemorySource] and a
+/// [`CachingByteSource`][crate::io::CachingByteSource] wrapping one both
+/// satisfy this; a source that genuinely waits on I/O (a network fetch, for
+/// example) needs its own asynchronous reader rather than this provider.
+///
+/// `S` must be `Send` so the provider - and a reader built over it - can be
+/// moved to a decode thread, matching [`SampleProvider`]'s own requirement.
+pub struct Mp4SampleProvider<S> {
+    track: Mp4Track,
+    source: S,
+    presentation_index_by_decode: Vec<u64>,
+}
+
+impl<S: ByteSource + Send> Mp4SampleProvider<S> {
+    /// Fails if `track` is not a video track; reads no sample data.
+    pub fn new(track: Mp4Track, source: S) -> Result<Self> {
+        if track.kind != TrackKind::Video {
+            return Err(unsupported("a sample provider requires a video track"));
+        }
+        let presentation_index_by_decode = track.presentation_index_by_decode()?;
+        Ok(Self {
+            track,
+            source,
+            presentation_index_by_decode,
+        })
+    }
+
+    pub fn track(&self) -> &Mp4Track {
+        &self.track
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
+    fn len(&self) -> usize {
+        self.track.samples.len()
+    }
+
+    fn is_random_access(&self, decode_index: usize) -> bool {
+        self.track.samples[decode_index].is_sync
+    }
+
+    fn presentation_index(&self, decode_index: usize) -> FrameIndex {
+        FrameIndex(self.presentation_index_by_decode[decode_index])
+    }
+
+    fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>> {
+        let size = self
+            .track
+            .samples
+            .get(decode_index)
+            .ok_or_else(|| invalid("MP4 sample index is out of range"))?
+            .size as usize;
+        let mut data = vec![0_u8; size];
+        poll_once(
+            self.track
+                .read_sample_into(&self.source, decode_index, &mut data),
+        )
+        .ok_or_else(|| {
+            unsupported(
+                "Mp4SampleProvider requires a byte source whose reads complete \
+                     synchronously; it cannot drive one that suspends",
+            )
+        })??;
+        Ok(Cow::Owned(data))
+    }
+}
+
+/// Polls a future once and returns its value if it was ready, without
+/// blocking or spinning. Every `ByteSource` this crate ships resolves on its
+/// first poll; this is how a synchronous caller, such as
+/// [`Mp4SampleProvider::read`], drives one without an async runtime.
+fn poll_once<T>(future: impl Future<Output = T>) -> Option<T> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(value) => Some(value),
+        std::task::Poll::Pending => None,
     }
 }
 
@@ -1983,7 +2093,7 @@ fn unsupported(m: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{IoFuture, MemorySource};
+    use crate::io::{CachingByteSource, IoFuture, MemorySource};
     use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
@@ -2233,6 +2343,138 @@ mod tests {
         let derived =
             crate::codec_config::derive_codec_string(track.codec, &track.decoder_config).unwrap();
         assert!(derived.codec_string.starts_with("hev1."));
+    }
+
+    /// A source that counts every byte actually read from it, so a test can
+    /// tell whether building an on-demand provider read any sample data.
+    struct CountingSource {
+        inner: MemorySource,
+        bytes_read: Cell<u64>,
+    }
+
+    impl ByteSource for CountingSource {
+        fn len(&self) -> Option<u64> {
+            self.inner.len()
+        }
+
+        fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
+            Box::pin(async move {
+                let read = self.inner.read_at(offset, destination).await?;
+                self.bytes_read.set(self.bytes_read.get() + read as u64);
+                Ok(read)
+            })
+        }
+    }
+
+    fn bundled_hevc_track_and_bytes() -> (Mp4Track, Vec<u8>) {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/media/BigBuckBunny.mp4"
+        ))
+        .expect("bundled sample video is checked into the repository");
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+        let track = demuxer
+            .tracks
+            .into_iter()
+            .find(|track| track.kind == TrackKind::Video)
+            .expect("sample video has a video track");
+        (track, bytes)
+    }
+
+    /// Requirement 3 of issue #669: building the provider holds only the
+    /// track's index, reading no sample data until a specific sample is
+    /// asked for.
+    #[test]
+    fn mp4_sample_provider_reads_no_sample_data_at_construction() {
+        let (track, bytes) = bundled_hevc_track_and_bytes();
+        let source = CountingSource {
+            inner: MemorySource::new(bytes),
+            bytes_read: Cell::new(0),
+        };
+        let provider = Mp4SampleProvider::new(track, source).unwrap();
+        assert_eq!(
+            provider.source().bytes_read.get(),
+            0,
+            "constructing the provider read sample data"
+        );
+        assert!(provider.len() > 1);
+        // Metadata alone - no data read for it either.
+        for position in 0..provider.len() {
+            provider.presentation_index(position);
+            provider.is_random_access(position);
+        }
+        assert_eq!(
+            provider.source().bytes_read.get(),
+            0,
+            "reading metadata alone read sample data"
+        );
+        // Reading one sample's bytes reads only that sample, not the track.
+        let one_sample_size = track_sample_size(provider.track(), 0);
+        provider.read(0).unwrap();
+        assert_eq!(provider.source().bytes_read.get(), one_sample_size);
+    }
+
+    fn track_sample_size(track: &Mp4Track, decode_index: usize) -> u64 {
+        u64::from(track.samples[decode_index].size)
+    }
+
+    /// Requirement 2 and the "exact-frame and exact-audio-range results are
+    /// identical" acceptance criterion: the on-demand provider must answer
+    /// exactly what the eager `Vec` path does, for every sample of a real
+    /// track.
+    #[test]
+    fn mp4_sample_provider_matches_the_eager_vec_path_for_the_bundled_sample() {
+        let (track, bytes) = bundled_hevc_track_and_bytes();
+        let source = MemorySource::new(bytes.clone());
+        let eager = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
+
+        let provider_source = MemorySource::new(bytes);
+        let provider = Mp4SampleProvider::new(track, provider_source).unwrap();
+        assert_eq!(provider.len(), eager.len());
+        for (decode_index, expected) in eager.iter().enumerate() {
+            assert_eq!(
+                provider.presentation_index(decode_index),
+                expected.presentation_index
+            );
+            assert_eq!(
+                provider.is_random_access(decode_index),
+                expected.random_access
+            );
+            assert_eq!(provider.read(decode_index).unwrap().as_ref(), expected.data);
+        }
+    }
+
+    /// Acceptance criterion: compressed bytes held in memory stay within a
+    /// configured cache budget while seeking through a track much larger
+    /// than that budget.
+    #[test]
+    fn mp4_sample_provider_over_a_caching_byte_source_stays_within_its_budget() {
+        let (track, bytes) = bundled_hevc_track_and_bytes();
+        let total_track_bytes: u64 = track.samples.iter().map(|s| u64::from(s.size)).sum();
+        let budget = total_track_bytes / 20;
+        assert!(budget > 0, "the bundled sample is too small for this test");
+        let source = MemorySource::new(bytes);
+        let cache = CachingByteSource::new(source, 64 * 1024, budget).unwrap();
+        let provider = Mp4SampleProvider::new(track, cache).unwrap();
+
+        let len = provider.len();
+        // Forward through the whole track, then seek back across it, then
+        // jump to the middle and the very end - the shape of playback
+        // followed by scrubbing.
+        let positions = (0..len).chain((0..len).rev()).chain([len / 2, 0, len - 1]);
+        for position in positions {
+            provider.read(position).unwrap();
+            assert!(
+                provider.source().resident_bytes() <= budget,
+                "resident bytes {} exceeded the budget {budget} at decode index {position}",
+                provider.source().resident_bytes()
+            );
+        }
+        assert!(
+            provider.source().resident_bytes() < total_track_bytes,
+            "the cache held as much as the whole track"
+        );
     }
 
     /// An `avcC` record as WebCodecs/mediabunny writes it: High profile,

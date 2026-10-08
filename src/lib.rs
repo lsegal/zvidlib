@@ -121,8 +121,8 @@ pub use wasm_api::*;
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
 #[doc(no_inline)]
 pub use audio::{
-    AacDecoder, AacSampleReader, AudioDecoder, AudioEdit, AudioSampleReader, AudioTrackTiming,
-    EncodedAudioSample,
+    AacDecoder, AacSampleReader, AudioDecoder, AudioEdit, AudioPacketProvider, AudioSampleReader,
+    AudioTrackTiming, EncodedAudioSample,
 };
 #[doc(no_inline)]
 pub use av1::{
@@ -177,8 +177,8 @@ pub use codec::{
     AudioGapless, CancellationToken, CodecImplementation, CodecProfile, CodecSupport,
     DecodeStatistics, DecodedVideoFrame, EncodedSample, EncodedVideoSample, EncoderConfig,
     EncoderFuture, ExactFrameReader, HardwarePreference, SEEK_LATENCY_BUDGET, SampleDependency,
-    Seek, SeekPreviewSource, TrackKind, VideoDecoder, VideoDecoderConfig, VideoDecoderFactory,
-    VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
+    SampleProvider, Seek, SeekPreviewSource, TrackKind, VideoDecoder, VideoDecoderConfig,
+    VideoDecoderFactory, VideoEncoder, VideoEncoderConfig, VideoEncoderFactory, VideoEncoderFormat,
     uncompressed_video_decoder_factory,
 };
 #[doc(no_inline)]
@@ -201,7 +201,8 @@ pub use media::{
 pub use mp4::{CoverArt, CoverArtFormat};
 #[doc(no_inline)]
 pub use mp4_demux::{
-    AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4Track, probe_mp4,
+    AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
+    Mp4Track, probe_mp4,
 };
 #[cfg(feature = "opus-decoder")]
 #[doc(no_inline)]
