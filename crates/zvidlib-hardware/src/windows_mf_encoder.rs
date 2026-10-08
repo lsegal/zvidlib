@@ -677,8 +677,7 @@ impl Mft {
                 .map_err(|error| mf_error("could not drain the encoder", error))?;
         }
         if self.events.is_some() {
-            while self.next_event(true, canceled, out)? != Some(METransformDrainComplete.0 as u32)
-            {
+            while self.next_event(true, canceled, out)? != Some(METransformDrainComplete.0 as u32) {
             }
         } else {
             self.drain_sync(out)?;

@@ -297,10 +297,7 @@ impl CancellationToken {
     #[doc(hidden)]
     pub fn check(&self) -> Result<()> {
         if self.is_canceled() {
-            Err(Error::new(
-                ErrorKind::Canceled,
-                "codec operation canceled",
-            ))
+            Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
         } else {
             Ok(())
         }

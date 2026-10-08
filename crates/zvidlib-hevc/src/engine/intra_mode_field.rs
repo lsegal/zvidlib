@@ -262,10 +262,7 @@ mod tests {
     fn fresh_field_reports_dc_for_all_neighbors() {
         let f = IntraModeField::new(64, 64, 6);
         // No cell written yet ⇒ both candidates are INTRA_DC.
-        assert_eq!(
-            f.cand_intra_pred_mode(8, 8, Neighbor::Left, true),
-            INTRA_DC
-        );
+        assert_eq!(f.cand_intra_pred_mode(8, 8, Neighbor::Left, true), INTRA_DC);
         assert_eq!(
             f.cand_intra_pred_mode(8, 8, Neighbor::Above, true),
             INTRA_DC
@@ -276,10 +273,7 @@ mod tests {
     fn out_of_picture_neighbor_is_dc() {
         let f = IntraModeField::new(64, 64, 6);
         // ( -1, 0 ) left of the picture origin.
-        assert_eq!(
-            f.cand_intra_pred_mode(0, 0, Neighbor::Left, true),
-            INTRA_DC
-        );
+        assert_eq!(f.cand_intra_pred_mode(0, 0, Neighbor::Left, true), INTRA_DC);
         // ( 0, -1 ) above the picture origin.
         assert_eq!(
             f.cand_intra_pred_mode(0, 0, Neighbor::Above, true),
@@ -338,20 +332,14 @@ mod tests {
     fn non_intra_neighbor_is_dc() {
         let mut f = IntraModeField::new(64, 64, 6);
         f.record_non_intra_cu(0, 8, 8, CuPredMode::Inter);
-        assert_eq!(
-            f.cand_intra_pred_mode(8, 8, Neighbor::Left, true),
-            INTRA_DC
-        );
+        assert_eq!(f.cand_intra_pred_mode(8, 8, Neighbor::Left, true), INTRA_DC);
     }
 
     #[test]
     fn pcm_neighbor_is_dc() {
         let mut f = IntraModeField::new(64, 64, 6);
         f.record_intra_pb(0, 8, 8, 18, true);
-        assert_eq!(
-            f.cand_intra_pred_mode(8, 8, Neighbor::Left, true),
-            INTRA_DC
-        );
+        assert_eq!(f.cand_intra_pred_mode(8, 8, Neighbor::Left, true), INTRA_DC);
     }
 
     #[test]

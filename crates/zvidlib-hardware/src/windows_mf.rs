@@ -1215,10 +1215,7 @@ fn frame_size(dimensions: VideoDimensions) -> u64 {
 
 fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_canceled() {
-        Err(Error::new(
-            ErrorKind::Canceled,
-            "codec operation canceled",
-        ))
+        Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
     } else {
         Ok(())
     }

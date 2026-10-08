@@ -472,12 +472,9 @@ impl PictureParseState {
         let cand_a =
             self.field
                 .cand_intra_pred_mode(x_pb as usize, y_pb as usize, Neighbor::Left, avail_a);
-        let cand_b = self.field.cand_intra_pred_mode(
-            x_pb as usize,
-            y_pb as usize,
-            Neighbor::Above,
-            avail_b,
-        );
+        let cand_b =
+            self.field
+                .cand_intra_pred_mode(x_pb as usize, y_pb as usize, Neighbor::Above, avail_b);
         let cand_list = intra_luma_cand_mode_list(cand_a, cand_b);
         let source = luma_intra_mode_source_from_flag(u8::from(luma.prev_intra_luma_pred_flag));
         let field_val = match source {

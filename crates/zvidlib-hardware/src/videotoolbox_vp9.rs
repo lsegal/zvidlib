@@ -572,10 +572,7 @@ fn read_picture(decoded: videotoolbox::DecodedFrame, limits: &Limits) -> Result<
 
 fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_canceled() {
-        Err(Error::new(
-            ErrorKind::Canceled,
-            "codec operation canceled",
-        ))
+        Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
     } else {
         Ok(())
     }
