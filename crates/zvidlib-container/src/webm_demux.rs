@@ -836,6 +836,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
     let mut encoded = false;
     let mut width = None;
     let mut height = None;
+    let mut colour = None;
     let mut sampling_frequency = None;
     let mut channels = None;
     for child in children(payload) {
@@ -864,6 +865,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
                     match id {
                         ebml::PIXEL_WIDTH => width = Some(read_uint(value)?),
                         ebml::PIXEL_HEIGHT => height = Some(read_uint(value)?),
+                        ebml::COLOUR => colour = Some(value),
                         _ => {}
                     }
                 }
@@ -961,7 +963,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
         dimension(height, "PixelHeight")?,
         &options.limits,
     )?;
-    let decoder_config = decoder_config(codec, codec_private)?;
+    let decoder_config = decoder_config(codec, codec_private, colour)?;
     Ok(TrackEntry {
         number,
         codec_id,
@@ -1002,7 +1004,11 @@ fn audio_codec(codec_id: &str) -> Option<Codec> {
 
 /// Wraps a track's `CodecPrivate` in the MP4 box an [`Mp4Track`] carries, so
 /// decoders configure from a WebM track exactly as from an MP4 one.
-fn decoder_config(codec: Codec, codec_private: Option<&[u8]>) -> Result<Vec<u8>> {
+fn decoder_config(
+    codec: Codec,
+    codec_private: Option<&[u8]>,
+    colour: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     match codec {
         Codec::Av1 => {
             let record = codec_private
@@ -1021,10 +1027,25 @@ fn decoder_config(codec: Codec, codec_private: Option<&[u8]>) -> Result<Vec<u8>>
         // VP9's `CodecPrivate` is an optional list of features (profile,
         // level, bit depth, chroma subsampling); it becomes the `vpcC` box an
         // MP4 track would carry, with the profile 0 defaults for any it
-        // leaves out.
+        // leaves out. The range and colour description come from the
+        // `Colour` element, which is where WebM keeps them.
         Codec::Vp9 => {
-            let config =
+            let mut config =
                 crate::Vp9CodecConfig::parse_webm_codec_private(codec_private.unwrap_or_default())?;
+            for child in children(colour.unwrap_or_default()) {
+                let (id, value) = child?;
+                let value = || {
+                    u8::try_from(read_uint(value)?)
+                        .map_err(|_| malformed("WebM Colour value is out of range"))
+                };
+                match id {
+                    ebml::MATRIX_COEFFICIENTS => config.matrix_coefficients = value()?,
+                    ebml::TRANSFER_CHARACTERISTICS => config.transfer_characteristics = value()?,
+                    ebml::PRIMARIES => config.colour_primaries = value()?,
+                    ebml::RANGE => config.video_full_range = value()? == 2,
+                    _ => {}
+                }
+            }
             Ok(config.to_vpcc())
         }
         _ => Err(unsupported(
