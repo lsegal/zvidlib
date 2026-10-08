@@ -1,11 +1,12 @@
-//! Native on-demand playback of an MP4 that is never loaded whole (issue #689).
+//! Native on-demand playback of an MP4 or WebM that is never loaded whole
+//! (issues #689 and #685).
 //!
 //! [`OnDemandPlayer`] is the native counterpart of the browser's
-//! `OnDemandPlayback`: it reads the movie header when it opens and then only
-//! the compressed samples playback reaches, into one cache for the video track
-//! and one for the selected audio track, each bounded by a byte budget. It
-//! chooses the video decoder and the AAC or Opus audio decoder from the tracks,
-//! and plays on the default audio device:
+//! `OnDemandPlayback`: it reads the container's header and index when it opens
+//! and then only the compressed samples playback reaches, into one cache for
+//! the video track and one for the selected audio track, each bounded by a byte
+//! budget. It chooses the video decoder and the AAC, Opus or Vorbis audio
+//! decoder from the tracks, and plays on the default audio device:
 //!
 //! ```no_run
 //! use zvidlib::{FrameIndex, OnDemandOptions, OnDemandPlayer};
@@ -38,10 +39,9 @@
 use crate::codec::HardwarePreference;
 use crate::io::{ByteSource, FileSource, IoFuture};
 use crate::media::{VideoDimensions, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions};
 use crate::on_demand::{
     AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
-    SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, audio_packets, crate_video_source, first_track,
+    SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, audio_packets, crate_video_source,
 };
 use crate::playback::{
     AudioOutputBackend, IndexedPresentationTimeline, NativeAudioOutput, OnDemandAudioSource,
@@ -51,8 +51,8 @@ use crate::playback::{
 use crate::timeline::{FrameIndex, SampleRange};
 use crate::track::Track;
 use crate::{
-    AudioBuffer, AudioDecoder, AudioSampleReader, CancellationToken, Error, ErrorKind, Limits,
-    Result, TrackKind, TrackSampleLoader,
+    AudioBuffer, AudioDecoder, AudioSampleReader, AudioTrackTiming, CancellationToken, Error,
+    ErrorKind, Limits, Result, TrackKind, TrackSampleLoader,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -191,7 +191,7 @@ impl AudioOutputBackend for WallClock {
 type Controller<S> =
     PlaybackController<OnDemandVideoSource<S>, PlayerAudio<S>, Box<dyn PlaybackAudioOutput>>;
 
-/// Plays an MP4 natively, reading only the compressed samples playback
+/// Plays an MP4 or WebM natively, reading only the compressed samples playback
 /// reaches; see the [module documentation](self).
 pub struct OnDemandPlayer<S = FileSource> {
     controller: Controller<S>,
@@ -205,7 +205,10 @@ struct Input<S> {
     source: S,
     video: Track,
     audio_tracks: Vec<Track>,
-    movie_timescale: u32,
+    /// Each audio track's timing on the decoded sample clock, as its container
+    /// gives it, or why it has none; a track's failure is reported when it is
+    /// selected, not when the input opens.
+    audio_timings: Vec<Result<AudioTrackTiming>>,
     options: OnDemandOptions,
     limits: Limits,
     dimensions: VideoDimensions,
@@ -250,7 +253,7 @@ impl<S: ByteSource + Clone> Input<S> {
             .clone();
         let (decoder, channels) = audio_decoder(&track, self.limits)?;
         let sample_rate = track.audio_sample_rate()?;
-        let timing = track.audio_timing(self.movie_timescale)?;
+        let timing = self.audio_timings[index].clone()?;
         let loader =
             TrackSampleLoader::new(track, self.source.clone(), self.options.audio_budget_bytes)?;
         let (packets, preroll) = block_on(audio_packets(&loader))?;
@@ -276,15 +279,16 @@ impl<S: ByteSource + Clone> Input<S> {
 }
 
 impl OnDemandPlayer<FileSource> {
-    /// Opens the MP4 at `path`, playing its audio on the default audio device.
+    /// Opens the MP4 or WebM at `path`, playing its audio on the default audio
+    /// device.
     pub fn open(path: impl AsRef<std::path::Path>, options: OnDemandOptions) -> Result<Self> {
         Self::from_source(FileSource::open(path)?, options)
     }
 }
 
 impl<S: ByteSource + Clone> OnDemandPlayer<S> {
-    /// Opens the MP4 `source` reads, playing its audio on the default audio
-    /// device.
+    /// Opens the MP4 or WebM `source` reads, playing its audio on the default
+    /// audio device.
     pub fn from_source(source: S, options: OnDemandOptions) -> Result<Self> {
         Self::with_output(
             source,
@@ -298,11 +302,11 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
         )
     }
 
-    /// Opens the MP4 `source` reads, playing its audio on the outputs
+    /// Opens the MP4 or WebM `source` reads, playing its audio on the outputs
     /// `open_output` opens. An input with no audio track opens none, and plays
     /// on the system's monotonic clock.
     ///
-    /// Reads the movie header, and of the samples only an AV1 or VP9 track's
+    /// Reads the container's header and index, and of the samples only an AV1 or VP9 track's
     /// first and an Opus track's last.
     pub fn with_output(
         source: S,
@@ -313,15 +317,20 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
             max_cached_frames: options.max_cached_frames,
             ..Limits::default()
         };
-        let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default()))?;
-        let video = first_track(&demuxer, TrackKind::Video)
+        let media = block_on(crate::container::open_media(&source, &limits))?;
+        let video = media
+            .first_track(TrackKind::Video)
             .ok_or_else(|| Error::new(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
-        let audio_tracks: Vec<Track> = demuxer
-            .tracks
+        let audio_tracks: Vec<Track> = media
+            .tracks()
             .iter()
             .filter(|track| track.kind == TrackKind::Audio)
             .cloned()
+            .collect();
+        let audio_timings = audio_tracks
+            .iter()
+            .map(|track| media.audio_timing(track))
             .collect();
         let audio_track = if audio_tracks.is_empty() {
             None
@@ -345,7 +354,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
             source,
             video,
             audio_tracks,
-            movie_timescale: demuxer.movie_timescale,
+            audio_timings,
             options,
             limits,
         };

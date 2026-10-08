@@ -39,6 +39,85 @@ pub fn container_capabilities() -> Vec<Capability> {
         .collect()
 }
 
+/// Every track of an MP4 or WebM source, indexed by whichever demuxer its
+/// signature calls for, and what that demuxer knows of their timing beyond
+/// the tracks themselves.
+#[doc(hidden)]
+pub struct MediaTracks {
+    demuxer: Demuxer,
+}
+
+enum Demuxer {
+    Mp4(Mp4Demuxer),
+    WebM(WebmDemuxer),
+}
+
+impl MediaTracks {
+    /// Every indexed track, in the order the container lists them.
+    pub fn tracks(&self) -> &[Track] {
+        match &self.demuxer {
+            Demuxer::Mp4(demuxer) => &demuxer.tracks,
+            Demuxer::WebM(demuxer) => &demuxer.tracks,
+        }
+    }
+
+    /// Takes the indexed tracks, in the order the container lists them.
+    pub fn into_tracks(self) -> Vec<Track> {
+        match self.demuxer {
+            Demuxer::Mp4(demuxer) => demuxer.tracks,
+            Demuxer::WebM(demuxer) => demuxer.tracks,
+        }
+    }
+
+    /// The first track of `kind`, if the source has one.
+    pub fn first_track(&self, kind: TrackKind) -> Option<&Track> {
+        self.tracks().iter().find(|track| track.kind == kind)
+    }
+
+    /// `track`'s timing on the decoded sample clock: an MP4 track's edit
+    /// list, or a WebM track's `CodecDelay` and `DiscardPadding`. `track` must
+    /// be one of [`MediaTracks::tracks`].
+    pub fn audio_timing(&self, track: &Track) -> Result<AudioTrackTiming> {
+        match &self.demuxer {
+            Demuxer::Mp4(demuxer) => track.audio_timing(demuxer.movie_timescale),
+            Demuxer::WebM(demuxer) => demuxer.audio_timing(track.id),
+        }
+    }
+}
+
+/// Indexes every track of an MP4 or WebM source, detected by signature. A
+/// source that is neither is read as MP4, whose demuxer reports what is wrong.
+#[doc(hidden)]
+pub async fn open_media<S: ByteSource + ?Sized>(
+    source: &S,
+    limits: &Limits,
+) -> Result<MediaTracks> {
+    let demuxer = if probe_container(source).await? == Some(Container::WebM) {
+        Demuxer::WebM(
+            WebmDemuxer::open(
+                source,
+                WebmDemuxerOptions {
+                    limits: *limits,
+                    ..WebmDemuxerOptions::default()
+                },
+            )
+            .await?,
+        )
+    } else {
+        Demuxer::Mp4(
+            Mp4Demuxer::open(
+                source,
+                Mp4DemuxerOptions {
+                    limits: *limits,
+                    ..Mp4DemuxerOptions::default()
+                },
+            )
+            .await?,
+        )
+    };
+    Ok(MediaTracks { demuxer })
+}
+
 /// Indexes every track of an MP4 or WebM source, detected by signature. A
 /// source that is neither is read as MP4, whose demuxer reports what is wrong.
 #[doc(hidden)]
@@ -46,26 +125,7 @@ pub async fn open_tracks<S: ByteSource + ?Sized>(
     source: &S,
     limits: &Limits,
 ) -> Result<Vec<Track>> {
-    if probe_container(source).await? == Some(Container::WebM) {
-        let demuxer = WebmDemuxer::open(
-            source,
-            WebmDemuxerOptions {
-                limits: *limits,
-                ..WebmDemuxerOptions::default()
-            },
-        )
-        .await?;
-        return Ok(demuxer.tracks);
-    }
-    let demuxer = Mp4Demuxer::open(
-        source,
-        Mp4DemuxerOptions {
-            limits: *limits,
-            ..Mp4DemuxerOptions::default()
-        },
-    )
-    .await?;
-    Ok(demuxer.tracks)
+    Ok(open_media(source, limits).await?.into_tracks())
 }
 
 /// Indexes the `index`th audio track of an MP4 or WebM source, detected by
@@ -77,39 +137,13 @@ pub async fn open_audio_track<S: ByteSource + ?Sized>(
     index: usize,
     limits: &Limits,
 ) -> Result<(Track, AudioTrackTiming)> {
-    let no_track = || Error::new(ErrorKind::InvalidInput, "no such audio track");
-    if probe_container(source).await? == Some(Container::WebM) {
-        let demuxer = WebmDemuxer::open(
-            source,
-            WebmDemuxerOptions {
-                limits: *limits,
-                ..WebmDemuxerOptions::default()
-            },
-        )
-        .await?;
-        let track = demuxer
-            .tracks
-            .iter()
-            .filter(|track| track.kind == TrackKind::Audio)
-            .nth(index)
-            .ok_or_else(no_track)?;
-        let timing = demuxer.audio_timing(track.id)?;
-        return Ok((track.clone(), timing));
-    }
-    let demuxer = Mp4Demuxer::open(
-        source,
-        Mp4DemuxerOptions {
-            limits: *limits,
-            ..Mp4DemuxerOptions::default()
-        },
-    )
-    .await?;
-    let track = demuxer
-        .tracks
-        .into_iter()
+    let media = open_media(source, limits).await?;
+    let track = media
+        .tracks()
+        .iter()
         .filter(|track| track.kind == TrackKind::Audio)
         .nth(index)
-        .ok_or_else(no_track)?;
-    let timing = track.audio_timing(demuxer.movie_timescale)?;
-    Ok((track, timing))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "no such audio track"))?;
+    let timing = media.audio_timing(track)?;
+    Ok((track.clone(), timing))
 }

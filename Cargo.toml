@@ -173,7 +173,7 @@ required-features = ["vorbis-decoder"]
 [[test]]
 name = "on_demand_playback"
 path = "tests/on_demand_playback.rs"
-required-features = ["hevc-decoder"]
+required-features = ["hevc-decoder", "vp9-decoder", "vp9-encoder", "opus-encoder"]
 
 [[test]]
 name = "on_demand_player"
@@ -193,7 +193,7 @@ required-features = ["vp8-decoder"]
 [[test]]
 name = "on_demand_sample_provider"
 path = "tests/on_demand_sample_provider.rs"
-required-features = ["hevc-decoder"]
+required-features = ["hevc-decoder", "vp9-decoder", "vp9-encoder", "opus-encoder"]
 
 [build-dependencies]
 zvidlib-build = { workspace = true }

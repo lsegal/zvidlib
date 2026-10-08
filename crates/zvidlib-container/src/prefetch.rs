@@ -56,6 +56,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// first sample of the run behind the whole of it.
 const MAX_COALESCED_READ_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The most bytes between two samples that a coalesced read reads through and
+/// discards rather than splitting into two requests.
+///
+/// A WebM stores each sample in a block of its own, so a few header bytes
+/// separate every sample from the next, and the blocks of other tracks lie
+/// between a track's samples wherever the file interleaves them. Reading
+/// through a gap this small costs less than another round trip to the source
+/// (issue #685).
+const MAX_COALESCED_GAP_BYTES: u64 = 16 * 1024;
+
 /// Loads a track's compressed samples from a [`ByteSource`] asynchronously,
 /// ahead of the synchronous readers that decode them.
 ///
@@ -234,9 +244,10 @@ impl<S: ByteSource> TrackSampleLoader<S> {
     /// Loads every sample in `required` that is not already loaded, then up
     /// to `readahead` samples after it, as far as the budget allows.
     ///
-    /// `required` is clamped to the track. Adjacent samples that are stored
-    /// contiguously are read together. The samples loaded here are the most
-    /// recently used, so making room for them evicts other samples first.
+    /// `required` is clamped to the track. Adjacent samples stored together,
+    /// or separated only by a few kilobytes such as a WebM's block headers,
+    /// are read together. The samples loaded here are the most recently used,
+    /// so making room for them evicts other samples first.
     ///
     /// A `required` run larger than the whole budget - the walk to a frame
     /// deep inside a long group of pictures - is loaded from its start for as
@@ -315,13 +326,18 @@ impl<S: ByteSource> TrackSampleLoader<S> {
             }
             let offset = samples[index].offset;
             let mut run_end = index + 1;
+            // The bytes from the run's first sample to the end of its last.
             let mut run_bytes = u64::from(samples[index].size);
-            while run_end < range.end
-                && samples[run_end].offset == offset + run_bytes
-                && run_bytes + u64::from(samples[run_end].size) <= MAX_COALESCED_READ_BYTES
-                && !self.is_loaded(run_end)
-            {
-                run_bytes += u64::from(samples[run_end].size);
+            while run_end < range.end && !self.is_loaded(run_end) {
+                let next = &samples[run_end];
+                let Some(gap) = next.offset.checked_sub(offset + run_bytes) else {
+                    break;
+                };
+                let next_bytes = run_bytes + gap + u64::from(next.size);
+                if gap > MAX_COALESCED_GAP_BYTES || next_bytes > MAX_COALESCED_READ_BYTES {
+                    break;
+                }
+                run_bytes = next_bytes;
                 run_end += 1;
             }
             let mut bytes = vec![
@@ -332,11 +348,12 @@ impl<S: ByteSource> TrackSampleLoader<S> {
             ];
             read_exact(&self.source, offset, &mut bytes).await?;
             let mut cache = self.cache.lock();
-            let mut position = 0_usize;
             for (decode_index, sample) in samples.iter().enumerate().take(run_end).skip(index) {
-                let size = sample.size as usize;
-                cache.insert(decode_index, Arc::from(&bytes[position..position + size]));
-                position += size;
+                let start = (sample.offset - offset) as usize;
+                cache.insert(
+                    decode_index,
+                    Arc::from(&bytes[start..start + sample.size as usize]),
+                );
             }
             index = run_end;
         }
@@ -577,9 +594,17 @@ mod tests {
     /// offset 0, every fourth a random-access point, each filled with its own
     /// decode index.
     fn track_and_source(sizes: &[u32]) -> (Track, SuspendingSource) {
+        let gaps = vec![0; sizes.len()];
+        gapped_track_and_source(sizes, &gaps)
+    }
+
+    /// [`track_and_source`] with `gaps[index]` bytes of something else, such
+    /// as a WebM block header, stored before each sample.
+    fn gapped_track_and_source(sizes: &[u32], gaps: &[usize]) -> (Track, SuspendingSource) {
         let mut bytes = Vec::new();
         let mut samples = Vec::new();
         for (index, &size) in sizes.iter().enumerate() {
+            bytes.extend(std::iter::repeat_n(0xff, gaps[index]));
             samples.push(TrackSample {
                 offset: bytes.len() as u64,
                 size,
@@ -651,6 +676,30 @@ mod tests {
         // Loading what is already resident reads nothing.
         block_on(loader.load(4..10, 0)).unwrap();
         assert_eq!(loader.source().reads.get(), 1);
+    }
+
+    /// Issue #685: samples a few bytes apart, as a WebM's blocks are, are
+    /// still read together, while a gap too large to be worth reading through
+    /// splits the run.
+    #[test]
+    fn loading_a_run_reads_through_small_gaps_between_samples() {
+        let mut gaps = vec![12; 8];
+        gaps[6] = MAX_COALESCED_GAP_BYTES as usize + 1;
+        let (track, source) = gapped_track_and_source(&[10; 8], &gaps);
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
+        let provider = loader.sample_provider().unwrap();
+
+        block_on(loader.load(0..6, 0)).unwrap();
+        assert_eq!(loader.source().reads.get(), 1, "the run was not coalesced");
+        block_on(loader.load(0..8, 0)).unwrap();
+        assert_eq!(
+            loader.source().reads.get(),
+            2,
+            "the large gap was read through"
+        );
+        for index in 0..8 {
+            assert_eq!(provider.read(index).unwrap().as_ref(), &[index as u8; 10]);
+        }
     }
 
     #[test]

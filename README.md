@@ -192,7 +192,7 @@ try {
 input.close();
 ```
 
-Play and seek a remote MP4 without downloading it: `OnDemandPlayback` reads only the movie header and the compressed samples playback reaches, with HTTP range requests (or from a `Blob`), into byte-budgeted caches. No call waits on the network; one that needs a sample not loaded yet throws `WOULD_BLOCK`, and `prefetch()` loads it:
+Play and seek a remote MP4 or WebM without downloading it: `OnDemandPlayback` reads only the container's header and index and the compressed samples playback reaches, with HTTP range requests (or from a `Blob`), into byte-budgeted caches. No call waits on the network; one that needs a sample not loaded yet throws `WOULD_BLOCK`, and `prefetch()` loads it:
 
 ```js
 import init, { OnDemandPlayback, errorCode } from "zvidlib";
@@ -217,7 +217,7 @@ function render() {
 requestAnimationFrame(render);
 ```
 
-The server must answer range requests and, cross-origin, expose `Content-Range` through CORS. Video decodes through WebCodecs when the browser supports the track, and on zvidlib's software decoders otherwise (`playback.videoDecoder` says which); AAC audio decodes through WebCodecs, and Opus audio through WebCodecs or zvidlib's software decoder. A video with no audio track needs no `audioContext`: it plays on `performance.now()`, or on the context's clock when one is given.
+The server must answer range requests and, cross-origin, expose `Content-Range` through CORS. Video decodes through WebCodecs when the browser supports the track, and on zvidlib's software decoders otherwise (`playback.videoDecoder` says which); AAC audio decodes through WebCodecs, and Opus and Vorbis audio through WebCodecs or zvidlib's software decoders. A video with no audio track needs no `audioContext`: it plays on `performance.now()`, or on the context's clock when one is given.
 
 Record a canvas to WebM (or `"mp4"`) with synchronized Opus audio:
 
