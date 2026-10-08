@@ -46,7 +46,7 @@ use crate::codec::{CancellationToken, HardwarePreference};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions};
 use crate::on_demand::{
     AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
     SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, VIDEO_READAHEAD_SAMPLES, audio_packets,
@@ -58,6 +58,7 @@ use crate::playback::{
     PrefetchVideoSource, WebAudioOutput,
 };
 use crate::timeline::{FrameIndex, SampleRange};
+use crate::track::Track;
 use crate::wasm_api::{
     MAX_SAFE_INTEGER, WasmVideoFrame, bigint_u64, ensure_open, js_error, owned_u8_array, parse_u64,
     property,
@@ -67,7 +68,7 @@ use crate::web_decoder::{
     WebCodecsDecoder, js_to_promise, normalize_js_error, packed_rgba, webcodecs_config,
     webcodecs_supports,
 };
-use crate::{Error, ErrorKind, Limits, Mp4SampleLoader, Result, TrackKind};
+use crate::{Error, ErrorKind, Limits, Result, TrackKind, TrackSampleLoader};
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -307,7 +308,7 @@ impl AudioOutputBackend for AudioContextBackend {
 }
 
 /// An AAC or Opus track's presentation samples, decoded from packets an
-/// [`Mp4SampleLoader`] loads on demand.
+/// [`TrackSampleLoader`] loads on demand.
 ///
 /// `WebCodecs` decodes asynchronously, so it cannot sit behind the
 /// controller's synchronous reads. [`PrefetchAudioSource::prefetch`] decodes
@@ -319,7 +320,7 @@ impl AudioOutputBackend for AudioContextBackend {
 /// [`crate::web_audio_decoder`] arranges for `MediaInput`.
 pub(crate) struct BrowserAudioSource {
     reader: AudioSampleReader<Box<dyn AudioDecoder>>,
-    loader: Mp4SampleLoader<RangeSource>,
+    loader: TrackSampleLoader<RangeSource>,
     /// `None` once reads go through the reader's software decoder.
     webcodecs: Option<WebCodecsAudioDecoder>,
     /// Whether the reader's own decoder is a real software decoder rather
@@ -336,7 +337,7 @@ impl BrowserAudioSource {
     /// this browser decodes through `WebCodecs`, or an Opus track. Reads no
     /// packet but an Opus track's last, whose first two bytes give its length.
     async fn open(
-        audio: Mp4Track,
+        audio: Track,
         movie_timescale: u32,
         source: RangeSource,
         budget_bytes: u64,
@@ -369,7 +370,7 @@ impl BrowserAudioSource {
         }
         let sample_rate = audio.audio_sample_rate()?;
         let timing = audio.audio_timing(movie_timescale)?;
-        let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
+        let loader = TrackSampleLoader::new(audio, source, budget_bytes)?;
         let (packets, preroll) = audio_packets(&loader).await?;
         let has_software = software.is_some();
         let reader = AudioSampleReader::from_provider(
@@ -467,10 +468,7 @@ impl BrowserAudioSource {
 
 /// The crate's software decoder for `track`, if the browser build has one:
 /// Opus has one when the `opus-decoder` feature is on, and AAC never does.
-fn software_audio_decoder(
-    track: &Mp4Track,
-    limits: Limits,
-) -> Result<Option<Box<dyn AudioDecoder>>> {
+fn software_audio_decoder(track: &Track, limits: Limits) -> Result<Option<Box<dyn AudioDecoder>>> {
     match track.codec {
         #[cfg(feature = "opus-decoder")]
         Codec::Opus => Ok(Some(Box::new(crate::NativeOpusDecoder::new(
@@ -580,7 +578,7 @@ impl PrefetchAudioSource for BrowserAudioSource {
 }
 
 /// A video track's pictures, decoded through `WebCodecs` from samples an
-/// [`Mp4SampleLoader`] loads on demand (issue #680).
+/// [`TrackSampleLoader`] loads on demand (issue #680).
 ///
 /// [`PrefetchVideoSource::prefetch`] decodes the frame it is asked for and the
 /// [`DECODED_VIDEO_FRAMES`] after it, loading the samples the decode reaches
@@ -592,7 +590,7 @@ impl PrefetchAudioSource for BrowserAudioSource {
 /// them.
 pub(crate) struct WebCodecsVideoSource {
     decoder: WebCodecsDecoder,
-    loader: Mp4SampleLoader<RangeSource>,
+    loader: TrackSampleLoader<RangeSource>,
     frame_count: u64,
     /// Decoded pictures by presentation index, never more than
     /// [`DECODED_VIDEO_FRAMES`].
@@ -605,7 +603,7 @@ impl WebCodecsVideoSource {
     /// loader's track. Reads no sample.
     fn new(
         config: web_sys::VideoDecoderConfig,
-        loader: Mp4SampleLoader<RangeSource>,
+        loader: TrackSampleLoader<RangeSource>,
         limits: Limits,
     ) -> Result<Self> {
         let decoder = WebCodecsDecoder::open(config, Box::new(loader.sample_provider()?), &limits)?;
@@ -994,9 +992,12 @@ impl WasmOnDemandPlayback {
         };
         let video_source = match webcodecs {
             Some(config) => {
-                let video_loader =
-                    Mp4SampleLoader::new(video.clone(), source.clone(), options.video_budget_bytes)
-                        .map_err(core_error)?;
+                let video_loader = TrackSampleLoader::new(
+                    video.clone(),
+                    source.clone(),
+                    options.video_budget_bytes,
+                )
+                .map_err(core_error)?;
                 BrowserVideoSource::WebCodecs(
                     WebCodecsVideoSource::new(config, video_loader, limits).map_err(core_error)?,
                 )
@@ -1033,7 +1034,7 @@ impl WasmOnDemandPlayback {
         let sample_rate = audio_source.as_ref().map(BrowserAudioSource::sample_rate);
         let clock_rate = sample_rate.unwrap_or(VIDEO_ONLY_CLOCK_RATE);
 
-        let timeline = IndexedPresentationTimeline::from_mp4_track(&video, clock_rate, &limits)
+        let timeline = IndexedPresentationTimeline::from_track(&video, clock_rate, &limits)
             .map_err(core_error)?;
         let (audio_source, output) = match audio_source {
             Some(audio) => (
@@ -1691,7 +1692,7 @@ mod tests {
         let source = RangeSource::open(make_suspending_reader(AV1_SAMPLE))
             .await
             .unwrap();
-        let loader = Mp4SampleLoader::new(video, source, 512 * 1024).unwrap();
+        let loader = TrackSampleLoader::new(video, source, 512 * 1024).unwrap();
         let mut video = WebCodecsVideoSource::new(config, loader, Limits::default()).unwrap();
         let expected = webcodecs_frames(&[0, 2, 7, 47]).await;
         let cancellation = CancellationToken::new();

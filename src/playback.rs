@@ -2,10 +2,10 @@
 //!
 //! Natively, a [`PlaybackController`] reads its sources synchronously: an
 //! [`crate::ExactFrameReader`] and [`crate::AudioSampleReader`] over owned samples, or over an
-//! on-demand [`crate::Mp4SampleProvider`] whose source answers immediately. The browser's main
+//! on-demand [`crate::TrackSampleProvider`] whose source answers immediately. The browser's main
 //! thread cannot wait for a `fetch`, so there the sources are an [`OnDemandVideoSource`] and an
 //! [`OnDemandAudioSource`], which read compressed samples only from what their
-//! [`Mp4SampleLoader`] has already loaded and report [`ErrorKind::WouldBlock`] for anything else.
+//! [`TrackSampleLoader`] has already loaded and report [`ErrorKind::WouldBlock`] for anything else.
 //! The controller passes that error up without losing its place, and the caller awaits
 //! [`PlaybackController::prefetch`] - which loads the run the current frame and the scheduling
 //! window need, plus a readahead - before trying again (issue #672):
@@ -19,8 +19,8 @@
 
 use crate::io::{ByteSource, IoFuture};
 use crate::{
-    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Mp4SampleLoader, Result,
-    SampleRange, Timeline, VideoFrame,
+    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Result, SampleRange, Timeline,
+    TrackSampleLoader, VideoFrame,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,7 +141,7 @@ pub trait PrefetchAudioSource: PlaybackAudioSource {
     fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()>;
 }
 
-/// Exact video frames decoded from compressed samples an [`Mp4SampleLoader`] loads on demand,
+/// Exact video frames decoded from compressed samples a [`TrackSampleLoader`] loads on demand,
 /// for a byte source whose reads suspend, such as a browser `fetch`.
 ///
 /// [`PlaybackVideoSource::get_exact`] never waits on the source: it reports
@@ -149,18 +149,18 @@ pub trait PrefetchAudioSource: PlaybackAudioSource {
 /// [`PrefetchVideoSource::prefetch`] loads it.
 pub struct OnDemandVideoSource<S> {
     reader: crate::ExactFrameReader,
-    loader: Mp4SampleLoader<S>,
+    loader: TrackSampleLoader<S>,
     readahead_samples: usize,
 }
 
 impl<S: ByteSource> OnDemandVideoSource<S> {
     /// `reader` must have been built with [`crate::ExactFrameReader::from_provider`] over
-    /// `loader`'s [`Mp4SampleLoader::sample_provider`]. A prefetch loads up to
+    /// `loader`'s [`TrackSampleLoader::sample_provider`]. A prefetch loads up to
     /// `readahead_samples` decode-order samples past the run the requested frame needs, as far
     /// as the loader's budget allows.
     pub fn new(
         reader: crate::ExactFrameReader,
-        loader: Mp4SampleLoader<S>,
+        loader: TrackSampleLoader<S>,
         readahead_samples: usize,
     ) -> Self {
         Self {
@@ -178,7 +178,7 @@ impl<S: ByteSource> OnDemandVideoSource<S> {
         &mut self.reader
     }
 
-    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+    pub fn loader(&self) -> &TrackSampleLoader<S> {
         &self.loader
     }
 }
@@ -208,7 +208,7 @@ impl<S: ByteSource> PrefetchVideoSource for OnDemandVideoSource<S> {
     }
 }
 
-/// Exact audio ranges decoded from compressed packets an [`Mp4SampleLoader`] loads on demand,
+/// Exact audio ranges decoded from compressed packets a [`TrackSampleLoader`] loads on demand,
 /// for a byte source whose reads suspend, such as a browser `fetch`.
 ///
 /// [`PlaybackAudioSource::read`] never waits on the source: it reports
@@ -216,18 +216,18 @@ impl<S: ByteSource> PrefetchVideoSource for OnDemandVideoSource<S> {
 /// [`PrefetchAudioSource::prefetch`] loads it.
 pub struct OnDemandAudioSource<D, S> {
     reader: crate::AudioSampleReader<D>,
-    loader: Mp4SampleLoader<S>,
+    loader: TrackSampleLoader<S>,
     readahead_packets: usize,
 }
 
 impl<D: crate::AudioDecoder, S: ByteSource> OnDemandAudioSource<D, S> {
     /// `reader` must have been built with [`crate::AudioSampleReader::from_provider`] over
-    /// `loader`'s [`Mp4SampleLoader::audio_packet_provider`]. A prefetch loads up to
+    /// `loader`'s [`TrackSampleLoader::audio_packet_provider`]. A prefetch loads up to
     /// `readahead_packets` packets past the run the requested range needs, as far as the
     /// loader's budget allows.
     pub fn new(
         reader: crate::AudioSampleReader<D>,
-        loader: Mp4SampleLoader<S>,
+        loader: TrackSampleLoader<S>,
         readahead_packets: usize,
     ) -> Self {
         Self {
@@ -245,7 +245,7 @@ impl<D: crate::AudioDecoder, S: ByteSource> OnDemandAudioSource<D, S> {
         &mut self.reader
     }
 
-    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+    pub fn loader(&self) -> &TrackSampleLoader<S> {
         &self.loader
     }
 }
@@ -331,8 +331,8 @@ impl IndexedPresentationTimeline {
         Ok(Self { frame_audio_ranges })
     }
 
-    pub fn from_mp4_track(
-        track: &crate::Mp4Track,
+    pub fn from_track(
+        track: &crate::Track,
         audio_sample_rate: u32,
         limits: &crate::Limits,
     ) -> Result<Self> {
@@ -1247,8 +1247,8 @@ mod tests {
         use crate::io::MemorySource;
         use crate::{
             AudioSampleReader, AudioTrackTiming, Codec, CodecProfile, ColorRange,
-            EncodedAudioSample, ExactFrameReader, HardwarePreference, Mp4Sample, Mp4Track,
-            PixelFormat, SampleDependency, TrackKind, VideoDecoderConfig,
+            EncodedAudioSample, ExactFrameReader, HardwarePreference, PixelFormat,
+            SampleDependency, Track, TrackKind, TrackSample, VideoDecoderConfig,
             uncompressed_video_decoder_factory,
         };
         use std::cell::Cell;
@@ -1328,8 +1328,8 @@ mod tests {
             }
         }
 
-        fn track(kind: TrackKind, codec: Codec, samples: Vec<Mp4Sample>) -> Mp4Track {
-            Mp4Track {
+        fn track(kind: TrackKind, codec: Codec, samples: Vec<TrackSample>) -> Track {
+            Track {
                 id: 1,
                 kind,
                 codec,
@@ -1346,8 +1346,8 @@ mod tests {
             }
         }
 
-        fn sample(offset: usize, size: u32, index: usize, is_sync: bool) -> Mp4Sample {
-            Mp4Sample {
+        fn sample(offset: usize, size: u32, index: usize, is_sync: bool) -> TrackSample {
+            TrackSample {
                 offset: offset as u64,
                 size,
                 dts: index as u64,
@@ -1360,7 +1360,7 @@ mod tests {
 
         /// A file interleaving 1x1 Gray8 video frames, each holding its own
         /// index, with the two audio packets that play under each.
-        fn media() -> (Vec<u8>, Mp4Track, Mp4Track) {
+        fn media() -> (Vec<u8>, Track, Track) {
             let mut bytes = Vec::new();
             let mut video = Vec::new();
             let mut audio = Vec::new();
@@ -1409,7 +1409,7 @@ mod tests {
             };
             // Budgets smaller than one group of pictures and one scheduling
             // window, so both are streamed through over several prefetches.
-            let video_loader = Mp4SampleLoader::new(video_track, source(), 4).unwrap();
+            let video_loader = TrackSampleLoader::new(video_track, source(), 4).unwrap();
             let video_reader = ExactFrameReader::from_provider(
                 &uncompressed_video_decoder_factory(),
                 VideoDecoderConfig {
@@ -1425,7 +1425,7 @@ mod tests {
                 Limits::default(),
             )
             .unwrap();
-            let audio_loader = Mp4SampleLoader::new(audio_track, source(), 8).unwrap();
+            let audio_loader = TrackSampleLoader::new(audio_track, source(), 8).unwrap();
             let decoded_ranges = (0..FRAMES as u64 * 2)
                 .map(|packet| {
                     SampleRange::new(

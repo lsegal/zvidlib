@@ -2,7 +2,7 @@
 //! [`crate::OnDemandPlayer`] and the browser's `OnDemandPlayback` (issue #689).
 //!
 //! Both read only the movie header up front and then the compressed samples
-//! playback reaches, through an [`Mp4SampleLoader`] per track bounded by a
+//! playback reaches, through an [`TrackSampleLoader`] per track bounded by a
 //! byte budget. What they share is how a track becomes a source the
 //! [`crate::PlaybackController`] plays: which of the crate's decoders a video
 //! track opens on and with what configuration, how an audio track's packets
@@ -18,12 +18,13 @@ use crate::codec::{
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, VideoDimensions};
-use crate::mp4_demux::{Mp4Demuxer, Mp4Track};
+use crate::mp4_demux::Mp4Demuxer;
 use crate::playback::{OnDemandVideoSource, PlaybackAudioSource, PrefetchAudioSource};
 use crate::timeline::{FrameIndex, SampleRange};
+use crate::track::Track;
 use crate::{
-    Error, ErrorKind, Limits, Mp4SampleLoader, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider,
-    Result, TrackKind,
+    Error, ErrorKind, Limits, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider, Result,
+    TrackKind, TrackSampleLoader,
 };
 
 /// The compressed video a playback may hold when the caller does not say:
@@ -50,18 +51,18 @@ pub(crate) const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 /// second covers the decoder's own start-up.
 pub(crate) const AAC_PREROLL_PACKETS: usize = 2;
 
-pub(crate) fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Mp4Track> {
+pub(crate) fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Track> {
     demuxer.tracks.iter().find(|track| track.kind == kind)
 }
 
 /// `video` decoded on the crate's own decoder from samples a fresh
-/// [`Mp4SampleLoader`] of `budget_bytes` loads on demand from `source`.
+/// [`TrackSampleLoader`] of `budget_bytes` loads on demand from `source`.
 ///
 /// Reads only an AV1 or VP9 track's first sample, whose color range the
 /// decoder is configured with when the track's configuration record does not
 /// say.
 pub(crate) async fn crate_video_source<S: ByteSource>(
-    video: &Mp4Track,
+    video: &Track,
     source: S,
     budget_bytes: u64,
     hardware: HardwarePreference,
@@ -73,7 +74,7 @@ pub(crate) async fn crate_video_source<S: ByteSource>(
     let derived = derive_codec_string(video.codec, &video.decoder_config)?;
     // Before any read, so a budget that cannot hold the largest sample is
     // refused without one.
-    let loader = Mp4SampleLoader::new(video.clone(), source, budget_bytes)?;
+    let loader = TrackSampleLoader::new(video.clone(), source, budget_bytes)?;
     let mut leading = Vec::new();
     if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
         let first = video.samples.first().ok_or_else(|| {
@@ -115,7 +116,7 @@ pub(crate) async fn crate_video_source<S: ByteSource>(
 /// Reads no packet but an Opus track's last, whose first bytes give its
 /// length.
 pub(crate) async fn audio_packets<S: ByteSource>(
-    loader: &Mp4SampleLoader<S>,
+    loader: &TrackSampleLoader<S>,
 ) -> Result<(PrefetchedAudioPacketProvider, usize)> {
     match loader.track().codec {
         Codec::Opus => {
@@ -214,7 +215,7 @@ fn decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>> {
 /// decoder is opened with: the browser avoids a platform backend, which it
 /// has none of, while native playback prefers one where the codec has it.
 pub(crate) fn crate_video_decoder(
-    track: &Mp4Track,
+    track: &Track,
     profile: CodecProfile,
     dimensions: VideoDimensions,
     samples: &[EncodedVideoSample],
@@ -252,11 +253,7 @@ pub(crate) fn crate_video_decoder(
 /// `configOBUs` when it carries one, which it need not, and otherwise from the
 /// first sample, a key frame that must. Limited when neither parses, which
 /// leaves the reader to reject the first frame that disagrees.
-fn av1_color_range(
-    track: &Mp4Track,
-    samples: &[EncodedVideoSample],
-    limits: &Limits,
-) -> ColorRange {
+fn av1_color_range(track: &Track, samples: &[EncodedVideoSample], limits: &Limits) -> ColorRange {
     let from_config = Av1CodecConfigurationRecord::parse(&track.decoder_config, limits)
         .ok()
         .and_then(|record| {
@@ -280,7 +277,7 @@ fn av1_color_range(
 /// its pictures are decoded in. The `vpcC` box's `videoFullRangeFlag` stands
 /// in when the first sample does not parse, and limited range when neither
 /// says, which leaves the reader to reject the first frame that disagrees.
-fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRange {
+fn vp9_color_range(track: &Track, samples: &[EncodedVideoSample]) -> ColorRange {
     let full = samples
         .first()
         .and_then(|sample| zvidlib_vp9_syntax::chunk_full_range(&sample.data))

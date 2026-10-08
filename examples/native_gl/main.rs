@@ -189,7 +189,7 @@ fn run() -> Result<()> {
         / u128::from(video.duration.max(1)))
     .max(1)
     .min(u128::from(frame_count)) as u64;
-    let timeline = IndexedPresentationTimeline::from_mp4_track(video, sample_rate, &limits)?;
+    let timeline = IndexedPresentationTimeline::from_track(video, sample_rate, &limits)?;
     let playback = PlaybackController::new_with_indexed_timeline(
         video_reader,
         audio_reader,

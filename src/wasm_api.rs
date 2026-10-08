@@ -1137,7 +1137,7 @@ impl WasmVideoStream {
 async fn parse_audio_track(
     bytes: Option<Rc<Vec<u8>>>,
     index: u32,
-) -> Result<crate::Mp4Track, JsValue> {
+) -> Result<crate::Track, JsValue> {
     let bytes = bytes.ok_or_else(|| {
         js_error(
             ErrorKind::Unsupported,

@@ -38,7 +38,7 @@
 use crate::codec::HardwarePreference;
 use crate::io::{ByteSource, FileSource, IoFuture};
 use crate::media::{VideoDimensions, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions};
 use crate::on_demand::{
     AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
     SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, audio_packets, crate_video_source, first_track,
@@ -49,9 +49,10 @@ use crate::playback::{
     PlaybackOptions, PrefetchAudioSource, Presentation,
 };
 use crate::timeline::{FrameIndex, SampleRange};
+use crate::track::Track;
 use crate::{
     AudioBuffer, AudioDecoder, AudioSampleReader, CancellationToken, Error, ErrorKind, Limits,
-    Mp4SampleLoader, Result, TrackKind,
+    Result, TrackKind, TrackSampleLoader,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -202,8 +203,8 @@ pub struct OnDemandPlayer<S = FileSource> {
 /// What the player opened, from which it builds the audio of any track.
 struct Input<S> {
     source: S,
-    video: Mp4Track,
-    audio_tracks: Vec<Mp4Track>,
+    video: Track,
+    audio_tracks: Vec<Track>,
     movie_timescale: u32,
     options: OnDemandOptions,
     limits: Limits,
@@ -226,7 +227,7 @@ impl<S: ByteSource + Clone> Input<S> {
         open_output: &mut AudioOutputOpener,
     ) -> Result<PlayerAudioParts<S>> {
         let Some(index) = index else {
-            let timeline = IndexedPresentationTimeline::from_mp4_track(
+            let timeline = IndexedPresentationTimeline::from_track(
                 &self.video,
                 VIDEO_ONLY_CLOCK_RATE,
                 &self.limits,
@@ -251,7 +252,7 @@ impl<S: ByteSource + Clone> Input<S> {
         let sample_rate = track.audio_sample_rate()?;
         let timing = track.audio_timing(self.movie_timescale)?;
         let loader =
-            Mp4SampleLoader::new(track, self.source.clone(), self.options.audio_budget_bytes)?;
+            TrackSampleLoader::new(track, self.source.clone(), self.options.audio_budget_bytes)?;
         let (packets, preroll) = block_on(audio_packets(&loader))?;
         let reader = AudioSampleReader::from_provider(
             decoder,
@@ -268,7 +269,7 @@ impl<S: ByteSource + Clone> Input<S> {
             AUDIO_READAHEAD_PACKETS,
         )));
         let timeline =
-            IndexedPresentationTimeline::from_mp4_track(&self.video, sample_rate, &self.limits)?;
+            IndexedPresentationTimeline::from_track(&self.video, sample_rate, &self.limits)?;
         let output = open_output(sample_rate, channels)?;
         Ok((audio, output, timeline))
     }
@@ -316,7 +317,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
         let video = first_track(&demuxer, TrackKind::Video)
             .ok_or_else(|| Error::new(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
-        let audio_tracks: Vec<Mp4Track> = demuxer
+        let audio_tracks: Vec<Track> = demuxer
             .tracks
             .iter()
             .filter(|track| track.kind == TrackKind::Audio)
@@ -427,8 +428,8 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
 
     /// The input's audio tracks, in the order [`Self::select_audio_track`]
     /// and [`OnDemandOptions::audio_track`] number them. Each one's
-    /// [`Mp4Track::language`] is its ISO 639-2 code.
-    pub fn audio_tracks(&self) -> &[Mp4Track] {
+    /// [`Track::language`] is its ISO 639-2 code.
+    pub fn audio_tracks(&self) -> &[Track] {
         &self.input.audio_tracks
     }
 
@@ -457,7 +458,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
         Ok(())
     }
 
-    /// Plays the first audio track whose [`Mp4Track::language`] is
+    /// Plays the first audio track whose [`Track::language`] is
     /// `language`, an ISO 639-2 code such as `"eng"`, as
     /// [`Self::select_audio_track`] does. Fails with
     /// [`ErrorKind::InvalidInput`] if no track has that language.
@@ -509,7 +510,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
 }
 
 /// The crate's decoder for an audio track, and the channels it decodes to.
-fn audio_decoder(track: &Mp4Track, limits: Limits) -> Result<(Box<dyn AudioDecoder>, u16)> {
+fn audio_decoder(track: &Track, limits: Limits) -> Result<(Box<dyn AudioDecoder>, u16)> {
     match track.codec {
         #[cfg(feature = "aac-decoder")]
         crate::Codec::Aac => {

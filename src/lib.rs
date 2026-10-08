@@ -19,7 +19,7 @@ pub use zvidlib_av1::{
 pub use zvidlib_av1_syntax as av1;
 #[doc(inline)]
 pub use zvidlib_container::{
-    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, webm, webm_demux,
+    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, track, webm, webm_demux,
 };
 #[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
@@ -212,10 +212,7 @@ pub use media::{
 #[doc(no_inline)]
 pub use mp4::{CoverArt, CoverArtFormat};
 #[doc(no_inline)]
-pub use mp4_demux::{
-    AacTrackConfig, EditMapping, Mp4AudioPacketProvider, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample,
-    Mp4SampleProvider, Mp4Track, probe_mp4,
-};
+pub use mp4_demux::{AacTrackConfig, Mp4Demuxer, Mp4DemuxerOptions, probe_mp4};
 #[cfg(feature = "opus-decoder")]
 #[doc(no_inline)]
 pub use opus::NativeOpusDecoder;
@@ -236,11 +233,13 @@ pub use playback::{
     PrefetchVideoSource, Presentation, WebAudioOutput,
 };
 #[doc(no_inline)]
-pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
+pub use prefetch::{PrefetchedAudioPacketProvider, PrefetchedSampleProvider, TrackSampleLoader};
 #[doc(no_inline)]
 pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
 #[doc(no_inline)]
 pub use timeline::{FrameIndex, FrameRate, Rational, SampleRange, Timeline};
+#[doc(no_inline)]
+pub use track::{EditMapping, Track, TrackAudioPacketProvider, TrackSample, TrackSampleProvider};
 #[doc(no_inline)]
 pub use transfer::{
     ColorConversion, ContextIdentity, CpuFrameDestination, CpuFrameSource, CpuPlaneDestination,

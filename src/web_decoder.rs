@@ -22,9 +22,9 @@ use crate::codec::{
 use crate::codec_config::{DerivedCodecString, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, VideoDimensions, VideoFrame};
-use crate::mp4_demux::Mp4Track;
 use crate::on_demand::crate_video_decoder;
 use crate::timeline::FrameIndex;
+use crate::track::Track;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -94,7 +94,7 @@ pub(crate) fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
 }
 
 /// Indexes a video track of an MP4 or WebM input, whichever its signature says it is.
-async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Mp4Track> {
+async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Track> {
     crate::container::open_tracks(source, limits)
         .await?
         .into_iter()
@@ -289,7 +289,7 @@ impl WebVideoDecodeSession {
 /// The `WebCodecs` decoder configuration for `track`, whose codec string is
 /// `derived`. Fails for a codec `WebCodecs` has no registration for here.
 pub(crate) fn webcodecs_config(
-    track: &Mp4Track,
+    track: &Track,
     derived: &DerivedCodecString,
     dimensions: VideoDimensions,
 ) -> Result<JsVideoDecoderConfig> {
@@ -323,7 +323,7 @@ struct SoftwareDecoder {
 impl SoftwareDecoder {
     /// `profile` is as [`crate_video_decoder`] takes it.
     fn open(
-        track: &Mp4Track,
+        track: &Track,
         profile: CodecProfile,
         dimensions: VideoDimensions,
         samples: Vec<EncodedVideoSample>,

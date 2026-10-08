@@ -1,4 +1,4 @@
-//! `ExactFrameReader` built from an on-demand [`Mp4SampleProvider`] decodes
+//! `ExactFrameReader` built from an on-demand [`TrackSampleProvider`] decodes
 //! the same frames, through the real native HEVC decoder, that it does from
 //! an eagerly read `Vec<EncodedVideoSample>` (issue #669).
 
@@ -10,8 +10,8 @@ use std::task::{Context, Poll, Waker};
 use zvidlib::io::{CachingByteSource, MemorySource};
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, ExactFrameReader, FrameIndex,
-    HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4SampleProvider, Mp4Track,
-    PixelFormat, TrackKind, VideoDecoderConfig, native_hevc_video_decoder_factory,
+    HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, PixelFormat, Track, TrackKind,
+    TrackSampleProvider, VideoDecoderConfig, native_hevc_video_decoder_factory,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -24,7 +24,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
+fn bundled_track_and_bytes() -> (Track, Vec<u8>) {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/media/BigBuckBunny.mp4"
@@ -40,7 +40,7 @@ fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
     (track, bytes)
 }
 
-fn configuration(track: &Mp4Track) -> VideoDecoderConfig {
+fn configuration(track: &Track) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: track.codec,
         profile: CodecProfile::HevcMain,
@@ -86,7 +86,7 @@ fn on_demand_reader_matches_the_eager_reader_and_stays_within_its_cache_budget()
     assert!(budget > 0, "the bundled sample is too small for this test");
     let source = MemorySource::new(bytes);
     let cache = CachingByteSource::new(source, 64 * 1024, budget).unwrap();
-    let provider = Mp4SampleProvider::new(track, cache).unwrap();
+    let provider = TrackSampleProvider::new(track, cache).unwrap();
     let mut on_demand_reader = ExactFrameReader::from_provider(
         &factory,
         configuration_template,
