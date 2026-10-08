@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zvidlib: frame-exact video for Rust and the browser</title>
+  <meta name="description" content="zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8, VP9, AAC, Opus and Vorbis, natively and in WebAssembly, with frame-exact indexed get and put and synchronized audio." />
+  <meta property="og:title" content="zvidlib" />
+  <meta property="og:description" content="Frame-exact video and synchronized audio for Rust and the browser." />
+  <meta name="theme-color" content="#0b0d17" />
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#top" aria-label="zvidlib home"><img src="assets/logo.svg" alt="" width="28" height="28" /><span>zvidlib</span></a>
+    <nav aria-label="Primary">
+      <a href="#demo">Demo</a>
+      <a href="#support">Support</a>
+      <a href="#start">Quick start</a>
+      <a href="#showcase">Showcase</a>
+      <a href="zvidlib/">API docs</a>
+      <a class="nav-gh" href="https://github.com/lsegal/zvidlib">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Rust · WebAssembly · No FFmpeg</p>
+        <h1>Frame-exact video,<br /><span class="grad">native and in the browser.</span></h1>
+        <p class="lede">
+          zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8 and VP9 video and AAC, Opus and
+          Vorbis audio, from one API on desktop and the web. Ask for frame <code>n</code> and get
+          exactly frame <code>n</code>. Write frame <code>n</code> and the audio stays in sync.
+        </p>
+        <div class="cta">
+          <a class="button primary" href="#demo">Try the live demo</a>
+          <a class="button" href="#start">Get started</a>
+          <a class="button ghost" href="zvidlib/">API docs</a>
+        </div>
+        <ul class="hero-meta">
+          <li><a href="https://crates.io/crates/zvidlib">crates.io</a></li>
+          <li><a href="https://github.com/lsegal/zvidlib/releases/latest">Browser package</a></li>
+          <li><a href="https://github.com/lsegal/zvidlib/blob/main/LICENSE">MIT license</a></li>
+        </ul>
+      </div>
+      <div class="hero-code" aria-label="Example code">
+        <div class="window-bar"><span></span><span></span><span></span><em>scrub.js</em></div>
+<pre><code class="lang-js">import init, { MediaInput } from "zvidlib";
+await init();
+
+const input = await MediaInput.open(blob);
+const video = input.video(0);
+
+// Exactly frame 4812, not the keyframe before it.
+const frame = await video.get(4812n);
+draw(frame.pixels, frame.width, frame.height);</code></pre>
+      </div>
+    </section>
+
+    <section class="features" aria-label="Features">
+      <article>
+        <h3>Indexed <code>get</code> and <code>put</code></h3>
+        <p>Every read returns the exact frame in presentation order, even in streams full of B-frames and long groups of pictures. Decoded frames and decoder state carry over between calls, so sequential reads stay fast.</p>
+      </article>
+      <article>
+        <h3>Instant scrubbing</h3>
+        <p>A built-in seek-preview tier answers any position in constant time while the exact frame decodes behind it. That's what makes a timeline drag feel immediate.</p>
+      </article>
+      <article>
+        <h3>Synchronized audio</h3>
+        <p>An audio read returns exactly the samples a video frame covers. Priming, padding and edit lists are handled, so gapless round trips come back sample for sample.</p>
+      </article>
+      <article>
+        <h3>One API, two targets</h3>
+        <p>The same model works in Rust on Windows, macOS and Linux, and in JavaScript through WebAssembly, with BigInt frame indices, <code>Blob</code> and stream I/O, and stable error codes.</p>
+      </article>
+      <article>
+        <h3>Hardware first, Rust always</h3>
+        <p>NVDEC, Media Foundation (NVENC, Quick Sync, AMF), VideoToolbox and WebCodecs when the host has them, and pure-Rust codecs checked against libvpx and libdav1d when it doesn't.</p>
+      </article>
+      <article>
+        <h3>No FFmpeg</h3>
+        <p>No C toolchain, no system packages, no GPL. Every codec and direction is a Cargo feature, so an app builds only what it uses.</p>
+      </article>
+    </section>
+
+    <section id="demo" class="demo">
+      <div class="section-head">
+        <h2>Live demo</h2>
+        <p>Everything below runs on zvidlib's WebAssembly build in this tab. Nothing is uploaded.</p>
+      </div>
+
+      <div class="tabs" role="tablist" aria-label="Demo">
+        <button role="tab" id="tab-scrub" aria-controls="panel-scrub" aria-selected="true">Frame-exact scrubbing</button>
+        <button role="tab" id="tab-record" aria-controls="panel-record" aria-selected="false" tabindex="-1">Record a canvas</button>
+      </div>
+
+      <div class="panel" id="panel-scrub" role="tabpanel" aria-labelledby="tab-scrub">
+        <div class="stage">
+          <canvas id="scrub-canvas" width="960" height="540" aria-label="Decoded video frame"></canvas>
+          <div class="hud">
+            <span id="scrub-badge" class="badge">Loading…</span>
+            <span id="scrub-frame" class="mono"></span>
+          </div>
+        </div>
+        <div class="controls">
+          <button id="scrub-prev" type="button" title="Previous frame" aria-label="Previous frame" disabled>◀︎</button>
+          <button id="scrub-play" type="button" class="primary" disabled>Play</button>
+          <button id="scrub-next" type="button" title="Next frame" aria-label="Next frame" disabled>▶︎</button>
+          <input id="scrub-timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Timeline" disabled />
+          <button id="scrub-random" type="button" disabled>Random frame</button>
+        </div>
+        <div class="demo-notes">
+          <p id="scrub-status" class="mono small">Waiting to load…</p>
+          <div class="meter" aria-hidden="true"><div id="scrub-previews-bar"></div></div>
+          <p class="small muted">
+            Drag the timeline: the nearest seek preview draws at once, then the exact frame replaces it.
+            The clip is a single 768-frame group of pictures, so every exact frame depends on every frame before it.
+            Sample: <a href="https://peach.blender.org/">Big Buck Bunny</a> © Blender Foundation, CC BY 3.0.
+          </p>
+        </div>
+      </div>
+
+      <div class="panel" id="panel-record" role="tabpanel" aria-labelledby="tab-record" hidden>
+        <div class="record-grid">
+          <div>
+            <div class="stage">
+              <canvas id="record-canvas" width="640" height="360" aria-label="Animation to record"></canvas>
+              <div class="hud"><span class="badge live">Canvas</span></div>
+            </div>
+            <div class="controls wrap">
+              <label>Container
+                <select id="record-container">
+                  <option value="mp4">MP4</option>
+                  <option value="webm">WebM</option>
+                </select>
+              </label>
+              <label>Video
+                <select id="record-codec"></select>
+              </label>
+              <label class="check"><input id="record-audio" type="checkbox" checked /> Audio</label>
+              <button id="record-start" type="button" class="primary" disabled>Encode 3 seconds</button>
+            </div>
+            <div class="meter" aria-hidden="true"><div id="record-bar"></div></div>
+            <p id="record-status" class="mono small">Waiting to load…</p>
+          </div>
+          <div>
+            <div class="stage result">
+              <video id="record-video" controls loop playsinline muted aria-label="Encoded result"></video>
+              <div class="hud"><span class="badge">File</span></div>
+            </div>
+            <div class="readback">
+              <canvas id="readback-canvas" width="320" height="180" aria-label="Frame read back from the file"></canvas>
+              <p class="small" id="readback-text">After encoding, zvidlib reopens the file it just wrote and reads frame 45 back. The counter painted into the frame should say 045.</p>
+            </div>
+            <a id="record-download" class="button" hidden>Download</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="support" class="support">
+      <div class="section-head">
+        <h2>Codecs and containers</h2>
+        <p>Hardware where the host has it, pure Rust everywhere, WebCodecs in the browser.</p>
+      </div>
+
+      <h3>Video</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Codec</th><th>Decode</th><th>Encode</th><th>Browser</th></tr></thead>
+          <tbody>
+            <tr>
+              <th>HEVC / H.265</th>
+              <td><span class="chip rust">Rust</span> Main, Main 10<br /><span class="chip hw">HW</span> NVDEC · Media Foundation · VideoToolbox</td>
+              <td><span class="chip rust">Rust</span> Main, intra-only (lossless, QP or bitrate)<br /><span class="chip hw">HW</span> NVENC · Quick Sync · AMF · VideoToolbox</td>
+              <td>WebCodecs decode with Rust fallback · WebCodecs encode</td>
+            </tr>
+            <tr>
+              <th>AV1</th>
+              <td><span class="chip rust">Rust</span> Main, 8-bit 4:2:0 and monochrome</td>
+              <td><span class="chip rust">Rust</span> Main, 8-bit monochrome</td>
+              <td>WebCodecs decode with Rust fallback · WebCodecs encode (color)</td>
+            </tr>
+            <tr>
+              <th>VP8</th>
+              <td><span class="chip rust">Rust</span> every bitstream version<br /><span class="chip hw">HW</span> NVDEC · Media Foundation</td>
+              <td><span class="chip rust">Rust</span> key and inter frames</td>
+              <td>WebCodecs decode with Rust fallback · WebCodecs encode</td>
+            </tr>
+            <tr>
+              <th>VP9</th>
+              <td><span class="chip rust">Rust</span> profile 0<br /><span class="chip hw">HW</span> NVDEC · Media Foundation · VideoToolbox</td>
+              <td><span class="chip rust">Rust</span> profile 0, key and inter frames<br /><span class="chip hw">HW</span> Media Foundation · VideoToolbox</td>
+              <td>WebCodecs decode with Rust fallback · WebCodecs encode</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Audio</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Codec</th><th>Native decode</th><th>Native encode</th><th>Browser</th></tr></thead>
+          <tbody>
+            <tr>
+              <th>AAC-LC</th>
+              <td><span class="chip os">OS</span> Media Foundation · AudioToolbox<br /><span class="chip rust">Rust</span> Symphonia elsewhere</td>
+              <td><span class="chip os">OS</span> Media Foundation · AudioToolbox</td>
+              <td>WebCodecs decode and encode</td>
+            </tr>
+            <tr>
+              <th>Opus</th>
+              <td><span class="chip rust">Rust</span> opus-pure (libopus port)</td>
+              <td><span class="chip rust">Rust</span> opus-pure</td>
+              <td>WebCodecs with Rust fallback, both directions</td>
+            </tr>
+            <tr>
+              <th>Vorbis</th>
+              <td><span class="chip rust">Rust</span> up to 8 channels</td>
+              <td><span class="chip rust">Rust</span> libvorbis 1.3.7 port, bit-identical</td>
+              <td>WebCodecs decode with Rust fallback · Rust encode</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Containers</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Container</th><th>Read</th><th>Write</th><th>Carries</th></tr></thead>
+          <tbody>
+            <tr>
+              <th>MP4</th>
+              <td>Ordinary and fragmented, edit lists, cover art</td>
+              <td>Seekable, gapless audio trims, generated cover art</td>
+              <td>HEVC · AV1 · VP9 · AAC · Opus</td>
+            </tr>
+            <tr>
+              <th>WebM</th>
+              <td>Seekable files and live <code>MediaRecorder</code> captures</td>
+              <td>Seekable, with <code>Cues</code></td>
+              <td>AV1 · VP8 · VP9 · Opus · Vorbis</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">Backend order per platform, Cargo features and the full browser API are in the <a href="https://github.com/lsegal/zvidlib#support">README</a> and the <a href="zvidlib/">API docs</a>.</p>
+    </section>
+
+    <section id="start" class="start">
+      <div class="section-head">
+        <h2>Quick start</h2>
+        <p>One crate for Rust, one package for the browser.</p>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Language">
+        <button role="tab" id="tab-rust" aria-controls="panel-rust" aria-selected="true">Rust</button>
+        <button role="tab" id="tab-js" aria-controls="panel-js" aria-selected="false" tabindex="-1">JavaScript</button>
+      </div>
+      <div class="panel code-panel" id="panel-rust" role="tabpanel" aria-labelledby="tab-rust">
+<pre class="install"><code>cargo add zvidlib</code></pre>
+<pre><code class="lang-rust">let source = MemorySource::new(std::fs::read("clip.mp4")?);
+let movie = block_on(Mp4Demuxer::open(&amp;source, Mp4DemuxerOptions::default()))?;
+let track = movie.tracks.iter().find(|t| t.kind == TrackKind::Video).unwrap();
+let samples = block_on(track.to_encoded_video_samples(&amp;source, &amp;limits))?;
+
+let mut reader = ExactFrameReader::new(&amp;native_av1_video_decoder_factory(), config, samples, limits)?;
+// Exactly presentation frame 400, never the nearest keyframe.
+let frame = reader.get(FrameIndex(400), &amp;CancellationToken::new())?;</code></pre>
+        <p class="small muted">Trim the build with Cargo features, for example <code>default-features = false, features = ["vp9-decoder"]</code>. The <a href="https://github.com/lsegal/zvidlib#quick-start">README</a> has complete read and write programs.</p>
+      </div>
+      <div class="panel code-panel" id="panel-js" role="tabpanel" aria-labelledby="tab-js" hidden>
+<pre class="install"><code>npm install ./zvidlib-web-vX.Y.Z.tgz  # from the latest GitHub release</code></pre>
+<pre><code class="lang-js">import init, { CreateOptions, MediaOutput, VideoFrame } from "zvidlib";
+await init();
+
+const options = new CreateOptions("webm");
+options.videoCodec = "vp9";
+options.setTimeline(30, 1, 48_000);
+const output = await MediaOutput.create(options);
+
+for (let n = 0n; n &lt; 90n; n++) {
+  draw(ctx, n);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  await output.video(0).put(n, VideoFrame.rgba(width, height, data));
+}
+const webm = await output.finish(); // Blob { type: "video/webm" }</code></pre>
+        <p class="small muted">The browser package is attached to every <a href="https://github.com/lsegal/zvidlib/releases/latest">GitHub release</a>.</p>
+      </div>
+    </section>
+
+    <section id="showcase" class="showcase">
+      <div class="section-head">
+        <h2>Built with zvidlib</h2>
+      </div>
+      <article class="showcase-card">
+        <div class="showcase-mark" aria-hidden="true">z</div>
+        <div>
+          <h3><a href="https://zvid.lsegal.workers.dev">zvid</a></h3>
+          <p>
+            A collaborative, canvas-based video editor for the browser and desktop. The editor draws
+            each frame onto a canvas, and zvidlib encodes HEVC or AV1 with AAC audio and writes the
+            MP4, in the browser and in the native app. Its DAW capture plugin, ZVID Capture, records
+            cameras from inside Ableton Live through zvidlib's encoders and muxer.
+          </p>
+          <div class="cta">
+            <a class="button primary" href="https://zvid.lsegal.workers.dev">Open zvid</a>
+            <a class="button" href="https://github.com/lsegal/zvid">Source</a>
+          </div>
+        </div>
+      </article>
+      <p class="small muted">Building something with zvidlib? <a href="https://github.com/lsegal/zvidlib/edit/main/README.md">Add it to the README.</a></p>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>
+      <a class="brand" href="#top"><img src="assets/logo.svg" alt="" width="22" height="22" /><span>zvidlib</span></a>
+      <p class="small muted">MIT licensed. Third-party notices are in <a href="https://github.com/lsegal/zvidlib/blob/main/THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a>.</p>
+    </div>
+    <nav aria-label="Footer">
+      <a href="zvidlib/">API docs</a>
+      <a href="https://docs.rs/zvidlib">docs.rs</a>
+      <a href="https://crates.io/crates/zvidlib">crates.io</a>
+      <a href="https://github.com/lsegal/zvidlib">GitHub</a>
+      <a href="https://github.com/lsegal/zvidlib/blob/main/CHANGELOG.md">Changelog</a>
+    </nav>
+  </footer>
+
+  <script type="module" src="assets/site.js"></script>
+  <script type="module" src="assets/demo.js"></script>
+</body>
+</html>

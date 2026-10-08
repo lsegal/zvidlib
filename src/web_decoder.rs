@@ -45,6 +45,19 @@ use zvidlib_core::codec_config::box_payload;
 /// run so far ahead that the awaited frame is evicted from the frame cache.
 const MAX_IN_FLIGHT_CHUNKS: u32 = 16;
 
+/// How many decoded `VideoFrame`s the frame cache keeps open at once, whatever
+/// `Limits::max_cached_frames` allows.
+///
+/// Every open `VideoFrame` holds one of the decoder's output buffers, and a
+/// decoder whose buffer pool is spent stops emitting frames until one is
+/// closed. Chrome's stalls with as few as ten frames held (its hardware HEVC
+/// decoder on Windows) or fourteen (its software AV1 decoder), so a cache of 32
+/// open frames left `get()` waiting forever for a frame the decoder could not
+/// produce, a dozen frames into any track. Frames the decoder emits ahead of the
+/// one asked for are still kept up to this bound, which is what lets sequential
+/// reads continue the decode session instead of resetting it.
+const MAX_OPEN_FRAMES: usize = 4;
+
 /// Resolves `resolve` on the next event-loop turn.
 ///
 /// Reached through `globalThis` so it works in both window and worker scopes
@@ -631,7 +644,7 @@ impl WebCodecsDecoder {
                 self.next_decode_position = None;
                 return Err(Error::new(ErrorKind::Codec, message));
             }
-            self.drain_pending_frames();
+            self.drain_pending_frames(presentation_index);
             if self.cache.contains_key(&presentation_index) {
                 let frame = &self.cache[&presentation_index];
                 return self.copy_frame_rgba(frame).await;
@@ -690,13 +703,14 @@ impl WebCodecsDecoder {
     }
 
     /// Moves every frame the decoder has produced so far out of
-    /// `pending_frames` and into the bounded frame cache.
-    fn drain_pending_frames(&mut self) {
+    /// `pending_frames` and into the bounded frame cache, never evicting
+    /// `wanted`, the frame the caller is waiting for.
+    fn drain_pending_frames(&mut self, wanted: FrameIndex) {
         let frames = std::mem::take(&mut *self.pending_frames.borrow_mut());
         for frame in frames {
             let index = FrameIndex(frame.timestamp() as u64);
             self.published_since_reset.insert(index);
-            self.insert_cache(index, frame);
+            self.insert_cache(index, frame, wanted);
         }
     }
 
@@ -749,7 +763,7 @@ impl WebCodecsDecoder {
         let _ = JsFuture::from(promise).await;
     }
 
-    fn insert_cache(&mut self, index: FrameIndex, frame: JsVideoFrame) {
+    fn insert_cache(&mut self, index: FrameIndex, frame: JsVideoFrame, wanted: FrameIndex) {
         // Every `VideoFrame` owns a real platform decode buffer, so replaced
         // and evicted frames must be closed explicitly and deterministically;
         // letting one reach the garbage collector starves the decoder's buffer
@@ -759,11 +773,18 @@ impl WebCodecsDecoder {
             Some(replaced) => replaced.close(),
             None => self.cache_order.push_back(index),
         }
-        while self.cache.len() > self.limits.max_cached_frames as usize {
-            let Some(oldest) = self.cache_order.pop_front() else {
+        // The decoder emits a batch of frames between two turns of `get()`'s
+        // loop, so the frame being waited for can be the oldest of a batch
+        // larger than the cache; it is the one frame that must stay.
+        let capacity = (self.limits.max_cached_frames as usize).clamp(1, MAX_OPEN_FRAMES);
+        while self.cache.len() > capacity {
+            let Some(position) = self.cache_order.iter().position(|&cached| cached != wanted)
+            else {
                 break;
             };
-            if let Some(frame) = self.cache.remove(&oldest) {
+            if let Some(oldest) = self.cache_order.remove(position)
+                && let Some(frame) = self.cache.remove(&oldest)
+            {
                 frame.close();
             }
         }
@@ -1402,6 +1423,45 @@ mod tests {
                 .unwrap();
             assert_eq!(rgba.len(), 960 * 540 * 4);
             assert_eq!(digest(dimensions, rgba), expected, "frame {frame}");
+        }
+    }
+
+    /// Sequential reads through `WebCodecs` keep going past the first dozen
+    /// frames. The frame cache used to hold up to `Limits::max_cached_frames`
+    /// decoded `VideoFrame`s open, and Chrome's decoder stops emitting frames
+    /// once that many of its output buffers are held, so `get()` waited
+    /// forever for frame 14 of this track. Each read is cancelled after ten
+    /// seconds so a regression fails the test instead of hanging the suite.
+    #[wasm_bindgen_test(async)]
+    async fn sequential_webcodecs_reads_do_not_exhaust_the_decoder() {
+        const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let mut session = WebVideoDecodeSession::open(COLOR_AV1, 0, &Limits::default())
+            .await
+            .unwrap();
+        if session.is_software() {
+            return;
+        }
+        for frame in 0..48 {
+            let cancellation = CancellationToken::new();
+            let timeout = cancellation.clone();
+            let cancel = Closure::once_into_js(move || timeout.cancel());
+            let set_timeout: js_sys::Function =
+                js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+                    .unwrap()
+                    .unchecked_into();
+            let timer = set_timeout
+                .call2(&JsValue::NULL, &cancel, &JsValue::from_f64(10_000.0))
+                .unwrap();
+            let result = session.get(FrameIndex(frame), &cancellation).await;
+            let clear_timeout: js_sys::Function =
+                js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("clearTimeout"))
+                    .unwrap()
+                    .unchecked_into();
+            clear_timeout.call1(&JsValue::NULL, &timer).unwrap();
+            let (dimensions, rgba) =
+                result.unwrap_or_else(|error| panic!("frame {frame}: {error:?}"));
+            assert_eq!((dimensions.width, dimensions.height), (960, 540));
+            assert_eq!(rgba.len(), 960 * 540 * 4);
         }
     }
 

@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build rustdoc
+    name: Build site and rustdoc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,11 +42,42 @@ jobs:
         run: cargo doc --workspace --no-deps --features native
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Add redirect index
-        run: echo '<meta http-equiv="refresh" content="0; url=zvidlib/index.html">' > target/doc/index.html
+      # The landing page's live demo runs on the browser package, so the site
+      # is built from the same commit as the API documentation (#651). The
+      # published musl binary, pinned as in the CI and release workflows.
+      - name: Install wasm-pack
+        env:
+          WASM_PACK_VERSION: '0.15.0'
+        run: |
+          target="wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl"
+          mkdir -p "$RUNNER_TEMP/wasm-pack"
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/${target}.tar.gz"             | tar -xz --strip-components=1 -C "$RUNNER_TEMP/wasm-pack" "${target}/wasm-pack"
+          "$RUNNER_TEMP/wasm-pack/wasm-pack" --version
+          echo "$RUNNER_TEMP/wasm-pack" >> "$GITHUB_PATH"
+      - name: Build browser package for the site
+        run: wasm-pack build --target web --out-dir site/pkg --features web
+      # One Pages artifact: the landing site at the root, and rustdoc's output
+      # beside it, so existing links to `/zvidlib/...` keep working. `/api/`
+      # is a shorter name for the same documentation. Rustdoc writes no root
+      # `index.html` and none of the site's `assets/`, `media/` or `pkg/`, so
+      # neither tree overwrites the other.
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -R target/doc/. _site/
+          cp -R site/. _site/
+          rm -f _site/.gitignore _site/pkg/.gitignore _site/pkg/README.md
+          mkdir -p _site/media _site/api
+          cp examples/media/BigBuckBunny.av1.mp4 _site/media/
+          echo '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=../zvidlib/index.html"><link rel="canonical" href="../zvidlib/index.html"><a href="../zvidlib/index.html">zvidlib API documentation</a>' > _site/api/index.html
+          for required in index.html zvidlib/index.html pkg/zvidlib.js pkg/zvidlib_bg.wasm media/BigBuckBunny.av1.mp4; do
+            test -f "_site/$required" || { echo "::error::_site/$required is missing"; exit 1; }
+          done
+          du -sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: target/doc
+          path: _site
 
   deploy:
     name: Deploy to GitHub Pages
