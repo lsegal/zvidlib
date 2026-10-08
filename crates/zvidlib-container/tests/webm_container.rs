@@ -19,7 +19,7 @@ use zvidlib_core::io::{MemorySink, MemorySource};
 use zvidlib_core::{
     CancellationToken, Codec, CodecProfile, ColorRange, Container, EncodedSample, EncoderConfig,
     ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, Limits, PixelFormat,
-    SampleDependency, TrackKind, VideoDecoderConfig, VideoDimensions,
+    SampleDependency, TrackKind, VideoDecoderConfig, VideoDimensions, Vp9CodecConfig,
 };
 
 const AV1_MP4: &[u8] = include_bytes!("../../../examples/media/BigBuckBunny.av1.mp4");
@@ -285,6 +285,55 @@ fn samples_must_arrive_in_presentation_order_across_tracks() {
         assert_eq!(demuxer.tracks[0].samples.len(), 2);
         assert_eq!(demuxer.tracks[1].samples.len(), 1);
     });
+}
+
+/// Issue #655: a VP9 track's range and colour description travel in the WebM
+/// `Colour` element, which Chrome reads instead of the bitstream: a full-range
+/// stream written without one plays its key frame and then fails to decode.
+/// They come back out of the demuxer as the `vpcC` the track was written from.
+#[test]
+fn a_vp9_track_keeps_its_vpcc_colour_description() {
+    let limits = Limits::default();
+    let written = Vp9CodecConfig {
+        level: 21,
+        chroma_subsampling: 1,
+        video_full_range: true,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
+        ..Vp9CodecConfig::default()
+    };
+    let track = Mp4TrackConfig {
+        encoder: EncoderConfig {
+            codec: Codec::Vp9,
+            timescale: 30,
+            decoder_config: written.to_vpcc(),
+        },
+        format: Mp4TrackFormat::Video(VideoDimensions::new(640, 360, &limits).unwrap()),
+    };
+    let bytes = block_on(async {
+        let mut muxer = WebmMuxer::new(MemorySink::new(), vec![track], 1_000_000)
+            .await
+            .unwrap();
+        muxer
+            .write_sample(
+                0,
+                EncodedSample {
+                    data: vec![0x82, 0x49, 0x83, 0x42, 0x00],
+                    dts: 0,
+                    pts: 0,
+                    duration: 1,
+                    is_sync: true,
+                    dependency: SampleDependency::INDEPENDENT,
+                },
+            )
+            .await
+            .unwrap();
+        muxer.finish().await.unwrap().into_inner()
+    });
+    let (_, demuxer) = demux(bytes);
+    let read = Vp9CodecConfig::parse_vpcc(&demuxer.tracks[0].decoder_config).unwrap();
+    assert_eq!(read, written);
 }
 
 fn ffmpeg_available() -> bool {
