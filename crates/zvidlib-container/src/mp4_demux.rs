@@ -2527,6 +2527,94 @@ mod tests {
         u64::from(track.samples[decode_index].size)
     }
 
+    /// The bundled stereo movie's AAC track and a mono `.m4a` with a real
+    /// priming edit, each with the file's bytes.
+    fn aac_fixture_tracks_and_bytes() -> Vec<(Mp4Track, Vec<u8>)> {
+        [
+            include_bytes!("../../../examples/media/BigBuckBunny.mp4").as_slice(),
+            include_bytes!("../../../tests/fixtures/codec/aac_lc_mono_48k.m4a").as_slice(),
+        ]
+        .into_iter()
+        .map(|bytes| {
+            let source = MemorySource::new(bytes.to_vec());
+            let demuxer =
+                block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+            let track = demuxer
+                .tracks
+                .into_iter()
+                .find(|track| track.kind == TrackKind::Audio)
+                .expect("fixture has an audio track");
+            assert_eq!(track.codec, Codec::Aac);
+            (track, bytes.to_vec())
+        })
+        .collect()
+    }
+
+    /// Issue #671: building the AAC provider, and asking it every packet's
+    /// decoded range, reads no packet data.
+    #[test]
+    fn mp4_audio_packet_provider_reads_no_packet_data_at_construction() {
+        for (track, bytes) in aac_fixture_tracks_and_bytes() {
+            let source = CountingSource {
+                inner: MemorySource::new(bytes),
+                bytes_read: Cell::new(0),
+            };
+            let provider = Mp4AudioPacketProvider::new(track, source).unwrap();
+            assert!(provider.len() > 1);
+            for index in 0..provider.len() {
+                provider.decoded_range(index);
+            }
+            assert_eq!(
+                provider.source().bytes_read.get(),
+                0,
+                "building the provider or reading its index read packet data"
+            );
+            let one_packet_size = track_sample_size(provider.track(), 0);
+            provider.read(0).unwrap();
+            assert_eq!(provider.source().bytes_read.get(), one_packet_size);
+        }
+    }
+
+    /// Issue #671: every packet the on-demand provider reads, and its decoded
+    /// range, matches the eager `to_encoded_audio_samples` path exactly.
+    #[test]
+    fn mp4_audio_packet_provider_matches_the_eager_vec_path_for_aac_fixtures() {
+        for (track, bytes) in aac_fixture_tracks_and_bytes() {
+            let source = MemorySource::new(bytes.clone());
+            let eager =
+                block_on(track.to_encoded_audio_samples(&source, &Limits::default())).unwrap();
+            let provider = Mp4AudioPacketProvider::new(track, MemorySource::new(bytes)).unwrap();
+            assert_eq!(provider.len(), eager.len());
+            for (index, expected) in eager.iter().enumerate() {
+                assert_eq!(provider.decoded_range(index), expected.decoded_range);
+                assert_eq!(provider.read(index).unwrap().as_ref(), expected.data);
+            }
+            assert!(provider.read(eager.len()).is_err());
+        }
+    }
+
+    /// Opus and Vorbis packets' decoded ranges need their bytes, so the
+    /// provider rejects those tracks - and any non-audio track - outright.
+    #[test]
+    fn mp4_audio_packet_provider_rejects_non_aac_tracks() {
+        let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
+        for codec in [Codec::Opus, Codec::Vorbis] {
+            let track = Mp4Track {
+                codec,
+                ..aac.clone()
+            };
+            let error = Mp4AudioPacketProvider::new(track, MemorySource::new(bytes.clone()))
+                .err()
+                .expect("a non-AAC audio track is rejected");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+        }
+        let (video, bytes) = bundled_hevc_track_and_bytes();
+        let error = Mp4AudioPacketProvider::new(video, MemorySource::new(bytes))
+            .err()
+            .expect("a video track is rejected");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
     /// Requirement 2 and the "exact-frame and exact-audio-range results are
     /// identical" acceptance criterion: the on-demand provider must answer
     /// exactly what the eager `Vec` path does, for every sample of a real
