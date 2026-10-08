@@ -33,9 +33,15 @@
 //! is usually in hardware (issue #680), and otherwise on the crate's software
 //! decoders, which are synchronous and so sit behind the reads directly. AAC
 //! audio has no software decoder in the browser build, so it always decodes
-//! through `WebCodecs`.
+//! through `WebCodecs`. Opus audio decodes through `WebCodecs` where the
+//! browser supports it, and on the crate's software decoder otherwise.
+//!
+//! An input with no audio track plays on a clock of its own (issue #681): the
+//! `AudioContext`'s when the page gives one, with nothing scheduled on it, and
+//! the page's `performance.now()` otherwise. [`SilentAudioSource`] stands in
+//! for the audio the controller schedules against it.
 
-use crate::audio::{AudioSampleReader, EncodedAudioSample};
+use crate::audio::{AudioDecoder, AudioPacketProvider, AudioSampleReader, EncodedAudioSample};
 use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
@@ -58,7 +64,10 @@ use crate::web_decoder::{
     WebCodecsDecoder, js_to_promise, normalize_js_error, packed_rgba, software_video_decoder,
     webcodecs_config, webcodecs_supports,
 };
-use crate::{Error, ErrorKind, Limits, Mp4SampleLoader, Result, TrackKind};
+use crate::{
+    Error, ErrorKind, Limits, Mp4SampleLoader, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider,
+    Result, TrackKind,
+};
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -82,6 +91,9 @@ extern "C" {
         offset: f64,
         length: f64,
     ) -> std::result::Result<Promise, JsValue>;
+
+    #[wasm_bindgen(js_name = clockSeconds)]
+    fn clock_seconds() -> f64;
 }
 
 /// The compressed video a playback may hold when the page does not say:
@@ -107,6 +119,10 @@ const AUDIO_READAHEAD_PACKETS: usize = 16;
 /// How many prefetch passes an audio decode may take to load packets the plan
 /// missed before giving up on the request.
 const MAX_AUDIO_LOAD_PASSES: usize = 8;
+
+/// The ticks per second of the clock that times an input with no audio track,
+/// standing in for an audio sample rate.
+const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 
 fn core_error(error: Error) -> JsValue {
     js_error(error.kind(), error.message())
@@ -309,18 +325,25 @@ impl AudioOutputBackend for AudioContextBackend {
     }
 }
 
-/// An AAC track's presentation samples, decoded through `WebCodecs` from
-/// packets an [`Mp4SampleLoader`] loads on demand.
+/// An AAC or Opus track's presentation samples, decoded from packets an
+/// [`Mp4SampleLoader`] loads on demand.
 ///
 /// `WebCodecs` decodes asynchronously, so it cannot sit behind the
 /// controller's synchronous reads. [`PrefetchAudioSource::prefetch`] decodes
 /// the range it is asked for and a readahead past it instead, and
 /// [`PlaybackAudioSource::read`] answers from those samples, reporting
-/// [`ErrorKind::WouldBlock`] for anything not decoded yet.
+/// [`ErrorKind::WouldBlock`] for anything not decoded yet. An Opus track the
+/// browser cannot decode, or decodes out of line with its packets, goes
+/// through the crate's software decoder instead, as
+/// [`crate::web_audio_decoder`] arranges for `MediaInput`.
 pub(crate) struct BrowserAudioSource {
-    reader: AudioSampleReader<NoSoftwareDecoder>,
+    reader: AudioSampleReader<Box<dyn AudioDecoder>>,
     loader: Mp4SampleLoader<RangeSource>,
-    decoder: WebCodecsAudioDecoder,
+    /// `None` once reads go through the reader's software decoder.
+    webcodecs: Option<WebCodecsAudioDecoder>,
+    /// Whether the reader's own decoder is a real software decoder rather
+    /// than [`NoSoftwareDecoder`].
+    has_software: bool,
     readahead_samples: u64,
     /// One contiguous run of decoded presentation samples.
     decoded: Option<AudioBuffer>,
@@ -329,7 +352,8 @@ pub(crate) struct BrowserAudioSource {
 
 impl BrowserAudioSource {
     /// Fails with [`ErrorKind::Unsupported`] unless `audio` is an AAC track
-    /// this browser decodes through `WebCodecs`. Reads no packet.
+    /// this browser decodes through `WebCodecs`, or an Opus track. Reads no
+    /// packet but an Opus track's last, whose first two bytes give its length.
     async fn open(
         audio: Mp4Track,
         movie_timescale: u32,
@@ -337,10 +361,10 @@ impl BrowserAudioSource {
         budget_bytes: u64,
         limits: Limits,
     ) -> Result<Self> {
-        if audio.codec != Codec::Aac {
+        if !matches!(audio.codec, Codec::Aac | Codec::Opus) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "on-demand playback supports AAC audio tracks",
+                "on-demand playback supports AAC and Opus audio tracks",
             ));
         }
         let config = WebAudioDecoderConfig::for_track(&audio)?;
@@ -350,32 +374,66 @@ impl BrowserAudioSource {
         .await
         .map_err(|error| normalize_js_error(error, "querying WebCodecs audio decoder support"))?
         .unchecked_into();
-        if !support.get_supported().unwrap_or(false) {
+        let webcodecs_supported = support.get_supported().unwrap_or(false);
+        let software = software_audio_decoder(&audio, limits)?;
+        if !webcodecs_supported && software.is_none() {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                format!("this browser cannot decode {} via WebCodecs", config.codec),
+                format!(
+                    "this browser cannot decode {} via WebCodecs, and the browser build has no \
+                     software decoder for it",
+                    config.codec
+                ),
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
         let timing = audio.audio_timing(movie_timescale)?;
+        let codec = audio.codec;
         let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
+        let (packets, preroll) = if codec == Codec::Opus {
+            let packets = loader.opus_packet_provider().await?;
+            let preroll = opus_preroll_packets(&packets);
+            (packets, preroll)
+        } else {
+            (loader.aac_packet_provider()?, AAC_PREROLL_PACKETS)
+        };
+        let has_software = software.is_some();
         let reader = AudioSampleReader::from_provider(
-            NoSoftwareDecoder,
-            Box::new(loader.aac_packet_provider()?),
+            software.unwrap_or_else(|| Box::new(NoSoftwareDecoder)),
+            Box::new(packets),
             sample_rate,
             config.channels,
             timing,
-            AAC_PREROLL_PACKETS,
+            preroll,
             limits,
         )?;
+        let webcodecs = if webcodecs_supported {
+            Some(WebCodecsAudioDecoder::open(config, limits)?)
+        } else {
+            None
+        };
         Ok(Self {
             reader,
             loader,
-            decoder: WebCodecsAudioDecoder::open(config, limits)?,
+            webcodecs,
+            has_software,
             readahead_samples: u64::from(sample_rate),
             decoded: None,
             limits,
         })
+    }
+
+    /// Whether reads go through the software decoder, because `WebCodecs`
+    /// cannot decode the track or decoded it wrongly.
+    #[cfg(all(test, feature = "all"))]
+    fn is_software(&self) -> bool {
+        self.webcodecs.is_none()
+    }
+
+    /// Drops the `WebCodecs` decoder, so reads go through software.
+    #[cfg(all(test, feature = "all"))]
+    fn use_software(&mut self) {
+        self.webcodecs = None;
     }
 
     /// Decodes `range` from a fresh decoder, loading the packets it needs
@@ -383,22 +441,44 @@ impl BrowserAudioSource {
     async fn decode(&mut self, range: SampleRange) -> Result<AudioBuffer> {
         let cancellation = CancellationToken::new();
         for _ in 0..MAX_AUDIO_LOAD_PASSES {
-            // Every decode starts a fresh `WebCodecs` decoder, preroll included,
-            // as `WebAudioDecodeSession` does.
+            // Every decode starts a fresh decoder, preroll included, as
+            // `WebAudioDecodeSession` does.
             self.reader.reset()?;
             self.loader.load_missing().await?;
             for run in self.reader.packets_for_range(range)? {
                 self.loader.load(run, AUDIO_READAHEAD_PACKETS).await?;
             }
-            let decoder = &mut self.decoder;
-            let result = self
-                .reader
-                .get_range_with(
-                    range,
-                    &cancellation,
-                    async |_, packets: &[EncodedAudioSample]| decoder.decode(packets).await,
-                )
-                .await;
+            let result = match self.webcodecs.as_mut() {
+                Some(decoder) => {
+                    let result = self
+                        .reader
+                        .get_range_with(
+                            range,
+                            &cancellation,
+                            async |_, packets: &[EncodedAudioSample]| decoder.decode(packets).await,
+                        )
+                        .await;
+                    match result {
+                        Err(error)
+                            if self.has_software
+                                && !matches!(
+                                    error.kind(),
+                                    ErrorKind::WouldBlock
+                                        | ErrorKind::Canceled
+                                        | ErrorKind::MalformedMedia
+                                ) =>
+                        {
+                            // The browser's decode does not line up with the
+                            // track. The software decoder does, so it takes
+                            // over for good, starting with this range.
+                            self.webcodecs = None;
+                            continue;
+                        }
+                        result => result,
+                    }
+                }
+                None => self.reader.get_range(range, &cancellation),
+            };
             match result {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => continue,
                 result => return result,
@@ -409,6 +489,37 @@ impl BrowserAudioSource {
             "the audio budget cannot hold the packets one prefetch decodes",
         ))
     }
+}
+
+/// The crate's software decoder for `track`, if the browser build has one:
+/// Opus has one when the `opus-decoder` feature is on, and AAC never does.
+fn software_audio_decoder(
+    track: &Mp4Track,
+    limits: Limits,
+) -> Result<Option<Box<dyn AudioDecoder>>> {
+    match track.codec {
+        #[cfg(feature = "opus-decoder")]
+        Codec::Opus => Ok(Some(Box::new(crate::NativeOpusDecoder::new(
+            &track.opus_config()?,
+            limits,
+        )?))),
+        _ => {
+            let _ = limits;
+            Ok(None)
+        }
+    }
+}
+
+/// How many packets an Opus read decodes ahead of the first one it needs:
+/// enough to cover [`OPUS_PREROLL_SAMPLES`] even at the track's shortest
+/// packet, as [`crate::opus_preroll_packets`] counts for packets in memory.
+fn opus_preroll_packets(packets: &PrefetchedAudioPacketProvider) -> usize {
+    let shortest = (0..packets.len())
+        .map(|index| packets.decoded_range(index).len())
+        .filter(|&length| length > 0)
+        .min()
+        .unwrap_or(u64::from(OPUS_PREROLL_SAMPLES));
+    usize::try_from(u64::from(OPUS_PREROLL_SAMPLES).div_ceil(shortest)).unwrap_or(usize::MAX)
 }
 
 impl PlaybackAudioSource for BrowserAudioSource {
@@ -657,12 +768,188 @@ impl PrefetchVideoSource for BrowserVideoSource {
     }
 }
 
+/// Silence for as long as the video lasts, standing in for the audio of an
+/// input that has none, so the controller's clock runs over the whole video.
+pub(crate) struct SilentAudioSource {
+    sample_rate: u32,
+    length: u64,
+    limits: Limits,
+}
+
+impl PlaybackAudioSource for SilentAudioSource {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn presentation_length(&self) -> u64 {
+        self.length
+    }
+
+    fn read(&mut self, range: SampleRange, _: &CancellationToken) -> Result<AudioBuffer> {
+        AudioBuffer::new(
+            range,
+            self.sample_rate,
+            1,
+            vec![0.0; range.len() as usize],
+            &self.limits,
+        )
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl PrefetchAudioSource for SilentAudioSource {
+    fn prefetch(&mut self, _: SampleRange) -> IoFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// What a playback's audio comes from: the input's audio track, or silence
+/// when it has none.
+pub(crate) enum PlaybackAudio {
+    Track(BrowserAudioSource),
+    Silent(SilentAudioSource),
+}
+
+impl PlaybackAudioSource for PlaybackAudio {
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Track(audio) => audio.sample_rate(),
+            Self::Silent(audio) => audio.sample_rate(),
+        }
+    }
+
+    fn presentation_length(&self) -> u64 {
+        match self {
+            Self::Track(audio) => audio.presentation_length(),
+            Self::Silent(audio) => audio.presentation_length(),
+        }
+    }
+
+    fn read(
+        &mut self,
+        range: SampleRange,
+        cancellation: &CancellationToken,
+    ) -> Result<AudioBuffer> {
+        match self {
+            Self::Track(audio) => audio.read(range, cancellation),
+            Self::Silent(audio) => audio.read(range, cancellation),
+        }
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::Track(audio) => audio.reset(),
+            Self::Silent(audio) => audio.reset(),
+        }
+    }
+}
+
+impl PrefetchAudioSource for PlaybackAudio {
+    fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()> {
+        match self {
+            Self::Track(audio) => audio.prefetch(range),
+            Self::Silent(audio) => audio.prefetch(range),
+        }
+    }
+}
+
+/// The clock that times playback of an input with no audio track.
+pub(crate) enum Clock {
+    /// An `AudioContext`'s `currentTime`, with nothing scheduled on it.
+    AudioContext(BaseAudioContext),
+    /// The page's `performance.now()`.
+    Page,
+}
+
+impl Clock {
+    fn seconds(&self) -> f64 {
+        match self {
+            Self::AudioContext(context) => context.current_time(),
+            Self::Page => clock_seconds(),
+        }
+    }
+}
+
+/// Times playback of an input with no audio track, and plays nothing.
+pub(crate) struct ClockBackend {
+    clock: Clock,
+    rate: u32,
+}
+
+impl AudioOutputBackend for ClockBackend {
+    fn clock_samples(&self) -> u64 {
+        (self.clock.seconds() * f64::from(self.rate)).floor() as u64
+    }
+
+    fn start(&mut self, _: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn schedule(&mut self, _: AudioBuffer, _: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn cancel_queued(&mut self, _: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Where a playback's audio goes, and the clock that times it.
+pub(crate) enum BrowserOutput {
+    Audio(AudioContextBackend),
+    Clock(ClockBackend),
+}
+
+impl AudioOutputBackend for BrowserOutput {
+    fn clock_samples(&self) -> u64 {
+        match self {
+            Self::Audio(output) => output.clock_samples(),
+            Self::Clock(output) => output.clock_samples(),
+        }
+    }
+
+    fn start(&mut self, media_sample: u64) -> Result<()> {
+        match self {
+            Self::Audio(output) => output.start(media_sample),
+            Self::Clock(output) => output.start(media_sample),
+        }
+    }
+
+    fn schedule(&mut self, buffer: AudioBuffer, generation: u64) -> Result<()> {
+        match self {
+            Self::Audio(output) => output.schedule(buffer, generation),
+            Self::Clock(output) => output.schedule(buffer, generation),
+        }
+    }
+
+    fn cancel_queued(&mut self, generation: u64) -> Result<()> {
+        match self {
+            Self::Audio(output) => output.cancel_queued(generation),
+            Self::Clock(output) => output.cancel_queued(generation),
+        }
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        match self {
+            Self::Audio(output) => output.stop(),
+            Self::Clock(output) => output.stop(),
+        }
+    }
+}
+
 type Controller =
-    PlaybackController<BrowserVideoSource, BrowserAudioSource, WebAudioOutput<AudioContextBackend>>;
+    PlaybackController<BrowserVideoSource, PlaybackAudio, WebAudioOutput<BrowserOutput>>;
 
 /// The budgets and audio context a playback is opened with.
 struct OnDemandOptions {
-    audio_context: BaseAudioContext,
+    audio_context: Option<BaseAudioContext>,
     video_budget_bytes: u64,
     audio_budget_bytes: u64,
 }
@@ -677,31 +964,30 @@ fn parse_budget(options: &JsValue, name: &str, default: u64) -> std::result::Res
 fn parse_on_demand_options(
     options: Option<JsValue>,
 ) -> std::result::Result<OnDemandOptions, JsValue> {
-    let options = options.ok_or_else(|| {
-        js_error(
-            ErrorKind::InvalidInput,
-            "on-demand playback requires options with an audioContext",
-        )
-    })?;
+    let options = options.unwrap_or_else(|| Object::new().into());
     let audio_context = property(&options, "audioContext")?
-        .ok_or_else(|| {
-            js_error(
-                ErrorKind::InvalidInput,
-                "on-demand playback requires an audioContext, whose clock drives it",
-            )
-        })?
-        .dyn_into::<BaseAudioContext>()
-        .map_err(|_| {
-            js_error(
-                ErrorKind::InvalidInput,
-                "audioContext must be an AudioContext or OfflineAudioContext",
-            )
-        })?;
+        .map(|context| {
+            context.dyn_into::<BaseAudioContext>().map_err(|_| {
+                js_error(
+                    ErrorKind::InvalidInput,
+                    "audioContext must be an AudioContext or OfflineAudioContext",
+                )
+            })
+        })
+        .transpose()?;
     Ok(OnDemandOptions {
         audio_context,
         video_budget_bytes: parse_budget(&options, "videoBudgetBytes", DEFAULT_VIDEO_BUDGET_BYTES)?,
         audio_budget_bytes: parse_budget(&options, "audioBudgetBytes", DEFAULT_AUDIO_BUDGET_BYTES)?,
     })
+}
+
+fn missing_audio_context() -> JsValue {
+    js_error(
+        ErrorKind::InvalidInput,
+        "on-demand playback of an input with audio requires an audioContext, which plays the \
+         audio and whose clock times it",
+    )
 }
 
 fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Mp4Track> {
@@ -720,7 +1006,8 @@ enum VideoBackend {
 }
 
 /// Playback of an MP4 read on demand through a URL, `Blob` or range reader,
-/// timed by a Web Audio context.
+/// timed by a Web Audio context, or by the page's clock for a video with no
+/// audio track and no context.
 ///
 /// `play`, `pause`, `seek`, `present` and `currentFrame` never wait on the
 /// network. When one needs a sample that has not been loaded, it throws an
@@ -736,7 +1023,8 @@ pub struct WasmOnDemandPlayback {
     frame_count: u64,
     width: u32,
     height: u32,
-    sample_rate: u32,
+    /// The audio track's sample rate, or `None` for an input with no audio.
+    sample_rate: Option<u32>,
     webcodecs_video: bool,
     video_budget_bytes: u64,
     audio_budget_bytes: u64,
@@ -764,14 +1052,11 @@ impl WasmOnDemandPlayback {
         let video = first_track(&demuxer, TrackKind::Video)
             .ok_or_else(|| js_error(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
-        let audio = first_track(&demuxer, TrackKind::Audio)
-            .ok_or_else(|| {
-                js_error(
-                    ErrorKind::Unsupported,
-                    "on-demand playback requires an audio track, whose clock drives it",
-                )
-            })?
-            .clone();
+        let audio = first_track(&demuxer, TrackKind::Audio).cloned();
+        // Checked before any audio is read, rather than once it has been.
+        if audio.is_some() && options.audio_context.is_none() {
+            return Err(missing_audio_context());
+        }
 
         let dimensions = video
             .dimensions
@@ -833,25 +1118,53 @@ impl WasmOnDemandPlayback {
         let webcodecs_video = matches!(video_source, BrowserVideoSource::WebCodecs(_));
         let frame_count = video.presentation_order.len() as u64;
 
-        let audio_source = BrowserAudioSource::open(
-            audio,
-            demuxer.movie_timescale,
-            source.clone(),
-            options.audio_budget_bytes,
-            limits,
-        )
-        .await
-        .map_err(core_error)?;
-        let sample_rate = audio_source.sample_rate();
+        let audio_source = match audio {
+            Some(audio) => Some(
+                BrowserAudioSource::open(
+                    audio,
+                    demuxer.movie_timescale,
+                    source.clone(),
+                    options.audio_budget_bytes,
+                    limits,
+                )
+                .await
+                .map_err(core_error)?,
+            ),
+            None => None,
+        };
+        let sample_rate = audio_source.as_ref().map(BrowserAudioSource::sample_rate);
+        let clock_rate = sample_rate.unwrap_or(VIDEO_ONLY_CLOCK_RATE);
 
-        let timeline = IndexedPresentationTimeline::from_mp4_track(&video, sample_rate, &limits)
+        let timeline = IndexedPresentationTimeline::from_mp4_track(&video, clock_rate, &limits)
             .map_err(core_error)?;
+        let (audio_source, output) = match audio_source {
+            Some(audio) => (
+                PlaybackAudio::Track(audio),
+                BrowserOutput::Audio(AudioContextBackend::new(
+                    options.audio_context.ok_or_else(missing_audio_context)?,
+                    clock_rate,
+                )),
+            ),
+            None => (
+                PlaybackAudio::Silent(SilentAudioSource {
+                    sample_rate: clock_rate,
+                    length: timeline.end_sample(),
+                    limits,
+                }),
+                BrowserOutput::Clock(ClockBackend {
+                    clock: options
+                        .audio_context
+                        .map_or(Clock::Page, Clock::AudioContext),
+                    rate: clock_rate,
+                }),
+            ),
+        };
         let controller = PlaybackController::new_with_indexed_timeline(
             video_source,
             audio_source,
-            WebAudioOutput(AudioContextBackend::new(options.audio_context, sample_rate)),
+            WebAudioOutput(output),
             timeline,
-            PlaybackOptions::for_sample_rate(sample_rate),
+            PlaybackOptions::for_sample_rate(clock_rate),
         )
         .map_err(core_error)?;
         Ok(Self {
@@ -906,15 +1219,20 @@ impl WasmOnDemandPlayback {
     /// requests, a `Blob` or `File`, or an object with a numeric `size` and a
     /// `read(offset, length)` method resolving to the bytes.
     ///
-    /// `options.audioContext`, an `AudioContext`, is required: playback is
-    /// timed by its clock and plays through its destination.
-    /// `options.videoBudgetBytes` and `options.audioBudgetBytes` bound the
-    /// compressed samples held at once, and default to 16 MiB and 1 MiB.
+    /// `options.audioContext`, an `AudioContext`, is required when the input
+    /// has an audio track: playback is timed by its clock and plays through
+    /// its destination. An input with no audio track is timed by the
+    /// context's clock when one is given, and by `performance.now()`
+    /// otherwise. `options.videoBudgetBytes` and `options.audioBudgetBytes`
+    /// bound the compressed samples held at once, and default to 16 MiB and
+    /// 1 MiB.
     ///
-    /// Only the movie header is read here. The video decodes through
-    /// `WebCodecs` when the browser supports the track, and on the crate's
-    /// software decoder otherwise; `videoDecoder` says which. The audio, which
-    /// must be AAC, decodes through `WebCodecs`.
+    /// Only the movie header is read here, and the first bytes of an Opus
+    /// track's last packet. The video decodes through `WebCodecs` when the
+    /// browser supports the track, and on the crate's software decoder
+    /// otherwise; `videoDecoder` says which. AAC audio decodes through
+    /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
+    /// supports it and the crate's software decoder otherwise.
     pub fn open(source: JsValue, options: Option<JsValue>) -> Promise {
         future_to_promise(async move { Ok(Self::open_inner(source, options).await?.into()) })
     }
@@ -934,9 +1252,16 @@ impl WasmOnDemandPlayback {
         self.height
     }
 
+    /// The audio track's sample rate, or `0` for an input with no audio.
     #[wasm_bindgen(getter, js_name = sampleRate)]
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.sample_rate.unwrap_or(0)
+    }
+
+    /// Whether the input has an audio track, which plays with the video.
+    #[wasm_bindgen(getter, js_name = hasAudio)]
+    pub fn has_audio(&self) -> bool {
+        self.sample_rate.is_some()
     }
 
     /// `"webcodecs"` when the video decodes through the browser's `WebCodecs`
@@ -974,7 +1299,7 @@ impl WasmOnDemandPlayback {
             .is_some_and(Controller::is_playing)
     }
 
-    /// The presentation frame the audio clock is on.
+    /// The presentation frame the playback clock is on.
     #[wasm_bindgen(js_name = currentFrameIndex)]
     pub fn current_frame_index(&self) -> std::result::Result<JsValue, JsValue> {
         self.with_controller(|controller| controller.current_frame_index())
@@ -1105,7 +1430,7 @@ mod tests {
     use js_sys::BigInt;
     use std::collections::HashMap;
     use wasm_bindgen_test::*;
-    use web_sys::OfflineAudioContext;
+    use web_sys::{AudioDecoderConfig as JsAudioDecoderConfig, OfflineAudioContext};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -1710,6 +2035,406 @@ mod tests {
         assert!(canceled.iter().all(|&sample| sample == 0.0));
     }
 
+    /// Frames per second of [`small_mp4`]'s video, and how many frames it has.
+    const SMALL_RATE: u64 = 30;
+    const SMALL_FRAMES: u64 = 90;
+
+    /// The gray levels of frame `index` of [`small_mp4`], a moving gradient.
+    fn small_gray(index: u64) -> Vec<u8> {
+        (0..18_u32)
+            .flat_map(|y| {
+                (0..32_u32).map(move |x| ((x * 7 + y * 3 + index as u32 * 5) % 256) as u8)
+            })
+            .collect()
+    }
+
+    /// Frame `index` of [`small_mp4`] as on-demand playback presents it.
+    fn small_rgba(index: u64) -> Vec<u8> {
+        small_gray(index)
+            .into_iter()
+            .flat_map(|level| [level, level, level, 255])
+            .collect()
+    }
+
+    thread_local! {
+        /// [`small_mp4`]'s files, without and with Opus, once encoded.
+        static SMALL: RefCell<[Option<Rc<Vec<u8>>>; 2]> = const { RefCell::new([None, None]) };
+    }
+
+    /// Three seconds of lossless monochrome 32x18 AV1 at 30 fps, which
+    /// decodes quickly and exactly, and with `opus`, three seconds of Opus
+    /// muxed beside it with its pre-skip and end trim. Encoded once and
+    /// shared, as [`eager_frames`] is.
+    async fn small_mp4(opus: bool) -> Rc<Vec<u8>> {
+        if let Some(bytes) = SMALL.with_borrow(|small| small[usize::from(opus)].clone()) {
+            return bytes;
+        }
+        let bytes = Rc::new(encode_small_mp4(opus).await);
+        SMALL.with_borrow_mut(|small| small[usize::from(opus)] = Some(Rc::clone(&bytes)));
+        bytes
+    }
+
+    async fn encode_small_mp4(opus: bool) -> Vec<u8> {
+        use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
+        use crate::io::MemorySink;
+        use crate::media::{ColorRange, PixelFormat, Plane, VideoDimensions};
+        use crate::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+        use crate::transfer::{CpuFrameSource, FrameSource, Orientation};
+        use crate::{CodecProfile, HardwarePreference, VideoFrame};
+
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(32, 18, &limits).unwrap();
+        let mut encoder = crate::native_av1_video_encoder_factory()
+            .create(
+                &VideoEncoderConfig {
+                    codec: Codec::Av1,
+                    profile: CodecProfile::Av1Main,
+                    coded_dimensions: dimensions,
+                    input_format: PixelFormat::Gray8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    timescale: SMALL_RATE as u32,
+                    frame_duration: 1,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut tracks = vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Video(dimensions),
+        }];
+        let audio = if opus {
+            let (track, packets, gapless, _) =
+                crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE)
+                    .await;
+            tracks.push(track);
+            Some((packets, gapless))
+        } else {
+            None
+        };
+        let mut muxer = Mp4Muxer::new(MemorySink::new(), tracks, 100_000)
+            .await
+            .unwrap();
+        let mut video = Vec::new();
+        for index in 0..SMALL_FRAMES {
+            let frame = VideoFrame::new(
+                dimensions,
+                PixelFormat::Gray8,
+                ColorRange::Full,
+                vec![Plane {
+                    data: small_gray(index),
+                    stride: dimensions.width as usize,
+                }],
+                &limits,
+            )
+            .unwrap();
+            video.extend(
+                encoder
+                    .encode(
+                        FrameIndex(index),
+                        FrameSource::Cpu(CpuFrameSource {
+                            frame: &frame,
+                            orientation: Orientation::TopLeft,
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        video.extend(encoder.finish().await.unwrap());
+        for sample in video {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
+        if let Some((packets, gapless)) = audio {
+            for packet in packets {
+                muxer.write_sample(1, packet).await.unwrap();
+            }
+            muxer.set_audio_gapless(1, gapless).unwrap();
+        }
+        muxer.finish().await.unwrap().into_inner()
+    }
+
+    /// Opens one of [`small_mp4`]'s files on the software video decoder,
+    /// which decodes it back to exactly the gray levels it was encoded from;
+    /// these tests are about its audio and its clock, not how its video
+    /// decodes.
+    async fn open_small(
+        source: JsValue,
+        options: Option<JsValue>,
+    ) -> std::result::Result<WasmOnDemandPlayback, JsValue> {
+        WasmOnDemandPlayback::open_with(source, options, VideoBackend::SoftwareOnly).await
+    }
+
+    /// Resolves after `milliseconds` of real time.
+    async fn sleep(milliseconds: f64) {
+        let promise = Promise::new(&mut |resolve, _| {
+            let set_timeout: js_sys::Function =
+                Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+                    .unwrap()
+                    .unchecked_into();
+            set_timeout
+                .call2(&JsValue::NULL, &resolve, &JsValue::from_f64(milliseconds))
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
+
+    /// The largest difference between two runs of samples of the same length.
+    fn largest_difference(got: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(got.len(), expected.len());
+        got.iter()
+            .zip(expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Issue #681: an Opus track opens without its packets being read, its
+    /// reads come from packets loaded as playback reaches them, and they are
+    /// the samples an eager decode of the whole track gives, through
+    /// `WebCodecs` where the browser decodes Opus and through the software
+    /// decoder either way.
+    #[wasm_bindgen_test(async)]
+    async fn opus_audio_reads_load_packets_on_demand_and_match_an_eager_decode() {
+        let bytes = small_mp4(true).await;
+        let source = MemorySource::new(bytes.to_vec());
+        let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
+            .await
+            .unwrap();
+        let track = first_track(&demuxer, TrackKind::Audio).unwrap().clone();
+        assert_eq!(track.codec, Codec::Opus);
+        let packets = track.samples.len();
+        let limits = Limits::default();
+        let mut eager = WebAudioDecodeSession::open(&bytes, 0, &limits)
+            .await
+            .unwrap();
+        let length = eager.presentation_length();
+        assert_eq!(length, 48_000 * SMALL_FRAMES / SMALL_RATE);
+        let range = |start: u64, end: u64| SampleRange::new(start, end).unwrap();
+        let cancellation = CancellationToken::new();
+
+        for software in [false, true] {
+            let reader = make_suspending_reader(&bytes);
+            let mut audio = BrowserAudioSource::open(
+                track.clone(),
+                demuxer.movie_timescale,
+                RangeSource::open(reader.clone()).await.unwrap(),
+                64 * 1024,
+                limits,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                field(&reader, "reads").as_f64().unwrap(),
+                1.0,
+                "opening read the last packet's header and nothing else"
+            );
+            if software {
+                audio.use_software();
+            }
+            assert_eq!(audio.presentation_length(), length);
+            assert_eq!(audio.sample_rate(), 48_000);
+
+            for wanted in [
+                range(0, 9_600),
+                range(70_000, 80_000),
+                range(20_000, 20_001),
+            ] {
+                audio.reset().unwrap();
+                assert_eq!(
+                    audio.read(wanted, &cancellation).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
+                audio.prefetch(wanted).await.unwrap();
+                if wanted.start == 0 {
+                    // The first second and a readahead, not the whole track.
+                    assert!(!audio.loader.is_loaded(packets - 1));
+                    assert!(
+                        field(&reader, "reads").as_f64().unwrap() > 1.0,
+                        "the prefetch read through the source"
+                    );
+                }
+                let got = audio.read(wanted, &cancellation).unwrap().samples;
+                let expected = eager
+                    .get_range(wanted, &cancellation)
+                    .await
+                    .unwrap()
+                    .samples;
+                // libopus and opus-pure agree to within a few 16-bit steps,
+                // and either may decode each side.
+                let largest = largest_difference(&got, &expected);
+                assert!(
+                    largest < 1e-3,
+                    "[{}, {}) differs by {largest} (software: {software})",
+                    wanted.start,
+                    wanted.end
+                );
+            }
+            // A read the browser decodes wrongly would have moved it to
+            // software; a correct one stays where it started.
+            assert_eq!(
+                audio.is_software(),
+                software || !browser_decodes_opus().await
+            );
+            assert!(audio.loader.resident_bytes() <= audio.loader.budget_bytes());
+        }
+    }
+
+    /// Whether this browser decodes stereo Opus through `WebCodecs`.
+    async fn browser_decodes_opus() -> bool {
+        let config = JsAudioDecoderConfig::new("opus", 2, 48_000);
+        let support: AudioDecoderSupport =
+            JsFuture::from(js_to_promise(JsAudioDecoder::is_config_supported(&config)))
+                .await
+                .unwrap()
+                .unchecked_into();
+        support.get_supported().unwrap_or(false)
+    }
+
+    /// Issue #681: an MP4 whose audio is Opus plays, presents and seeks over
+    /// a suspending source, with its audio scheduled on the context.
+    #[wasm_bindgen_test(async)]
+    async fn plays_an_mp4_with_opus_audio_over_a_suspending_source() {
+        let bytes = small_mp4(true).await;
+        let reader = make_suspending_reader(&bytes);
+        let playback = open_small(reader, Some(options(1 << 20))).await.unwrap();
+        assert!(playback.has_audio());
+        assert_eq!(playback.sample_rate(), 48_000);
+        assert_eq!(
+            parse_u64(&playback.frame_count(), "frames").unwrap(),
+            SMALL_FRAMES
+        );
+
+        until_loaded(&playback, WasmOnDemandPlayback::play).await;
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 0);
+        assert_eq!(pixels(&field(&presentation, "picture")), small_rgba(0));
+
+        playback.seek(JsValue::from_f64(45.0)).unwrap();
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 45);
+        assert_eq!(pixels(&field(&presentation, "picture")), small_rgba(45));
+
+        playback.pause().unwrap();
+        playback.seek(JsValue::from_f64(7.0)).unwrap();
+        let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+        assert_eq!(pixels(&picture), small_rgba(7));
+        assert!(playback.fetched_bytes() < bytes.len() as f64);
+    }
+
+    /// Issue #681: an input with no audio track plays on an audio context's
+    /// clock when it is given one, with nothing scheduled on it, and plays,
+    /// presents and seeks exactly as an input with audio does.
+    #[wasm_bindgen_test(async)]
+    async fn plays_a_video_only_mp4_on_an_audio_contexts_clock() {
+        let bytes = small_mp4(false).await;
+        let reader = make_suspending_reader(&bytes);
+        let playback = open_small(reader.clone(), Some(options(1 << 20)))
+            .await
+            .unwrap();
+        assert!(!playback.has_audio());
+        assert_eq!(playback.sample_rate(), 0);
+        assert_eq!(
+            parse_u64(&playback.frame_count(), "frames").unwrap(),
+            SMALL_FRAMES
+        );
+
+        assert_error_code(&playback.present().unwrap_err(), "INVALID_STATE");
+        until_loaded(&playback, WasmOnDemandPlayback::play).await;
+        assert!(playback.is_playing());
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 0);
+        assert_eq!(pixels(&field(&presentation, "picture")), small_rgba(0));
+        // The context's clock has not moved, so there is no new frame.
+        assert!(field(&playback.present().unwrap(), "frame").is_null());
+
+        for frame in [30_u64, 12] {
+            playback.seek(JsValue::from_f64(frame as f64)).unwrap();
+            let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), frame);
+            assert_eq!(pixels(&field(&presentation, "picture")), small_rgba(frame));
+        }
+
+        playback.pause().unwrap();
+        playback.seek(JsValue::from_f64(89.0)).unwrap();
+        let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+        assert_eq!(pixels(&picture), small_rgba(89));
+        assert!(field(&reader, "reads").as_f64().unwrap() > 0.0);
+
+        // Whichever video decoder the browser picks, the clock and seeks
+        // behave the same.
+        let automatic = WasmOnDemandPlayback::open_inner(
+            make_suspending_reader(&bytes),
+            Some(options(1 << 20)),
+        )
+        .await
+        .unwrap();
+        until_loaded(&automatic, WasmOnDemandPlayback::play).await;
+        for frame in [0_u64, 30] {
+            automatic.seek(JsValue::from_f64(frame as f64)).unwrap();
+            let presentation = until_loaded(&automatic, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), frame);
+            assert_eq!(pixels(&field(&presentation, "picture")).len(), 32 * 18 * 4);
+        }
+    }
+
+    /// Issue #681: given no audio context, an input with no audio track plays
+    /// on the page's clock, which advances in real time while playing and
+    /// holds still while paused, and finishes at the end of the video.
+    #[wasm_bindgen_test(async)]
+    async fn plays_a_video_only_mp4_on_the_page_clock_in_real_time() {
+        let bytes = small_mp4(false).await;
+        let playback = open_small(make_suspending_reader(&bytes), None)
+            .await
+            .unwrap();
+        assert!(!playback.has_audio());
+        let frame_index = |playback: &WasmOnDemandPlayback| {
+            parse_u64(&playback.current_frame_index().unwrap(), "frame").unwrap()
+        };
+
+        // Paused, the clock holds still.
+        playback.seek(JsValue::from_f64(10.0)).unwrap();
+        let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+        assert_eq!(pixels(&picture), small_rgba(10));
+        sleep(150.0).await;
+        assert_eq!(frame_index(&playback), 10);
+
+        // Playing, it runs at the video's own rate: a third of a second is
+        // ten frames, give or take the time the test itself takes.
+        until_loaded(&playback, WasmOnDemandPlayback::play).await;
+        let started = clock_seconds();
+        let first = frame_index(&playback);
+        sleep(334.0).await;
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        let elapsed = clock_seconds() - started;
+        let requested = parse_u64(&field(&presentation, "requestedFrame"), "frame").unwrap();
+        let expected = first as f64 + elapsed * SMALL_RATE as f64;
+        assert!(
+            (requested as f64 - expected).abs() <= 2.0,
+            "frame {requested} after {elapsed} s from frame {first}"
+        );
+        assert!(requested >= first + 9);
+        if !field(&presentation, "frame").is_null() {
+            assert_eq!(
+                pixels(&field(&presentation, "picture")),
+                small_rgba(requested)
+            );
+        }
+
+        playback.pause().unwrap();
+        let paused = frame_index(&playback);
+        sleep(150.0).await;
+        assert_eq!(frame_index(&playback), paused);
+
+        // Played past its end, the video finishes.
+        playback.seek(JsValue::from_f64(88.0)).unwrap();
+        until_loaded(&playback, WasmOnDemandPlayback::play).await;
+        sleep(200.0).await;
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(field(&presentation, "finished"), JsValue::TRUE);
+    }
+
+    /// An input with audio needs an audio context to play it through.
     #[wasm_bindgen_test(async)]
     async fn opening_requires_an_audio_context() {
         let reader = make_suspending_reader(SAMPLE);

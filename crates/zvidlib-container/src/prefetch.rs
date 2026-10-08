@@ -132,7 +132,8 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// without reading every packet depends on the codec, as
     /// [`AudioPacketProvider`] explains. An Opus or Vorbis packet's depends
     /// on packet bytes; an AAC track should use [`Self::aac_packet_provider`],
-    /// which derives them from the track's index. Fails if the track is not
+    /// which derives them from the track's index, and an Opus track
+    /// [`Self::opus_packet_provider`]. Fails if the track is not
     /// an audio track or `decoded_ranges` does not have one interval per
     /// sample.
     pub fn audio_packet_provider(
@@ -151,8 +152,40 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
         }
         Ok(PrefetchedAudioPacketProvider {
             decoded_ranges,
+            check_opus_durations: false,
             cache: self.cache.clone(),
         })
+    }
+
+    /// An [`AudioPacketProvider`] for an Opus track, answering from this
+    /// loader's cache, without reading every packet to learn its interval.
+    ///
+    /// Each packet's decoded interval is its sample-table duration, except
+    /// the last packet's, which comes from its own table of contents: a muxer
+    /// trims the stream's end by shortening that duration. Only that packet's
+    /// first two bytes are read here. The table is then checked a packet at a
+    /// time, as playback reaches each one: a packet whose table of contents
+    /// disagrees with its duration is read as [`ErrorKind::MalformedMedia`],
+    /// so a track whose intervals would differ from the ones
+    /// [`Mp4Track::to_encoded_audio_samples`] gives is refused rather than
+    /// played out of time. Fails if the track is not an Opus audio track.
+    pub async fn opus_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
+        if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Opus {
+            return Err(unsupported(
+                "an Opus audio packet provider requires an Opus audio track",
+            ));
+        }
+        // `new` refuses an empty track.
+        let last = &self.track.samples[self.track.samples.len() - 1];
+        let mut head = [0_u8; 2];
+        let head = &mut head[..(last.size as usize).min(2)];
+        read_exact(&self.source, last.offset, head).await?;
+        let decoded_ranges = self
+            .track
+            .opus_decoded_ranges(crate::opus::opus_packet_samples(head)?)?;
+        let mut provider = self.audio_packet_provider(decoded_ranges)?;
+        provider.check_opus_durations = true;
+        Ok(provider)
     }
 
     /// An [`AudioPacketProvider`] for an AAC track, answering from this
@@ -162,8 +195,9 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// The intervals are the ones [`Mp4AudioPacketProvider`] and
     /// [`Mp4Track::to_encoded_audio_samples`] give the same track, and
     /// building them reads no packet data. Fails if the track is not an AAC
-    /// audio track: Opus and Vorbis tracks use [`Self::audio_packet_provider`]
-    /// with intervals the caller supplies.
+    /// audio track: Opus tracks use [`Self::opus_packet_provider`], and Vorbis
+    /// tracks [`Self::audio_packet_provider`] with intervals the caller
+    /// supplies.
     ///
     /// [`Mp4AudioPacketProvider`]: crate::mp4_demux::Mp4AudioPacketProvider
     pub fn aac_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
@@ -325,6 +359,9 @@ impl SampleProvider for PrefetchedSampleProvider {
 /// loaded yet.
 pub struct PrefetchedAudioPacketProvider {
     decoded_ranges: Vec<SampleRange>,
+    /// Whether each packet is an Opus packet whose interval came from the
+    /// sample table, so its own table of contents must agree with it.
+    check_opus_durations: bool,
     cache: SharedCache,
 }
 
@@ -341,7 +378,17 @@ impl AudioPacketProvider for PrefetchedAudioPacketProvider {
         if index >= self.len() {
             return Err(invalid("MP4 sample index is out of range"));
         }
-        self.cache.read(index)
+        let packet = self.cache.read(index)?;
+        if self.check_opus_durations
+            && u64::from(crate::opus::opus_packet_samples(&packet)?)
+                != self.decoded_ranges[index].len()
+        {
+            return Err(Error::new(
+                ErrorKind::MalformedMedia,
+                "an Opus packet's duration disagrees with the track's sample table",
+            ));
+        }
+        Ok(packet)
     }
 }
 

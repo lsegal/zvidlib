@@ -359,6 +359,11 @@ impl IndexedPresentationTimeline {
             .ok_or_else(|| invalid("presentation frame is not indexed"))
     }
 
+    /// The audio sample the last frame's interval ends at, where the presentation ends.
+    pub fn end_sample(&self) -> u64 {
+        self.frame_audio_ranges.last().map_or(0, |range| range.end)
+    }
+
     pub fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex> {
         let index = self
             .frame_audio_ranges
