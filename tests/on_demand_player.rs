@@ -594,6 +594,41 @@ fn plays_and_seeks_a_webm_with_vorbis_audio() {
     }
 }
 
+/// Issue #695: `play` on an input nothing has been loaded from waits for the
+/// audio it starts with and schedules it from the play position, so the
+/// opening audio is not lost however late the first `present` comes.
+#[test]
+fn plays_from_the_start_on_an_input_nothing_has_been_loaded_from() {
+    for bytes in [movie(1), webm(1)] {
+        let clock = Clock::default();
+        let (opener, opened) = outputs(&clock);
+        let mut player = OnDemandPlayer::with_output(
+            MemorySource::new(bytes),
+            OnDemandOptions::default(),
+            opener,
+        )
+        .unwrap();
+        assert_eq!(player.audio_resident_bytes(), 0);
+        player.play().unwrap();
+        assert!(player.is_playing());
+        assert_eq!(player.current_frame_index().unwrap(), FrameIndex(0));
+        clock.advance(48_000 / RATE * 5 / 2);
+        let (presentation, picture) = player.present().unwrap();
+        assert_eq!(presentation.frame, Some(FrameIndex(2)));
+        assert_gray(&picture.unwrap(), 2);
+
+        let opened = opened.lock().unwrap();
+        let scheduled = &opened[0].lock().unwrap().scheduled;
+        assert_eq!(scheduled.first().unwrap().start, 0);
+        assert!(
+            scheduled
+                .windows(2)
+                .all(|pair| pair[0].end == pair[1].start),
+            "the scheduled audio has a gap: {scheduled:?}"
+        );
+    }
+}
+
 #[test]
 fn refuses_an_audio_track_or_language_the_input_lacks() {
     let clock = Clock::default();

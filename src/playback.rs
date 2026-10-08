@@ -506,10 +506,29 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         if self.playing {
             return Ok(());
         }
+        let queued_from = self.queued_until;
         self.clock_anchor = self.output.clock_samples();
         self.output.start(self.media_anchor)?;
         self.playing = true;
-        self.fill_audio()
+        match self.fill_audio() {
+            // Leave the controller paused where it was, so a retry once the source has loaded
+            // the audio schedules it from the play position rather than from wherever the
+            // clock has run to by then (issue #695).
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if self.queued_until != queued_from {
+                    self.generation = self
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("playback generation overflow"))?;
+                    self.output.cancel_queued(self.generation)?;
+                }
+                self.output.stop()?;
+                self.playing = false;
+                self.queued_until = queued_from;
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     pub fn pause(&mut self) -> Result<()> {
@@ -1403,9 +1422,20 @@ mod tests {
             panic!("playback still had not loaded what it needed");
         }
 
-        async fn plays_and_seeks_without_blocking() {
+        type OnDemandPlayback = PlaybackController<
+            OnDemandVideoSource<SuspendingSource>,
+            OnDemandAudioSource<PacketIndexAudio, SuspendingSource>,
+            WebAudioOutput<FixtureBackend>,
+        >;
+
+        /// A controller over [`media`] whose reads go through a [`SuspendingSource`]
+        /// counting into `reads`, timed by `clock` and scheduling into `scheduled`.
+        fn playback(
+            reads: &Rc<Cell<usize>>,
+            clock: &Arc<Mutex<u64>>,
+            scheduled: &Arc<Mutex<Vec<(SampleRange, u64)>>>,
+        ) -> OnDemandPlayback {
             let (bytes, video_track, audio_track) = media();
-            let reads = Rc::new(Cell::new(0));
             let source = || SuspendingSource {
                 inner: MemorySource::new(bytes.clone()),
                 reads: reads.clone(),
@@ -1448,8 +1478,6 @@ mod tests {
                 Limits::default(),
             )
             .unwrap();
-            let clock = Arc::new(Mutex::new(0));
-            let scheduled = Arc::new(Mutex::new(Vec::new()));
             let backend = FixtureBackend {
                 clock: clock.clone(),
                 scheduled: scheduled.clone(),
@@ -1457,7 +1485,7 @@ mod tests {
             };
             let timeline =
                 Timeline::new(crate::FrameRate::new(24, 1).unwrap(), SAMPLE_RATE).unwrap();
-            let mut playback = PlaybackController::new(
+            PlaybackController::new(
                 OnDemandVideoSource::new(video_reader, video_loader, 2),
                 OnDemandAudioSource::new(audio_reader, audio_loader, 2),
                 WebAudioOutput(backend),
@@ -1467,7 +1495,14 @@ mod tests {
                     preroll_samples: 1_000,
                 },
             )
-            .unwrap();
+            .unwrap()
+        }
+
+        async fn plays_and_seeks_without_blocking() {
+            let reads = Rc::new(Cell::new(0));
+            let clock = Arc::new(Mutex::new(0));
+            let scheduled = Arc::new(Mutex::new(Vec::new()));
+            let mut playback = playback(&reads, &clock, &scheduled);
 
             let error = playback.play().unwrap_err();
             assert_eq!(error.kind(), ErrorKind::WouldBlock);
@@ -1492,12 +1527,68 @@ mod tests {
             assert!(!scheduled.lock().unwrap().is_empty());
         }
 
+        /// Issue #695: a `play` that reports `WouldBlock` leaves the controller
+        /// paused where it was, so its retry schedules audio from the play
+        /// position however far the output's clock has run in the meantime.
+        async fn retried_play_schedules_from_the_play_position() {
+            let reads = Rc::new(Cell::new(0));
+            let clock = Arc::new(Mutex::new(0));
+            let scheduled = Arc::new(Mutex::new(Vec::new()));
+            let mut playback = playback(&reads, &clock, &scheduled);
+            for (start, waited) in [(0, 2_400), (5 * SAMPLES_PER_FRAME, 7_000)] {
+                if start > 0 {
+                    playback.pause().unwrap();
+                    playback
+                        .seek(FrameIndex(start / SAMPLES_PER_FRAME))
+                        .unwrap();
+                }
+                scheduled.lock().unwrap().clear();
+
+                let error = playback.play().unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::WouldBlock);
+                assert!(!playback.is_playing());
+                assert!(scheduled.lock().unwrap().is_empty());
+
+                // The page awaits a prefetch and tries again, while the
+                // output's clock runs on.
+                until_loaded(&mut playback, |playback| {
+                    *clock.lock().unwrap() += waited;
+                    assert_eq!(
+                        playback.current_frame_index().unwrap(),
+                        FrameIndex(start / SAMPLES_PER_FRAME)
+                    );
+                    playback.play()
+                })
+                .await;
+                assert!(playback.is_playing());
+
+                let scheduled = scheduled.lock().unwrap();
+                assert_eq!(scheduled.first().map(|(range, _)| range.start), Some(start));
+                assert!(
+                    scheduled
+                        .windows(2)
+                        .all(|pair| pair[0].0.end == pair[1].0.start)
+                );
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        fn run_natively<F: Future<Output = ()>>(future: F) {
+            let mut future = std::pin::pin!(future);
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            while future.as_mut().poll(&mut context).is_pending() {}
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         #[test]
         fn natively() {
-            let mut future = std::pin::pin!(plays_and_seeks_without_blocking());
-            let mut context = Context::from_waker(std::task::Waker::noop());
-            while future.as_mut().poll(&mut context).is_pending() {}
+            run_natively(plays_and_seeks_without_blocking());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn retried_play_natively() {
+            run_natively(retried_play_schedules_from_the_play_position());
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1507,6 +1598,12 @@ mod tests {
         #[wasm_bindgen_test::wasm_bindgen_test(async)]
         async fn in_the_browser() {
             plays_and_seeks_without_blocking().await;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        #[wasm_bindgen_test::wasm_bindgen_test(async)]
+        async fn retried_play_in_the_browser() {
+            retried_play_schedules_from_the_play_position().await;
         }
     }
 }
