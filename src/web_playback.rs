@@ -1247,8 +1247,8 @@ impl WasmOnDemandPlayback {
     /// track's last packet. The video decodes through `WebCodecs` when the
     /// browser supports the track, and on the crate's software decoder
     /// otherwise; `videoDecoder` says which. AAC audio decodes through
-    /// `WebCodecs`, and Opus and Vorbis audio through `WebCodecs` where the
-    /// browser supports them and the crate's software decoders otherwise.
+    /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
+    /// supports it and the crate's software decoder otherwise.
     pub fn open(source: JsValue, options: Option<JsValue>) -> Promise {
         future_to_promise(async move { Ok(Self::open_inner(source, options).await?.into()) })
     }
