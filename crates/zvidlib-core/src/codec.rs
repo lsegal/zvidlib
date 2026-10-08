@@ -2,6 +2,7 @@ use crate::{
     AudioBuffer, Codec, ColorRange, Error, ErrorKind, FrameIndex, FrameSource, Limits, PixelFormat,
     Plane, Result, VideoDimensions, VideoFrame,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -268,6 +269,52 @@ pub struct EncodedVideoSample {
     pub data: Vec<u8>,
 }
 
+/// Supplies [`ExactFrameReader`] with compressed video samples by decode
+/// index, so a reader does not have to own every sample of a track up front.
+///
+/// An owned `Vec<EncodedVideoSample>` implements this directly and is what
+/// [`ExactFrameReader::new`] wraps, so that constructor and its callers are
+/// unchanged. [`ExactFrameReader::from_provider`] accepts any other
+/// implementation, such as one that reads through a container track's index
+/// and a [`crate::io::ByteSource`] on demand, holding only the index and a
+/// bounded cache of compressed bytes rather than the whole track.
+///
+/// `len`, `is_random_access` and `presentation_index` answer from the index
+/// alone and must not read sample data; only [`Self::read`] may do that, and
+/// only for the one sample it is asked for.
+///
+/// Implementations used from a decode thread must be `Send`, matching
+/// [`VideoDecoder`]'s own requirement.
+pub trait SampleProvider: Send {
+    /// The number of samples, in decode order.
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn is_random_access(&self, decode_index: usize) -> bool;
+    fn presentation_index(&self, decode_index: usize) -> FrameIndex;
+    /// Returns the compressed bytes of one decode-order sample.
+    fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>>;
+}
+
+impl SampleProvider for Vec<EncodedVideoSample> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn is_random_access(&self, decode_index: usize) -> bool {
+        self[decode_index].random_access
+    }
+
+    fn presentation_index(&self, decode_index: usize) -> FrameIndex {
+        self[decode_index].presentation_index
+    }
+
+    fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>> {
+        Ok(Cow::Borrowed(&self[decode_index].data))
+    }
+}
+
 /// One normalized decoder output, independent of backend-private image types.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedVideoFrame {
@@ -422,7 +469,7 @@ pub struct DecodeStatistics {
 pub struct ExactFrameReader {
     configuration: VideoDecoderConfig,
     decoder: Box<dyn VideoDecoder>,
-    samples: Vec<EncodedVideoSample>,
+    samples: Box<dyn SampleProvider>,
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     cache: BTreeMap<FrameIndex, VideoFrame>,
     lru: VecDeque<FrameIndex>,
@@ -536,6 +583,21 @@ impl ExactFrameReader {
         samples: Vec<EncodedVideoSample>,
         limits: Limits,
     ) -> Result<Self> {
+        Self::from_provider(factory, configuration, Box::new(samples), limits)
+    }
+
+    /// Builds a reader over any [`SampleProvider`], such as one that reads
+    /// compressed bytes from a container track and a
+    /// [`crate::io::ByteSource`] on demand instead of owning every sample.
+    ///
+    /// Behaves exactly as [`Self::new`], which is this constructor with an
+    /// owned `Vec<EncodedVideoSample>` as the provider.
+    pub fn from_provider(
+        factory: &dyn VideoDecoderFactory,
+        configuration: VideoDecoderConfig,
+        samples: Box<dyn SampleProvider>,
+        limits: Limits,
+    ) -> Result<Self> {
         if limits.max_cached_frames == 0 || limits.max_decode_samples_per_seek == 0 {
             return Err(Error::new(
                 ErrorKind::ResourceLimit,
@@ -552,16 +614,16 @@ impl ExactFrameReader {
                 "an exact-frame reader requires at least one sample",
             ));
         }
-        if !samples[0].random_access {
+        if !samples.is_random_access(0) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "the first decode-order sample must be a random-access point",
             ));
         }
         let mut positions = HashMap::with_capacity(samples.len());
-        for (position, sample) in samples.iter().enumerate() {
+        for position in 0..samples.len() {
             if positions
-                .insert(sample.presentation_index, position)
+                .insert(samples.presentation_index(position), position)
                 .is_some()
             {
                 return Err(Error::new(
@@ -587,6 +649,17 @@ impl ExactFrameReader {
             seek_previews: None,
             limits,
             statistics: DecodeStatistics::default(),
+        })
+    }
+
+    /// Builds the owned, transient [`EncodedVideoSample`] the decoder is
+    /// submitted for one decode-order position, reading its bytes from the
+    /// provider.
+    fn sample_at(&self, position: usize) -> Result<EncodedVideoSample> {
+        Ok(EncodedVideoSample {
+            presentation_index: self.samples.presentation_index(position),
+            random_access: self.samples.is_random_access(position),
+            data: self.samples.read(position)?.into_owned(),
         })
     }
 
@@ -759,19 +832,19 @@ impl ExactFrameReader {
             // bundled sample's 768 pictures (issue #402).
             let cache_tail = request.cache_tail(&self.limits);
             let wanted = position >= target_position
-                || self.samples[position].presentation_index.0
+                || self.samples.presentation_index(position).0
                     >= presentation_index.0.saturating_sub(cache_tail);
             self.set_output_wanted(wanted);
             let suppressed = !self.output_wanted;
-            let outputs = self.decoder.submit(&self.samples[position], cancellation)?;
+            let sample = self.sample_at(position)?;
+            let outputs = self.decoder.submit(&sample, cancellation)?;
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
             if suppressed {
                 self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
                 self.suppressed_since_reset
-                    .insert(self.samples[position].presentation_index);
+                    .insert(sample.presentation_index);
             } else {
-                self.in_flight_since_reset
-                    .insert(self.samples[position].presentation_index);
+                self.in_flight_since_reset.insert(sample.presentation_index);
             }
             self.next_decode_position = Some(position + 1);
             work += 1;
@@ -854,12 +927,12 @@ impl ExactFrameReader {
     /// random-access point, so a decode that starts there cannot reconstruct them (issue #506).
     /// The walk goes back to a random-access point the target is not leading.
     fn nearest_random_access(&self, target_position: usize) -> usize {
-        let target = self.samples[target_position].presentation_index;
+        let target = self.samples.presentation_index(target_position);
         (0..=target_position)
             .rev()
-            .find(|position| {
-                let sample = &self.samples[*position];
-                sample.random_access && sample.presentation_index <= target
+            .find(|&position| {
+                self.samples.is_random_access(position)
+                    && self.samples.presentation_index(position) <= target
             })
             .unwrap_or(0)
     }

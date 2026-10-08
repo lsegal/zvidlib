@@ -1,4 +1,6 @@
 use crate::{Error, ErrorKind, Result};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -170,6 +172,131 @@ impl ByteSink for NonSeekableSink {
     }
 }
 
+/// A [`ByteSource`] wrapper that caches fixed-size pages of the bytes it
+/// reads, evicting the least-recently-used page once a configured byte
+/// budget is exceeded.
+///
+/// This is how a [`crate::codec::SampleProvider`] backed by a container
+/// track and a plain [`ByteSource`] (such as a file) keeps the memory for
+/// compressed sample bytes bounded: samples near the playhead are read
+/// through overlapping pages that stay cached, and pages behind the budget
+/// are dropped rather than held for the life of the source.
+///
+/// Reads are not required to be page-aligned or page-sized; a read spanning
+/// several pages fetches and caches each of them. Internal caching uses a
+/// [`RefCell`], so a `CachingByteSource` is usable from one thread at a time,
+/// matching how a reader built over it is used.
+pub struct CachingByteSource<S> {
+    inner: S,
+    page_size: u64,
+    budget_bytes: u64,
+    pages: RefCell<HashMap<u64, Vec<u8>>>,
+    lru: RefCell<VecDeque<u64>>,
+    resident_bytes: RefCell<u64>,
+}
+
+impl<S: ByteSource> CachingByteSource<S> {
+    /// `page_size` and `budget_bytes` must both be nonzero; a page larger
+    /// than the budget is still cached (so a single read always succeeds)
+    /// but is evicted again on the very next page fetch.
+    pub fn new(inner: S, page_size: u64, budget_bytes: u64) -> Result<Self> {
+        if page_size == 0 || budget_bytes == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "caching byte source requires a nonzero page size and budget",
+            ));
+        }
+        Ok(Self {
+            inner,
+            page_size,
+            budget_bytes,
+            pages: RefCell::new(HashMap::new()),
+            lru: RefCell::new(VecDeque::new()),
+            resident_bytes: RefCell::new(0),
+        })
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// Total bytes currently cached, for tests and diagnostics.
+    pub fn resident_bytes(&self) -> u64 {
+        *self.resident_bytes.borrow()
+    }
+
+    fn touch(&self, page: u64) {
+        let mut lru = self.lru.borrow_mut();
+        lru.retain(|candidate| *candidate != page);
+        lru.push_back(page);
+    }
+
+    fn evict_until_within_budget(&self) {
+        loop {
+            if *self.resident_bytes.borrow() <= self.budget_bytes {
+                return;
+            }
+            let Some(evicted) = self.lru.borrow_mut().pop_front() else {
+                return;
+            };
+            if let Some(bytes) = self.pages.borrow_mut().remove(&evicted) {
+                *self.resident_bytes.borrow_mut() -= bytes.len() as u64;
+            }
+        }
+    }
+
+    /// Reads one page, from the cache if present, filling it from the inner
+    /// source otherwise.
+    async fn page(&self, page_index: u64) -> Result<Vec<u8>> {
+        if let Some(cached) = self.pages.borrow().get(&page_index) {
+            self.touch(page_index);
+            return Ok(cached.clone());
+        }
+        let mut bytes = vec![0_u8; self.page_size as usize];
+        let read = self
+            .inner
+            .read_at(page_index * self.page_size, &mut bytes)
+            .await?;
+        bytes.truncate(read);
+        *self.resident_bytes.borrow_mut() += bytes.len() as u64;
+        self.pages.borrow_mut().insert(page_index, bytes.clone());
+        self.touch(page_index);
+        self.evict_until_within_budget();
+        Ok(bytes)
+    }
+}
+
+impl<S: ByteSource> ByteSource for CachingByteSource<S> {
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+
+    fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
+        Box::pin(async move {
+            let mut produced = 0_usize;
+            while produced < destination.len() {
+                let position = offset + produced as u64;
+                let page_index = position / self.page_size;
+                let page_start = page_index * self.page_size;
+                let in_page_offset = (position - page_start) as usize;
+                let page = self.page(page_index).await?;
+                if in_page_offset >= page.len() {
+                    break;
+                }
+                let available = (page.len() - in_page_offset).min(destination.len() - produced);
+                destination[produced..produced + available]
+                    .copy_from_slice(&page[in_page_offset..in_page_offset + available]);
+                produced += available;
+                if page.len() < self.page_size as usize {
+                    // The inner source ended partway through this page.
+                    break;
+                }
+            }
+            Ok(produced)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +346,99 @@ mod tests {
         assert_eq!(sink.bytes, b"abc");
         let error = ready(sink.seek(0)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    /// A source that counts every byte actually read from it, so a test can
+    /// tell a cache hit from a fetch.
+    struct CountingSource {
+        inner: MemorySource,
+        reads: std::cell::Cell<u64>,
+    }
+
+    impl ByteSource for CountingSource {
+        fn len(&self) -> Option<u64> {
+            self.inner.len()
+        }
+
+        fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
+            Box::pin(async move {
+                let read = self.inner.read_at(offset, destination).await?;
+                self.reads.set(self.reads.get() + read as u64);
+                Ok(read)
+            })
+        }
+    }
+
+    fn large_source(bytes: u64) -> CountingSource {
+        CountingSource {
+            inner: MemorySource::new((0..bytes).map(|value| value as u8).collect::<Vec<u8>>()),
+            reads: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn caching_byte_source_reads_match_the_inner_source_across_page_boundaries() {
+        let cache = CachingByteSource::new(large_source(1000), 64, 1_000_000).unwrap();
+        let mut destination = [0_u8; 100];
+        assert_eq!(ready(cache.read_at(30, &mut destination)).unwrap(), 100);
+        let expected: Vec<u8> = (30..130).map(|value| value as u8).collect();
+        assert_eq!(&destination, expected.as_slice());
+    }
+
+    #[test]
+    fn caching_byte_source_answers_a_repeated_read_without_fetching_again() {
+        let cache = CachingByteSource::new(large_source(1000), 64, 1_000_000).unwrap();
+        let mut destination = [0_u8; 10];
+        ready(cache.read_at(0, &mut destination)).unwrap();
+        let reads_after_first = cache.inner.reads.get();
+        assert!(reads_after_first > 0);
+        ready(cache.read_at(0, &mut destination)).unwrap();
+        assert_eq!(
+            cache.inner.reads.get(),
+            reads_after_first,
+            "a repeated read fetched from the inner source again instead of the cache"
+        );
+    }
+
+    /// Reading all over a track much larger than the cache budget - the
+    /// shape of scrubbing and sequential playback through a long file - must
+    /// never grow resident bytes past the configured budget.
+    #[test]
+    fn caching_byte_source_stays_within_its_budget_while_scanning_a_large_source() {
+        let total = 1_000_000_u64;
+        let page_size = 4096_u64;
+        let budget = 64 * 1024_u64;
+        let cache = CachingByteSource::new(large_source(total), page_size, budget).unwrap();
+        let mut destination = [0_u8; 1024];
+        let mut offset = 0_u64;
+        while offset + destination.len() as u64 <= total {
+            ready(cache.read_at(offset, &mut destination)).unwrap();
+            assert!(
+                cache.resident_bytes() <= budget,
+                "resident bytes {} exceeded the budget {budget} at offset {offset}",
+                cache.resident_bytes()
+            );
+            // Jump far enough each time that pages do not all stay resident
+            // through overlap alone.
+            offset += 97 * 1024;
+        }
+    }
+
+    #[test]
+    fn caching_byte_source_rejects_a_zero_page_size_or_budget() {
+        assert_eq!(
+            CachingByteSource::new(MemorySource::default(), 0, 1024)
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            CachingByteSource::new(MemorySource::default(), 1024, 0)
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
     }
 }
