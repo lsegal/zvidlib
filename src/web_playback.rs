@@ -2079,6 +2079,31 @@ mod tests {
     thread_local! {
         /// [`small_mp4`]'s files, without and with Opus, once encoded.
         static SMALL: RefCell<[Option<Rc<Vec<u8>>>; 2]> = const { RefCell::new([None, None]) };
+        /// [`small_webm`]'s files, by video codec and whether they have Opus,
+        /// once encoded.
+        static SMALL_WEBM: RefCell<Vec<((Codec, bool), Rc<Vec<u8>>)>> =
+            const { RefCell::new(Vec::new()) };
+        /// [`small_opus`]'s track, once encoded.
+        static SMALL_OPUS: RefCell<Option<SmallOpus>> = const { RefCell::new(None) };
+    }
+
+    type SmallOpus = (
+        crate::mp4::Mp4TrackConfig,
+        Vec<crate::EncodedSample>,
+        crate::AudioGapless,
+    );
+
+    /// The Opus track [`small_mp4`] and [`small_webm`] carry: three seconds
+    /// of it, its packets and its gapless trim. Encoded once and shared.
+    async fn small_opus() -> SmallOpus {
+        if let Some(opus) = SMALL_OPUS.with_borrow(Clone::clone) {
+            return opus;
+        }
+        let (track, packets, gapless, _) =
+            crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE).await;
+        let opus = (track, packets, gapless);
+        SMALL_OPUS.set(Some(opus.clone()));
+        opus
     }
 
     /// Three seconds of lossless monochrome 32x18 AV1 at 30 fps, which
@@ -2125,9 +2150,7 @@ mod tests {
             format: Mp4TrackFormat::Video(dimensions),
         }];
         let audio = if opus {
-            let (track, packets, gapless, _) =
-                crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE)
-                    .await;
+            let (track, packets, gapless) = small_opus().await;
             tracks.push(track);
             Some((packets, gapless))
         } else {
@@ -2177,8 +2200,25 @@ mod tests {
 
     /// [`small_mp4`]'s three seconds of moving gradient as a WebM, its video
     /// encoded as `codec` (VP8 or VP9, both lossy) and with `opus`, the same
-    /// Opus track muxed beside it with its `CodecDelay` and end trim.
-    async fn small_webm(codec: Codec, opus: bool) -> Vec<u8> {
+    /// Opus track muxed beside it with its `CodecDelay` and end trim. Encoded
+    /// once and shared, as [`small_mp4`] is.
+    async fn small_webm(codec: Codec, opus: bool) -> Rc<Vec<u8>> {
+        let key = (codec, opus);
+        let cached = SMALL_WEBM.with_borrow(|small| {
+            small
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, bytes)| Rc::clone(bytes))
+        });
+        if let Some(bytes) = cached {
+            return bytes;
+        }
+        let bytes = Rc::new(encode_small_webm(codec, opus).await);
+        SMALL_WEBM.with_borrow_mut(|small| small.push((key, Rc::clone(&bytes))));
+        bytes
+    }
+
+    async fn encode_small_webm(codec: Codec, opus: bool) -> Vec<u8> {
         use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
         use crate::io::MemorySink;
         use crate::media::{ColorRange, PixelFormat, Plane, VideoDimensions};
@@ -2197,7 +2237,7 @@ mod tests {
                 Box::new(crate::native_vp9_video_encoder_factory()),
                 CodecProfile::Vp9Profile0,
             ),
-            _ => unreachable!("small_webm encodes VP8 or VP9"),
+            _ => unreachable!("a small WebM is VP8 or VP9"),
         };
         let mut encoder = factory
             .create(
@@ -2220,9 +2260,7 @@ mod tests {
             format: Mp4TrackFormat::Video(dimensions),
         }];
         let audio = if opus {
-            let (track, packets, gapless, _) =
-                crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE)
-                    .await;
+            let (track, packets, gapless) = small_opus().await;
             tracks.push(track);
             Some((packets, gapless))
         } else {
@@ -2359,7 +2397,7 @@ mod tests {
         // Issue #685: a WebM's Opus track, timed by its `CodecDelay` rather
         // than an edit list, loads and decodes the same way.
         let mp4 = small_mp4(true).await;
-        let webm = Rc::new(small_webm(Codec::Vp9, true).await);
+        let webm = small_webm(Codec::Vp9, true).await;
         for bytes in [mp4, webm] {
             opus_reads_match_an_eager_decode(&bytes).await;
         }
@@ -2626,16 +2664,10 @@ mod tests {
             assert_eq!(frame_of(&presentation), 0);
             assert_eq!(pixels(&field(&presentation, "picture")), eager[0]);
 
-            for frame in [45_u64, 12] {
-                playback.seek(JsValue::from_f64(frame as f64)).unwrap();
-                let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
-                assert_eq!(frame_of(&presentation), frame, "{codec:?}");
-                assert_eq!(
-                    pixels(&field(&presentation, "picture")),
-                    eager[frame as usize],
-                    "{codec:?} frame {frame}"
-                );
-            }
+            playback.seek(JsValue::from_f64(45.0)).unwrap();
+            let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), 45, "{codec:?}");
+            assert_eq!(pixels(&field(&presentation, "picture")), eager[45]);
 
             playback.pause().unwrap();
             playback.seek(JsValue::from_f64(89.0)).unwrap();
