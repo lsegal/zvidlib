@@ -44,6 +44,8 @@ async function scrubber({ previews = true } = {}) {
     ImageData: class { constructor(data) { this.data = data; } },
     performance: { now: () => 0 },
     requestAnimationFrame: (callback) => ticks.push(callback),
+    cancelAnimationFrame() {},
+    addEventListener() {},
     fetch: async () => ({ ok: true, blob: async () => ({}) }),
     setTimeout,
   });
