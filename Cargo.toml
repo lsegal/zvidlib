@@ -165,6 +165,11 @@ name = "vp8_preview_index"
 path = "tests/vp8_preview_index.rs"
 required-features = ["vp8-decoder"]
 
+[[test]]
+name = "on_demand_sample_provider"
+path = "tests/on_demand_sample_provider.rs"
+required-features = ["hevc-decoder"]
+
 [build-dependencies]
 zvidlib-build = { workspace = true }
 
