@@ -460,13 +460,16 @@ impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
             .ok_or_else(|| invalid("MP4 sample index is out of range"))?
             .size as usize;
         let mut data = vec![0_u8; size];
-        poll_once(self.track.read_sample_into(&self.source, decode_index, &mut data))
-            .ok_or_else(|| {
-                unsupported(
-                    "Mp4SampleProvider requires a byte source whose reads complete \
+        poll_once(
+            self.track
+                .read_sample_into(&self.source, decode_index, &mut data),
+        )
+        .ok_or_else(|| {
+            unsupported(
+                "Mp4SampleProvider requires a byte source whose reads complete \
                      synchronously; it cannot drive one that suspends",
-                )
-            })??;
+            )
+        })??;
         Ok(Cow::Owned(data))
     }
 }
@@ -2459,9 +2462,7 @@ mod tests {
         // Forward through the whole track, then seek back across it, then
         // jump to the middle and the very end - the shape of playback
         // followed by scrubbing.
-        let positions = (0..len)
-            .chain((0..len).rev())
-            .chain([len / 2, 0, len - 1]);
+        let positions = (0..len).chain((0..len).rev()).chain([len / 2, 0, len - 1]);
         for position in positions {
             provider.read(position).unwrap();
             assert!(

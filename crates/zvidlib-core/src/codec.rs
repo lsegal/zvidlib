@@ -288,6 +288,9 @@ pub struct EncodedVideoSample {
 pub trait SampleProvider: Send {
     /// The number of samples, in decode order.
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn is_random_access(&self, decode_index: usize) -> bool;
     fn presentation_index(&self, decode_index: usize) -> FrameIndex;
     /// Returns the compressed bytes of one decode-order sample.
@@ -605,7 +608,7 @@ impl ExactFrameReader {
         if !capability.is_supported() {
             return Err(capability_error(capability));
         }
-        if samples.len() == 0 {
+        if samples.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "an exact-frame reader requires at least one sample",
@@ -838,7 +841,8 @@ impl ExactFrameReader {
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
             if suppressed {
                 self.statistics.samples_skipped = self.statistics.samples_skipped.saturating_add(1);
-                self.suppressed_since_reset.insert(sample.presentation_index);
+                self.suppressed_since_reset
+                    .insert(sample.presentation_index);
             } else {
                 self.in_flight_since_reset.insert(sample.presentation_index);
             }

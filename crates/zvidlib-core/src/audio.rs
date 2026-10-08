@@ -62,6 +62,9 @@ pub use self::AudioDecoder as AacDecoder;
 pub trait AudioPacketProvider: Send {
     /// The number of packets.
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn decoded_range(&self, index: usize) -> SampleRange;
     /// Returns the compressed bytes of one packet.
     fn read(&self, index: usize) -> Result<Cow<'_, [u8]>>;
@@ -178,7 +181,7 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         preroll_packets: usize,
         limits: Limits,
     ) -> Result<Self> {
-        if packets.len() == 0 {
+        if packets.is_empty() {
             return Err(invalid("an audio reader requires at least one packet"));
         }
         if sample_rate == 0 || sample_rate > limits.max_sample_rate {
