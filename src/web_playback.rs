@@ -1,11 +1,13 @@
-//! On-demand browser playback of an MP4 that is never loaded whole (issue #677).
+//! On-demand browser playback of an MP4 or WebM input that is never loaded
+//! whole (issues #677 and #685).
 //!
 //! [`WasmOnDemandPlayback`] is the JavaScript face of the on-demand
 //! [`PlaybackController`] of issue #672. It reads the file through a
 //! [`RangeSource`]: HTTP range requests against a URL, slices of a `Blob` or
-//! `File`, or an application's own `read(offset, length)`. Only the movie
-//! header and the compressed samples playback reaches are fetched, into caches
-//! bounded by the configured byte budgets.
+//! `File`, or an application's own `read(offset, length)`. The container is
+//! detected from the input's leading bytes, and only its header and index and
+//! the compressed samples playback reaches are fetched, into caches bounded by
+//! the configured byte budgets.
 //!
 //! Every playback call is synchronous and never waits on the network. One that
 //! needs a sample not loaded yet throws a `WOULD_BLOCK` error and leaves
@@ -41,12 +43,14 @@
 //! the page's `performance.now()` otherwise. [`SilentAudioSource`] stands in
 //! for the audio the controller schedules against it.
 
-use crate::audio::{AudioDecoder, AudioPacketProvider, AudioSampleReader, EncodedAudioSample};
+use crate::audio::{
+    AudioDecoder, AudioPacketProvider, AudioSampleReader, AudioTrackTiming, EncodedAudioSample,
+};
 use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
+use crate::mp4_demux::Mp4Track;
 use crate::playback::{
     AudioOutputBackend, IndexedPresentationTimeline, OnDemandVideoSource, PlaybackAudioSource,
     PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
@@ -352,11 +356,13 @@ pub(crate) struct BrowserAudioSource {
 
 impl BrowserAudioSource {
     /// Fails with [`ErrorKind::Unsupported`] unless `audio` is an AAC track
-    /// this browser decodes through `WebCodecs`, or an Opus track. Reads no
-    /// packet but an Opus track's last, whose first two bytes give its length.
+    /// this browser decodes through `WebCodecs`, or an Opus track. `timing` is
+    /// the track's timing on the decoded sample clock, as its container gives
+    /// it. Reads no packet but an Opus track's last, whose first two bytes give
+    /// its length.
     async fn open(
         audio: Mp4Track,
-        movie_timescale: u32,
+        timing: AudioTrackTiming,
         source: RangeSource,
         budget_bytes: u64,
         limits: Limits,
@@ -387,7 +393,6 @@ impl BrowserAudioSource {
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
-        let timing = audio.audio_timing(movie_timescale)?;
         let codec = audio.codec;
         let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
         let (packets, preroll) = if codec == Codec::Opus {
@@ -990,10 +995,6 @@ fn missing_audio_context() -> JsValue {
     )
 }
 
-fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Mp4Track> {
-    demuxer.tracks.iter().find(|track| track.kind == kind)
-}
-
 /// Which video decoders [`WasmOnDemandPlayback::open_with`] may choose between.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VideoBackend {
@@ -1005,9 +1006,9 @@ enum VideoBackend {
     SoftwareOnly,
 }
 
-/// Playback of an MP4 read on demand through a URL, `Blob` or range reader,
-/// timed by a Web Audio context, or by the page's clock for a video with no
-/// audio track and no context.
+/// Playback of an MP4 or WebM input read on demand through a URL, `Blob` or
+/// range reader, timed by a Web Audio context, or by the page's clock for a
+/// video with no audio track and no context.
 ///
 /// `play`, `pause`, `seek`, `present` and `currentFrame` never wait on the
 /// network. When one needs a sample that has not been loaded, it throws an
@@ -1046,13 +1047,18 @@ impl WasmOnDemandPlayback {
         let options = parse_on_demand_options(options)?;
         let limits = Limits::default();
         let source = RangeSource::open(source).await.map_err(core_error)?;
-        let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
+        let media = crate::container::open_media(&source, &limits)
             .await
             .map_err(core_error)?;
-        let video = first_track(&demuxer, TrackKind::Video)
+        let video = media
+            .first_track(TrackKind::Video)
             .ok_or_else(|| js_error(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
-        let audio = first_track(&demuxer, TrackKind::Audio).cloned();
+        let audio = media
+            .first_track(TrackKind::Audio)
+            .map(|audio| Ok((audio.clone(), media.audio_timing(audio)?)))
+            .transpose()
+            .map_err(core_error)?;
         // Checked before any audio is read, rather than once it has been.
         if audio.is_some() && options.audio_context.is_none() {
             return Err(missing_audio_context());
@@ -1119,10 +1125,10 @@ impl WasmOnDemandPlayback {
         let frame_count = video.presentation_order.len() as u64;
 
         let audio_source = match audio {
-            Some(audio) => Some(
+            Some((audio, timing)) => Some(
                 BrowserAudioSource::open(
                     audio,
-                    demuxer.movie_timescale,
+                    timing,
                     source.clone(),
                     options.audio_budget_bytes,
                     limits,
@@ -1227,8 +1233,8 @@ impl WasmOnDemandPlayback {
     /// bound the compressed samples held at once, and default to 16 MiB and
     /// 1 MiB.
     ///
-    /// Only the movie header is read here, and the first bytes of an Opus
-    /// track's last packet. The video decodes through `WebCodecs` when the
+    /// Only the container's header and sample index are read here, and the
+    /// first bytes of an Opus track's last packet. The video decodes through `WebCodecs` when the
     /// browser supports the track, and on the crate's software decoder
     /// otherwise; `videoDecoder` says which. AAC audio decodes through
     /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
@@ -1285,7 +1291,8 @@ impl WasmOnDemandPlayback {
         self.audio_budget_bytes as f64
     }
 
-    /// Every byte read from the source so far, movie header included.
+    /// Every byte read from the source so far, the container's header and
+    /// index included.
     #[wasm_bindgen(getter, js_name = fetchedBytes)]
     pub fn fetched_bytes(&self) -> f64 {
         self.source.fetched_bytes() as f64

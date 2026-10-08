@@ -161,10 +161,11 @@ export async function probeTestVideo(blob, seekTo) {
   }
 }
 
-// A range source is what `OnDemandPlayback` reads an MP4 through without
-// loading all of it: a URL (a string or `URL`) read with HTTP range requests,
-// a `Blob` or `File` read by slicing, or an object with a numeric `size` and a
-// `read(offset, length)` method resolving to a `Uint8Array` or `ArrayBuffer`.
+// A range source is what `OnDemandPlayback` reads an MP4 or WebM input through
+// without loading all of it: a URL (a string or `URL`) read with HTTP range
+// requests, a `Blob` or `File` read by slicing, or an object with a numeric
+// `size` and a `read(offset, length)` method resolving to a `Uint8Array` or
+// `ArrayBuffer`.
 function isUrl(source) {
   return typeof source === "string" || source instanceof URL;
 }
