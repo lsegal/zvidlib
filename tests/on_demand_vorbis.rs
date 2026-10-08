@@ -267,21 +267,24 @@ fn a_synchronous_provider_reads_no_packet_until_decoding_and_matches_the_eager_p
         let length = eager.presentation_length();
         assert_eq!(length, fixture.granule, "{name}: the end was not trimmed");
         assert_eq!(on_demand.presentation_length(), length);
-        let cancellation = CancellationToken::new();
-        for range in fixture.ranges(length) {
-            let expected = eager.get_range(range, &cancellation).unwrap();
-            let got = on_demand.get_range(range, &cancellation).unwrap();
-            assert_eq!(got.range, range);
-            assert_eq!(got.samples, expected.samples, "{name}: {range:?}");
-        }
         let total: u64 = eager_packets
             .iter()
             .map(|packet| packet.data.len() as u64)
             .sum();
-        assert!(
-            *bytes_read.lock().unwrap() <= total,
-            "{name}: the reads covered more than the track's packets"
-        );
+        let cancellation = CancellationToken::new();
+        for (index, range) in fixture.ranges(length).into_iter().enumerate() {
+            let expected = eager.get_range(range, &cancellation).unwrap();
+            let got = on_demand.get_range(range, &cancellation).unwrap();
+            assert_eq!(got.range, range);
+            assert_eq!(got.samples, expected.samples, "{name}: {range:?}");
+            if index == 0 {
+                let read = *bytes_read.lock().unwrap();
+                assert!(
+                    0 < read && read < total,
+                    "{name}: the first eighth read {read} of the track's {total} packet bytes"
+                );
+            }
+        }
     }
 }
 
@@ -331,8 +334,8 @@ impl Future for YieldOnce {
     }
 }
 
-/// The budget a test's loader may hold: a sixth of the track's packets, and
-/// at least the largest of them.
+/// The budget a test's loader may hold: a quarter of the track's packets,
+/// and at least four of the largest, so it holds a packet with its preroll.
 fn budget(track: &Mp4Track) -> u64 {
     let total: u64 = track
         .samples
@@ -345,7 +348,7 @@ fn budget(track: &Mp4Track) -> u64 {
         .map(|sample| u64::from(sample.size))
         .max()
         .unwrap();
-    (total / 6).max(largest)
+    (total / 4).max(4 * largest)
 }
 
 /// Over a source that suspends, the loader's provider is built from the
