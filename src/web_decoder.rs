@@ -53,9 +53,10 @@ const MAX_IN_FLIGHT_CHUNKS: u32 = 16;
 /// closed. Chrome's stalls with as few as ten frames held (its hardware HEVC
 /// decoder on Windows) or fourteen (its software AV1 decoder), so a cache of 32
 /// open frames left `get()` waiting forever for a frame the decoder could not
-/// produce, a dozen frames into any track. Frames the decoder emits ahead of the
-/// one asked for are still kept up to this bound, which is what lets sequential
-/// reads continue the decode session instead of resetting it.
+/// produce, a dozen frames into any track. The bound is on frames at or before
+/// the one asked for: frames the decoder emits after it are kept up to
+/// `Limits::max_cached_frames`, which is what lets sequential reads continue the
+/// decode session instead of resetting it (see `trim_cache()`).
 const MAX_OPEN_FRAMES: usize = 4;
 
 /// Resolves `resolve` on the next event-loop turn.
@@ -584,6 +585,10 @@ impl WebCodecsDecoder {
         cancellation: &CancellationToken,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
         cancellation.check()?;
+        // Frames this request has moved past are closed before anything is
+        // awaited, so the decoder's output buffers they hold are free for the
+        // frames it still has to emit on the way to this one.
+        self.trim_cache(presentation_index);
         if let Some(frame) = self.cache.get(&presentation_index) {
             return self.copy_frame_rgba(frame).await;
         }
@@ -627,6 +632,10 @@ impl WebCodecsDecoder {
                 normalize_js_error(error, "resetting the WebCodecs VideoDecoder")
             })?;
             self.close_pending_frames();
+            // Frames the old session ran ahead to can sit after the new
+            // target, where `trim_cache()` keeps them, and would hold the
+            // output buffers the new session needs to reach it.
+            self.close_cached_frames();
             *self.decode_error.borrow_mut() = None;
             self.published_since_reset.clear();
             self.decoder.configure(&self.config).map_err(|error| {
@@ -773,20 +782,63 @@ impl WebCodecsDecoder {
             Some(replaced) => replaced.close(),
             None => self.cache_order.push_back(index),
         }
-        // The decoder emits a batch of frames between two turns of `get()`'s
-        // loop, so the frame being waited for can be the oldest of a batch
-        // larger than the cache; it is the one frame that must stay.
-        let capacity = (self.limits.max_cached_frames as usize).clamp(1, MAX_OPEN_FRAMES);
-        while self.cache.len() > capacity {
-            let Some(position) = self.cache_order.iter().position(|&cached| cached != wanted)
+        self.trim_cache(wanted);
+    }
+
+    /// Closes cached frames until at most `MAX_OPEN_FRAMES` of them are
+    /// presented at or before `wanted`, and the whole cache fits
+    /// `Limits::max_cached_frames`. `wanted` itself always stays.
+    ///
+    /// Frames after `wanted` are the ones sequential playback asks for next,
+    /// and the decoder never emits a frame twice without a reset, so closing
+    /// one of them makes the request that reaches it re-decode from the
+    /// random-access point: on a track coded as a single group of pictures,
+    /// from frame 0. Evicting by age did that to every frame but the newest few
+    /// of each batch the decoder ran ahead with while the caller was between
+    /// requests, so a page playing the track paid for a decode from the key
+    /// frame every other frame (issue #655). They cannot starve the decoder of
+    /// output buffers on the way to `wanted` either: it emits in presentation
+    /// order, so none of them exists until `wanted` does, and the next request
+    /// past them closes them as frames behind it.
+    fn trim_cache(&mut self, wanted: FrameIndex) {
+        let history = (self.limits.max_cached_frames as usize).clamp(1, MAX_OPEN_FRAMES);
+        while self
+            .cache_order
+            .iter()
+            .filter(|&&cached| cached <= wanted)
+            .count()
+            > history
+        {
+            let Some(oldest) = self
+                .cache_order
+                .iter()
+                .copied()
+                .filter(|&cached| cached < wanted)
+                .min()
             else {
                 break;
             };
-            if let Some(oldest) = self.cache_order.remove(position)
-                && let Some(frame) = self.cache.remove(&oldest)
-            {
-                frame.close();
-            }
+            self.evict(oldest);
+        }
+        let capacity = (self.limits.max_cached_frames as usize).max(1);
+        while self.cache.len() > capacity {
+            let Some(furthest) = self
+                .cache_order
+                .iter()
+                .copied()
+                .filter(|&cached| cached > wanted)
+                .max()
+            else {
+                break;
+            };
+            self.evict(furthest);
+        }
+    }
+
+    fn evict(&mut self, index: FrameIndex) {
+        self.cache_order.retain(|&cached| cached != index);
+        if let Some(frame) = self.cache.remove(&index) {
+            frame.close();
         }
     }
 
