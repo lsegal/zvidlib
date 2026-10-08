@@ -53,9 +53,10 @@ const MAX_IN_FLIGHT_CHUNKS: u32 = 16;
 /// closed. Chrome's stalls with as few as ten frames held (its hardware HEVC
 /// decoder on Windows) or fourteen (its software AV1 decoder), so a cache of 32
 /// open frames left `get()` waiting forever for a frame the decoder could not
-/// produce, a dozen frames into any track. Frames the decoder emits ahead of the
-/// one asked for are still kept up to this bound, which is what lets sequential
-/// reads continue the decode session instead of resetting it.
+/// produce, a dozen frames into any track. The bound is on frames at or before
+/// the one asked for: frames the decoder emits after it are kept up to
+/// `Limits::max_cached_frames`, which is what lets sequential reads continue the
+/// decode session instead of resetting it (see `trim_cache()`).
 const MAX_OPEN_FRAMES: usize = 4;
 
 /// Resolves `resolve` on the next event-loop turn.
@@ -584,6 +585,10 @@ impl WebCodecsDecoder {
         cancellation: &CancellationToken,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
         cancellation.check()?;
+        // Frames this request has moved past are closed before anything is
+        // awaited, so the decoder's output buffers they hold are free for the
+        // frames it still has to emit on the way to this one.
+        self.trim_cache(presentation_index);
         if let Some(frame) = self.cache.get(&presentation_index) {
             return self.copy_frame_rgba(frame).await;
         }
@@ -627,6 +632,10 @@ impl WebCodecsDecoder {
                 normalize_js_error(error, "resetting the WebCodecs VideoDecoder")
             })?;
             self.close_pending_frames();
+            // Frames the old session ran ahead to can sit after the new
+            // target, where `trim_cache()` keeps them, and would hold the
+            // output buffers the new session needs to reach it.
+            self.close_cached_frames();
             *self.decode_error.borrow_mut() = None;
             self.published_since_reset.clear();
             self.decoder.configure(&self.config).map_err(|error| {
@@ -773,20 +782,63 @@ impl WebCodecsDecoder {
             Some(replaced) => replaced.close(),
             None => self.cache_order.push_back(index),
         }
-        // The decoder emits a batch of frames between two turns of `get()`'s
-        // loop, so the frame being waited for can be the oldest of a batch
-        // larger than the cache; it is the one frame that must stay.
-        let capacity = (self.limits.max_cached_frames as usize).clamp(1, MAX_OPEN_FRAMES);
-        while self.cache.len() > capacity {
-            let Some(position) = self.cache_order.iter().position(|&cached| cached != wanted)
+        self.trim_cache(wanted);
+    }
+
+    /// Closes cached frames until at most `MAX_OPEN_FRAMES` of them are
+    /// presented at or before `wanted`, and the whole cache fits
+    /// `Limits::max_cached_frames`. `wanted` itself always stays.
+    ///
+    /// Frames after `wanted` are the ones sequential playback asks for next,
+    /// and the decoder never emits a frame twice without a reset, so closing
+    /// one of them makes the request that reaches it re-decode from the
+    /// random-access point: on a track coded as a single group of pictures,
+    /// from frame 0. Evicting by age did that to every frame but the newest few
+    /// of each batch the decoder ran ahead with while the caller was between
+    /// requests, so a page playing the track paid for a decode from the key
+    /// frame every other frame (issue #655). They cannot starve the decoder of
+    /// output buffers on the way to `wanted` either: it emits in presentation
+    /// order, so none of them exists until `wanted` does, and the next request
+    /// past them closes them as frames behind it.
+    fn trim_cache(&mut self, wanted: FrameIndex) {
+        let history = (self.limits.max_cached_frames as usize).clamp(1, MAX_OPEN_FRAMES);
+        while self
+            .cache_order
+            .iter()
+            .filter(|&&cached| cached <= wanted)
+            .count()
+            > history
+        {
+            let Some(oldest) = self
+                .cache_order
+                .iter()
+                .copied()
+                .filter(|&cached| cached < wanted)
+                .min()
             else {
                 break;
             };
-            if let Some(oldest) = self.cache_order.remove(position)
-                && let Some(frame) = self.cache.remove(&oldest)
-            {
-                frame.close();
-            }
+            self.evict(oldest);
+        }
+        let capacity = (self.limits.max_cached_frames as usize).max(1);
+        while self.cache.len() > capacity {
+            let Some(furthest) = self
+                .cache_order
+                .iter()
+                .copied()
+                .filter(|&cached| cached > wanted)
+                .max()
+            else {
+                break;
+            };
+            self.evict(furthest);
+        }
+    }
+
+    fn evict(&mut self, index: FrameIndex) {
+        self.cache_order.retain(|&cached| cached != index);
+        if let Some(frame) = self.cache.remove(&index) {
+            frame.close();
         }
     }
 
@@ -1462,6 +1514,56 @@ mod tests {
                 result.unwrap_or_else(|error| panic!("frame {frame}: {error:?}"));
             assert_eq!((dimensions.width, dimensions.height), (960, 540));
             assert_eq!(rgba.len(), 960 * 540 * 4);
+        }
+    }
+
+    /// Issue #655: reads paced like playback, with time between them for the
+    /// decoder to run ahead, continue one decode session instead of resetting
+    /// it. Evicting by age closed the frames the decoder emitted ahead of each
+    /// read, so on this single group of pictures every other read re-decoded
+    /// the track from frame 0.
+    #[wasm_bindgen_test(async)]
+    async fn paced_sequential_reads_keep_the_frames_the_decoder_ran_ahead_to() {
+        const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let mut session = WebVideoDecodeSession::open(COLOR_AV1, 0, &Limits::default())
+            .await
+            .unwrap();
+        if session.is_software() {
+            return;
+        }
+        for frame in 0..24 {
+            let index = FrameIndex(frame);
+            if frame > 0 {
+                let DecodeBackend::WebCodecs(decoder) = &session.backend else {
+                    unreachable!("checked above");
+                };
+                let position = decoder.decode_position_by_presentation[&index];
+                assert!(
+                    decoder.cache.contains_key(&index)
+                        || can_continue_session(
+                            decoder.next_decode_position,
+                            decoder.session_start,
+                            decoder.nearest_random_access(position),
+                            &decoder.published_since_reset,
+                            index,
+                        ),
+                    "reading frame {frame} would reset the decoder"
+                );
+            }
+            session
+                .get(index, &CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| panic!("frame {frame}: {error:?}"));
+            let pause = js_sys::Promise::new(&mut |resolve, _reject| {
+                let set_timeout: js_sys::Function =
+                    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+                        .unwrap()
+                        .unchecked_into();
+                set_timeout
+                    .call2(&JsValue::NULL, &resolve, &JsValue::from_f64(40.0))
+                    .unwrap();
+            });
+            JsFuture::from(pause).await.unwrap();
         }
     }
 
