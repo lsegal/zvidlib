@@ -317,10 +317,46 @@ impl Mp4Track {
     /// The decoded PCM interval of every AAC packet, from the sample table's
     /// durations alone. Reads no sample data.
     pub(crate) fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
+        self.table_decoded_ranges(&self.samples, sample_rate)
+    }
+
+    /// The decoded PCM interval of every Opus packet: the sample table's
+    /// durations for all but the last, and `last_packet_samples`, read from
+    /// the last packet's own table of contents, for that one. A muxer shortens
+    /// the last sample's duration to trim the stream's end, as
+    /// [`Self::to_encoded_audio_samples`] explains, so the table cannot give
+    /// it. Reads no sample data.
+    pub(crate) fn opus_decoded_ranges(
+        &self,
+        last_packet_samples: u32,
+    ) -> Result<Vec<crate::SampleRange>> {
+        let (_, leading) = self
+            .samples
+            .split_last()
+            .ok_or_else(|| malformed("audio track contains no samples"))?;
+        let mut ranges = self.table_decoded_ranges(leading, OPUS_SAMPLE_RATE)?;
+        let start = ranges.last().map_or(0, |range| range.end);
+        let end = start
+            .checked_add(u64::from(last_packet_samples))
+            .ok_or_else(|| limit("audio track timing overflow"))?;
+        if end <= start {
+            return Err(malformed("audio packet has an empty decoded interval"));
+        }
+        ranges.push(crate::SampleRange::new(start, end)?);
+        Ok(ranges)
+    }
+
+    /// The decoded PCM interval of each of `samples`, the track's leading
+    /// samples, from their sample-table durations.
+    fn table_decoded_ranges(
+        &self,
+        samples: &[Mp4Sample],
+        sample_rate: u32,
+    ) -> Result<Vec<crate::SampleRange>> {
         let mut decoded_start = 0_u64;
         let mut track_ticks = 0_u64;
-        let mut ranges = Vec::with_capacity(self.samples.len());
-        for sample in &self.samples {
+        let mut ranges = Vec::with_capacity(samples.len());
+        for sample in samples {
             track_ticks = track_ticks
                 .checked_add(u64::from(sample.duration))
                 .ok_or_else(|| limit("audio track timing overflow"))?;
@@ -2655,8 +2691,8 @@ mod tests {
         }
     }
 
-    /// Issue #676: Opus and Vorbis tracks, and video tracks, still need
-    /// caller-supplied ranges, so the AAC constructor rejects them.
+    /// Issue #676: Opus and Vorbis tracks, and video tracks, need intervals
+    /// the AAC constructor cannot give, so it rejects them.
     #[test]
     fn a_loader_rejects_an_aac_packet_provider_for_other_tracks() {
         let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
@@ -2680,6 +2716,109 @@ mod tests {
             .aac_packet_provider()
             .err()
             .expect("a video track is rejected");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    /// A synthetic Opus track of packets with the given table-of-contents
+    /// bytes and sample-table durations, stored back to back, with the bytes
+    /// of the file that holds them.
+    fn opus_track_and_bytes(packets: &[(u8, u32)]) -> (Mp4Track, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut samples = Vec::new();
+        let mut dts = 0_u64;
+        for (index, &(toc, duration)) in packets.iter().enumerate() {
+            samples.push(Mp4Sample {
+                offset: bytes.len() as u64,
+                size: 4,
+                dts,
+                pts: dts as i64,
+                duration,
+                dependency: SampleDependency::INDEPENDENT,
+                is_sync: true,
+            });
+            bytes.extend_from_slice(&[toc, index as u8, 0, 0]);
+            dts += u64::from(duration);
+        }
+        let track = Mp4Track {
+            id: 1,
+            kind: TrackKind::Audio,
+            codec: Codec::Opus,
+            timescale: OPUS_SAMPLE_RATE,
+            duration: dts,
+            dimensions: None,
+            channels: Some(2),
+            sample_rate: Some(OPUS_SAMPLE_RATE),
+            decoder_config: OpusHead::new(2, 312, 48_000).unwrap().to_dops(),
+            edits: Vec::new(),
+            presentation_order: (0..packets.len()).collect(),
+            samples,
+        };
+        (track, bytes)
+    }
+
+    /// 20 ms CELT packets (TOC 0xF8), a 10 ms one (0xF0), and a last 20 ms
+    /// packet whose sample-table duration trims the stream's end to 300.
+    const OPUS_PACKETS: [(u8, u32); 5] = [
+        (0xF8, 960),
+        (0xF8, 960),
+        (0xF0, 480),
+        (0xF8, 960),
+        (0xF8, 300),
+    ];
+
+    /// Issue #681: a loader builds an Opus track's prefetched provider with
+    /// exactly the decoded ranges the eager path reads from every packet,
+    /// reading only the last packet's first two bytes to do it.
+    #[test]
+    fn a_loader_builds_an_opus_packet_provider_reading_only_the_last_packets_header() {
+        let (track, bytes) = opus_track_and_bytes(&OPUS_PACKETS);
+        let eager = block_on(
+            track.to_encoded_audio_samples(&MemorySource::new(bytes.clone()), &Limits::default()),
+        )
+        .unwrap();
+        assert_eq!(eager.last().unwrap().decoded_range.len(), 960);
+        let source = CountingSource {
+            inner: MemorySource::new(bytes),
+            bytes_read: Cell::new(0),
+        };
+        let loader = crate::Mp4SampleLoader::new(track, source, 1 << 20).unwrap();
+        let provider = block_on(loader.opus_packet_provider()).unwrap();
+        assert_eq!(loader.source().bytes_read.get(), 2);
+        assert_eq!(provider.len(), eager.len());
+        for (index, expected) in eager.iter().enumerate() {
+            assert_eq!(provider.decoded_range(index), expected.decoded_range);
+        }
+        assert_eq!(provider.read(2).unwrap_err().kind(), ErrorKind::WouldBlock);
+        block_on(loader.load_missing()).unwrap();
+        assert_eq!(provider.read(2).unwrap().as_ref(), eager[2].data);
+    }
+
+    /// Issue #681: a packet whose table of contents disagrees with its
+    /// sample-table duration is refused when it is read, rather than played
+    /// at the wrong time; the packets before it still read.
+    #[test]
+    fn an_opus_packet_provider_refuses_a_packet_its_sample_table_mistimes() {
+        let mut packets = OPUS_PACKETS;
+        // A 10 ms packet the table says lasts 20 ms.
+        packets[2].1 = 960;
+        let (track, bytes) = opus_track_and_bytes(&packets);
+        let loader = crate::Mp4SampleLoader::new(track, MemorySource::new(bytes), 1 << 20).unwrap();
+        let provider = block_on(loader.opus_packet_provider()).unwrap();
+        block_on(loader.load(0..packets.len(), 0)).unwrap();
+        provider.read(1).unwrap();
+        assert_eq!(
+            provider.read(2).unwrap_err().kind(),
+            ErrorKind::MalformedMedia
+        );
+    }
+
+    #[test]
+    fn a_loader_rejects_an_opus_packet_provider_for_other_tracks() {
+        let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
+        let loader = crate::Mp4SampleLoader::new(aac, MemorySource::new(bytes), 1 << 20).unwrap();
+        let error = block_on(loader.opus_packet_provider())
+            .err()
+            .expect("an AAC track is rejected");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
     }
 
