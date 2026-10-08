@@ -517,14 +517,18 @@ fn playback_plays_and_seeks_with_vorbis_audio_over_a_suspending_source() {
         let anchor = Cell::new((0_u64, 0_u64));
         let present = |playback: &mut PlaybackController<_, _, _>, frame: u64| {
             let (clock, media) = anchor.get();
-            let start = timeline.audio_interval_for_frame(FrameIndex(frame)).unwrap();
+            let start = timeline
+                .audio_interval_for_frame(FrameIndex(frame))
+                .unwrap();
             *backend.clock.lock().unwrap() = clock + start.start - media;
             let (presentation, _) = until_loaded(playback, |playback| playback.present());
             assert_eq!(presentation.frame, Some(FrameIndex(frame)), "{name}");
         };
         let seek = |playback: &mut PlaybackController<_, _, _>, frame: u64| {
             playback.seek(FrameIndex(frame)).unwrap();
-            let start = timeline.audio_interval_for_frame(FrameIndex(frame)).unwrap();
+            let start = timeline
+                .audio_interval_for_frame(FrameIndex(frame))
+                .unwrap();
             anchor.set((*backend.clock.lock().unwrap(), start.start));
         };
         for frame in [0, 1, 2, 4] {

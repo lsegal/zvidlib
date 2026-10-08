@@ -195,9 +195,7 @@ impl VorbisConfig {
     /// the packet type bit and at most six bits of mode. So the intervals of a
     /// whole stream need only the first byte of each packet, which is how an
     /// on-demand reader indexes a Vorbis track without reading its packets.
-    pub fn decoded_ranges(
-        block_sizes: impl IntoIterator<Item = u16>,
-    ) -> Result<Vec<SampleRange>> {
+    pub fn decoded_ranges(block_sizes: impl IntoIterator<Item = u16>) -> Result<Vec<SampleRange>> {
         let mut previous = None;
         let mut end = 0_u64;
         block_sizes

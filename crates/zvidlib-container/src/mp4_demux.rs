@@ -2801,7 +2801,10 @@ mod tests {
             synchronous.source().bytes_read.get(),
             eager[5].data.len() as u64
         );
-        assert_eq!(prefetched.read(5).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(
+            prefetched.read(5).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
         block_on(loader.load_missing()).unwrap();
         assert_eq!(prefetched.read(5).unwrap().as_ref(), eager[5].data);
     }

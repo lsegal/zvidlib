@@ -659,9 +659,9 @@ impl ParsedBlock {
             };
             if track.codec == Codec::Vorbis {
                 // A frame is never empty, so its first byte was read.
-                track.vorbis_packet_heads.push(
-                    first_byte.ok_or_else(|| malformed("WebM block header is truncated"))?,
-                );
+                track
+                    .vorbis_packet_heads
+                    .push(first_byte.ok_or_else(|| malformed("WebM block header is truncated"))?);
             }
             track.frames.push(Frame {
                 offset,
