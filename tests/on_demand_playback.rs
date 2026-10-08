@@ -166,6 +166,15 @@ fn bundled() -> Bundled {
     }
 }
 
+/// A small frame cache: the bundled sample is 1080p and CI decodes it in
+/// software, so every cached frame is a conversion paid on each walk.
+fn video_limits() -> Limits {
+    Limits {
+        max_cached_frames: 4,
+        ..Limits::default()
+    }
+}
+
 fn video_configuration(track: &Mp4Track) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: track.codec,
@@ -173,7 +182,7 @@ fn video_configuration(track: &Mp4Track) -> VideoDecoderConfig {
         coded_dimensions: track.dimensions.unwrap(),
         output_format: PixelFormat::Rgba8,
         color_range: ColorRange::Limited,
-        hardware: HardwarePreference::Prefer,
+        hardware: HardwarePreference::Avoid,
         configuration: track.decoder_config.clone(),
     }
 }
@@ -220,7 +229,7 @@ impl Bundled {
             &native_hevc_video_decoder_factory(),
             video_configuration(&self.video),
             samples,
-            Limits::default(),
+            video_limits(),
         )
         .unwrap()
     }
@@ -283,7 +292,7 @@ fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
         &native_hevc_video_decoder_factory(),
         video_configuration(&bundled.video),
         Box::new(Mp4SampleProvider::new(bundled.video.clone(), cache).unwrap()),
-        Limits::default(),
+        video_limits(),
     )
     .unwrap();
     let audio = bundled.audio_reader(Box::new(bundled.eager_audio_packets()));
@@ -310,7 +319,7 @@ fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
             eager.get(FrameIndex(frame), &cancellation).unwrap().planes[0].data
         );
     }
-    let target = 100;
+    let target = 48;
     playback.seek(FrameIndex(target)).unwrap();
     let (presentation, picture) = playback.present().unwrap();
     assert_eq!(presentation.frame, Some(FrameIndex(target)));
@@ -346,9 +355,9 @@ where
 /// Browser playback: every read of the source suspends, so the controller's
 /// synchronous calls must never be the ones to read it. They report
 /// `WouldBlock`, the prefetch loads what they were missing, and the frames and
-/// audio are exactly the eager path's. The video budget is a tenth of the
-/// track, smaller than the walk to frame 400 of its single group of pictures,
-/// so that walk streams through the budget over several prefetches.
+/// audio are exactly the eager path's. The video budget holds only the first
+/// 24 samples of the track's single group of pictures, so the walk to frame
+/// 60 streams through it over several prefetches.
 #[test]
 fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source() {
     let bundled = bundled();
@@ -358,7 +367,11 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         .iter()
         .map(|sample| u64::from(sample.size))
         .sum();
-    let video_budget = total_video_bytes / 10;
+    let video_budget: u64 = bundled.video.samples[..24]
+        .iter()
+        .map(|sample| u64::from(sample.size))
+        .sum();
+    assert!(video_budget < total_video_bytes / 10);
     let video_loader = Mp4SampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
@@ -369,7 +382,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         &native_hevc_video_decoder_factory(),
         video_configuration(&bundled.video),
         Box::new(video_loader.sample_provider().unwrap()),
-        Limits::default(),
+        video_limits(),
     )
     .unwrap();
     let video = OnDemandVideoSource::new(video_reader, video_loader, 16);
@@ -436,19 +449,19 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
     for frame in [0, 1, 2, 3, 8] {
         present(&mut playback, frame);
     }
-    seek(&mut playback, 400);
-    present(&mut playback, 400);
-    seek(&mut playback, 40);
-    present(&mut playback, 40);
-    present(&mut playback, 41);
+    seek(&mut playback, 60);
+    present(&mut playback, 60);
+    seek(&mut playback, 20);
+    present(&mut playback, 20);
+    present(&mut playback, 21);
 
     // Paused, the current frame comes through the same loop.
     playback.pause().unwrap();
-    seek(&mut playback, 200);
+    seek(&mut playback, 30);
     let (picture, _) = until_loaded(&mut playback, |playback| playback.current_frame());
     assert_eq!(
         picture.planes[0].data,
-        eager.get(FrameIndex(200), &cancellation).unwrap().planes[0].data
+        eager.get(FrameIndex(30), &cancellation).unwrap().planes[0].data
     );
 
     assert_scheduled_audio_matches(&bundled, &backend.scheduled.lock().unwrap());
@@ -469,7 +482,7 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
         &native_hevc_video_decoder_factory(),
         video_configuration(&bundled.video),
         Box::new(video_loader.sample_provider().unwrap()),
-        Limits::default(),
+        video_limits(),
     )
     .unwrap();
     let audio_loader = Mp4SampleLoader::new(
