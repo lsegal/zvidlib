@@ -11,7 +11,7 @@
 //! `#[target_feature]`: they are `#[inline(always)]` and are only ever reached
 //! from a wrapper function that already carries the required feature, so LLVM
 //! inlines them with the wrapper's feature set. Calling one from a context that
-//! has not verified CPU support is undefined behaviour, which is why every
+//! has not verified CPU support is undefined behavior, which is why every
 //! method is `unsafe` and every dispatcher in [`super`] checks support first.
 
 #![allow(clippy::missing_safety_doc)]
@@ -612,7 +612,7 @@ mod x86 {
             unsafe {
                 // Two 128-bit loads and a `vinserti128`: three micro-operations
                 // against the eight lanes of work they feed, amortized over the
-                // eight neighbours an iteration reads.
+                // eight neighbors an iteration reads.
                 let lo = _mm_loadu_si128(low.as_ptr().cast());
                 let hi = _mm_loadu_si128(high.as_ptr().cast());
                 Self(_mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi))

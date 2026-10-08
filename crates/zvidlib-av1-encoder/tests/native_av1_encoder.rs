@@ -327,7 +327,7 @@ fn edges_pattern(width: u32, height: u32) -> Vec<u8> {
 /// and *before* `eob_pt`; this encoder and both in-tree decoders used to code it
 /// after the coefficients instead, so ffmpeg 7.1 (dav1d) desynchronized on the
 /// first coded transform block of every non-lossless frame and reconstructed
-/// noise. §9.3's neighbour-derived `tx_depth` context was also pinned to 0.
+/// noise. §9.3's neighbor-derived `tx_depth` context was also pinned to 0.
 ///
 /// This asserts a real distortion bound across two quantizers, two frame sizes
 /// and two content patterns, which is what the earlier header-only assertion

@@ -1,5 +1,5 @@
 //! AV1 OBU framing (§5.3, Annex B), the non-reduced sequence header (§5.5), and the lossless
-//! intra-keyframe uncompressed frame header (§5.9.2), specialised to the M0 config.
+//! intra-keyframe uncompressed frame header (§5.9.2), specialized to the M0 config.
 //!
 //! The sequence header is non-reduced with `enable_order_hint = 1` and every other optional tool
 //! disabled, matching the bounded subset [`crate::av1_inter_decoder::Av1InterDecoder`] accepts
@@ -187,7 +187,7 @@ pub(crate) fn sequence_header_payload(cfg: &Av1StillConfig, width: u32, height: 
 /// `base_q_idx` selects the two quantization profiles the crate implements (§5.9.12): `0` is
 /// `CodedLossless`, which suppresses `loop_filter_params` and `read_tx_mode` entirely, and any
 /// other value is the non-lossless profile, which signals both. The loop filter is always
-/// signalled off — the encoder reconstructs without deblocking, so a nonzero level would make
+/// signaled off — the encoder reconstructs without deblocking, so a nonzero level would make
 /// its reconstruction disagree with the decoder's — and `tx_mode_select` is always
 /// `TX_MODE_SELECT`, since the encoder chooses a transform size per coding block.
 ///

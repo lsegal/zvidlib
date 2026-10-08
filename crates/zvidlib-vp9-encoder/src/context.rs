@@ -158,7 +158,7 @@ pub(super) struct FrameCounts {
     /// end-of-block node was read.
     pub(super) eob_branch: [EobCounts; 4],
     /// Per transform size and coefficient context: the tokens past ONE,
-    /// which the decoder does not count. Their probabilities are modelled
+    /// which the decoder does not count. Their probabilities are modeled
     /// from the third node's, so the encoder weighs updates of that node by
     /// every one of them.
     pub(super) larger_tokens: [LargerTokenCounts; 4],
@@ -279,7 +279,7 @@ impl FrameContext {
 
 impl FrameContext {
     /// The coefficient probabilities a frame whose tokens `counts` counted
-    /// should code with, as forward updates of `self`'s signalled in its
+    /// should code with, as forward updates of `self`'s signaled in its
     /// compressed header, for the first `tx_sizes` transform sizes (libvpx's
     /// `update_coef_probs_common`, two-loop search). Each probability moves
     /// to the value between its own and the counts' that saves the most

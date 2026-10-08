@@ -123,7 +123,7 @@ pub fn create_vp8(
 }
 
 /// Creates an NVDEC VP9 profile 0 decoder. Its pictures are converted by the software decoder's
-/// own conversion, with the colour each frame's header names, so both return the same frames.
+/// own conversion, with the color each frame's header names, so both return the same frames.
 pub fn create_vp9(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
@@ -156,7 +156,7 @@ enum Bitstream {
     /// One VP9 chunk per sample, its frames passed to the parser one packet each. Every sample
     /// shows exactly one frame, possibly after hidden ones or by `show_existing_frame`, and VP9
     /// never reorders, so pictures are displayed as soon as they are decoded; they are cropped
-    /// on readback like VP8's. `inspector` reads each chunk's headers for the size and colour
+    /// on readback like VP8's. `inspector` reads each chunk's headers for the size and color
     /// of the frame it shows, which `shown` holds until that frame is displayed.
     ///
     /// The cuvid parser decodes a `show_existing_frame` header but never displays it, so the
@@ -393,10 +393,10 @@ impl NvDecoderCore {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if matches!(self.bitstream, Bitstream::Vp9 { .. }) {
             self.submit_vp9(sample)?;
-            check_cancelled(cancellation)?;
+            check_canceled(cancellation)?;
             return self.take_frames();
         }
         let (data, displayed) = match &self.bitstream {
@@ -441,7 +441,7 @@ impl NvDecoderCore {
             timestamp,
         };
         self.parse(&mut packet)?;
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         self.take_frames()
     }
 
@@ -531,13 +531,13 @@ impl NvDecoderCore {
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         let mut packet = CuvidSourceDataPacket {
             flags: CUVID_PKT_ENDOFSTREAM,
             ..CuvidSourceDataPacket::zeroed()
         };
         self.parse(&mut packet)?;
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         self.take_frames()
     }
 
@@ -1040,7 +1040,7 @@ fn read_back(
     let mut pitch = 0_u32;
     // NVDEC's surface-copy phase is the whole map/`cuMemcpyDtoH`/unmap
     // sequence: on a discrete GPU this is the PCIe transfer, and it is the
-    // half of readback the colour conversion below cannot account for.
+    // half of readback the color conversion below cannot account for.
     let surface_copy = readback::Timer::start();
     let mapped = unsafe {
         (state.api.cuvid_map_video_frame)(
@@ -1093,7 +1093,7 @@ fn read_back(
 /// and chose not to read it back - so it consumes the identity at the front of the heap just as a
 /// converted one does. Dropping the entry instead would shift every later frame onto the identity
 /// of the picture before it, which is silent corruption rather than an error: the frames would
-/// still be well-formed, just labelled wrong.
+/// still be well-formed, just labeled wrong.
 fn claim_identities(
     displayed: Vec<Option<RawNv12Frame>>,
     identities: &mut BinaryHeap<Reverse<FrameIndex>>,
@@ -1226,12 +1226,9 @@ fn append_annex_b_unit(output: &mut Vec<u8>, unit: &super::engine::nal::NalUnit)
     output.extend_from_slice(&unit.escaped);
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
-        ))
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
+        Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
     } else {
         Ok(())
     }

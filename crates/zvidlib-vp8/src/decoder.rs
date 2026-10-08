@@ -59,7 +59,7 @@ pub(super) struct MacroblockInfo {
     pub(super) reference: usize,
     pub(super) mv: MotionVector,
     /// Subblock intra modes; for a whole-macroblock intra mode, the subblock
-    /// mode it implies for its neighbours' contexts.
+    /// mode it implies for its neighbors' contexts.
     pub(super) b_modes: [u8; 16],
     /// Subblock motion vectors; every one equals `mv` unless split.
     pub(super) mvs: [MotionVector; 16],
@@ -218,7 +218,7 @@ impl Decoder {
         let mut header = BoolDecoder::new(first_partition);
 
         if key_frame {
-            // Colour space and clamping type: VP8 defines a single colour
+            // Color space and clamping type: VP8 defines a single color
             // space, and libvpx clamps reconstructed pixels either way.
             header.read_literal(2);
         }
@@ -922,23 +922,23 @@ pub(super) struct NearMvs {
 /// Ranks the motion vectors of the above, left and above-left macroblocks
 /// (RFC 6386 section 18.3).
 pub(super) fn find_near_mvs(
-    neighbours: [&MacroblockInfo; 3],
+    neighbors: [&MacroblockInfo; 3],
     reference: usize,
     sign_bias: &[bool; 4],
 ) -> NearMvs {
     let mut mvs = [MotionVector::ZERO; 4];
     let mut counts = [0usize; 4];
     let mut last = 0usize;
-    for (neighbour, weight) in neighbours.into_iter().zip([2, 2, 1]) {
-        if neighbour.reference == INTRA_FRAME {
+    for (neighbor, weight) in neighbors.into_iter().zip([2, 2, 1]) {
+        if neighbor.reference == INTRA_FRAME {
             continue;
         }
-        if neighbour.mv.is_zero() {
+        if neighbor.mv.is_zero() {
             counts[0] += weight;
             continue;
         }
-        let mut mv = neighbour.mv;
-        if sign_bias[neighbour.reference] != sign_bias[reference] {
+        let mut mv = neighbor.mv;
+        if sign_bias[neighbor.reference] != sign_bias[reference] {
             mv = MotionVector {
                 x: mv.x.wrapping_neg(),
                 y: mv.y.wrapping_neg(),
@@ -956,9 +956,9 @@ pub(super) fn find_near_mvs(
     if counts[3] > 0 && mvs[3] == mvs[1] {
         counts[1] += 1;
     }
-    counts[3] = usize::from(neighbours[0].y_mode == SPLITMV) * 2
-        + usize::from(neighbours[1].y_mode == SPLITMV) * 2
-        + usize::from(neighbours[2].y_mode == SPLITMV);
+    counts[3] = usize::from(neighbors[0].y_mode == SPLITMV) * 2
+        + usize::from(neighbors[1].y_mode == SPLITMV) * 2
+        + usize::from(neighbors[2].y_mode == SPLITMV);
     if counts[2] > counts[1] {
         counts.swap(1, 2);
         mvs.swap(1, 2);

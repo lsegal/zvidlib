@@ -8,7 +8,7 @@
 //! `#[inline(always)]` and only ever reached from a wrapper that already
 //! carries the feature, so LLVM inlines them with the wrapper's feature set.
 //! Calling one from a context that has not verified CPU support is undefined
-//! behaviour, which is why every method is `unsafe`.
+//! behavior, which is why every method is `unsafe`.
 //!
 //! Only operations that IEEE 754 defines exactly lane by lane are offered -
 //! add, subtract, multiply, sign flip, ordered compare, select and lane

@@ -10,7 +10,7 @@ dependency, and zvidlib's native codec implementations may not call or link it.
 (issue #527). The first is 48 frames at 256x144 in two groups of pictures,
 encoded in two passes so that libvpx codes hidden alternate reference frames,
 each carried in a superframe with the frame shown after it; the second is 12
-frames at 250x142, whose edges are not a multiple of 8. Both leave their colour
+frames at 250x142, whose edges are not a multiple of 8. Both leave their color
 space unspecified and use studio range. They were generated offline with
 FFmpeg 6.0's libvpx wrapper:
 

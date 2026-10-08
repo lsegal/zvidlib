@@ -59,7 +59,7 @@ test("a walk continues forwards and restarts backwards", () => {
   assert.equal(scrubWalkStart(2, 5, rate, KEYFRAMES), 5);
   // Already there.
   assert.equal(scrubWalkStart(5, 5, rate, KEYFRAMES), 5);
-  // Behind the reader, or a position a cancelled decode left unknown: restart at the
+  // Behind the reader, or a position a canceled decode left unknown: restart at the
   // random-access point the target decodes from, which is the first frame it can draw.
   assert.equal(scrubWalkStart(11, 6, rate, KEYFRAMES), 4);
   assert.equal(scrubWalkStart(null, 6, rate, KEYFRAMES), 4);

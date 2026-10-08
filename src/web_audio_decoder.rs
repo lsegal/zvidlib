@@ -253,7 +253,7 @@ impl WebAudioDecodeSession {
                 .await;
             match result {
                 Ok(buffer) => return Ok(buffer),
-                Err(error) if error.kind() == ErrorKind::Cancelled => return Err(error),
+                Err(error) if error.kind() == ErrorKind::Canceled => return Err(error),
                 Err(error) if !self.has_software => return Err(error),
                 Err(_) => {
                     // The browser's decode does not line up with the track.

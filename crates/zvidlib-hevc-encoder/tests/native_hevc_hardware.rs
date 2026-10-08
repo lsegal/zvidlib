@@ -309,7 +309,7 @@ fn hardware_readback_seam_attributes_each_decoded_frame() {
         report.total()
     );
     eprintln!(
-        "readback over {} frames: surface copy {:?}, colour convert {:?}",
+        "readback over {} frames: surface copy {:?}, color convert {:?}",
         report.frames, report.surface_copy, report.color_convert
     );
 }
@@ -409,7 +409,7 @@ fn hardware_encoder_available(configuration: &VideoEncoderConfig) -> bool {
     false
 }
 
-/// Smooth moving content: a diagonal gradient with a bright square travelling across it, so every
+/// Smooth moving content: a diagonal gradient with a bright square traveling across it, so every
 /// frame differs from the last and an encoder has real motion to code.
 fn rgba_frame((width, height): (u32, u32), index: u32) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);
@@ -466,7 +466,7 @@ fn encode_all(
     samples
 }
 
-/// PSNR over the colour channels of an RGBA source and a decoded RGBA frame of the same size.
+/// PSNR over the color channels of an RGBA source and a decoded RGBA frame of the same size.
 fn rgba_psnr(expected: &[u8], actual: &VideoFrame) -> f64 {
     let plane = &actual.planes[0];
     let width = actual.dimensions.width as usize * 4;
@@ -752,7 +752,7 @@ fn hardware_hevc_accepts_bgra_and_bottom_up_input() {
 /// the session down without waiting for, or emitting, the frames still inside it and leave the
 /// hardware usable; and an encoder that was finished refuses further frames.
 #[test]
-fn an_unfinished_hardware_encoder_is_cancelled_by_dropping_it() {
+fn an_unfinished_hardware_encoder_is_canceled_by_dropping_it() {
     let size = (1280, 720);
     let configuration = encoder_configuration(
         size,

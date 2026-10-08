@@ -255,7 +255,7 @@ fn decode_profiled(
 /// with a null control that reports the instrument's own noise floor.
 ///
 /// Three arms run per round, in an order that rotates from round to round so
-/// that no arm keeps a favourable position:
+/// that no arm keeps a favorable position:
 ///
 /// * **wide** — the accumulation forced off, which is the `i32` path
 ///   everywhere and so exactly what `main` executed before #404 landed.

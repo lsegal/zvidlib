@@ -7,7 +7,7 @@
 //! data the §8.5.3.3 inter-sample-prediction path
 //! ([`crate::engine::recon::reconstruct_inter_pu`]) consumes. It runs the
 //! §8.5.3.2.1 "Derivation process for motion vector components and
-//! reference indices": it gathers the §8.5.3.2.3 spatial neighbours out
+//! reference indices": it gathers the §8.5.3.2.3 spatial neighbors out
 //! of the per-block [`MotionField`], dispatches the merge-mode
 //! (§8.5.3.2.2) versus MVP (§8.5.3.2.6) candidate derivation that already
 //! lives in [`crate::engine::motion`], reconstructs each list's
@@ -18,13 +18,13 @@
 //!
 //! The arithmetic sub-processes (spatial / temporal candidate lists, MVP
 //! candidate, the MV wrap) stay in [`crate::engine::motion`]; this module owns the
-//! neighbour-location plumbing and the §8.5.3.2.1 ordered-step control
+//! neighbor-location plumbing and the §8.5.3.2.1 ordered-step control
 //! flow that ties them to the parsed PU syntax.
 
 use crate::engine::binarization::InterPredIdc;
 use crate::engine::motion::{
-    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
-    PartitionContext, RefPicId, SpatialMergeNeighbours, TemporalMvContext, build_merge_candidate,
+    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighborPu,
+    PartitionContext, RefPicId, SpatialMergeNeighbors, TemporalMvContext, build_merge_candidate,
     derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv, reconstruct_mv,
 };
 use crate::engine::slice_data::PredictionUnit;
@@ -298,24 +298,24 @@ pub struct PuGeometry {
     pub part_idx: u32,
 }
 
-/// A spatial neighbour location and whether the §6.4.2 prediction-block
+/// A spatial neighbor location and whether the §6.4.2 prediction-block
 /// availability test passed there. The driver reads the [`MotionField`]
 /// cell at `(x, y)` when `available`.
 #[derive(Debug, Clone, Copy)]
-struct NeighbourLoc {
+struct NeighborLoc {
     x: i32,
     y: i32,
     available: bool,
 }
 
-/// Read the [`NeighbourPu`] motion for a spatial neighbour, mapping the
+/// Read the [`NeighborPu`] motion for a spatial neighbor, mapping the
 /// motion field's stored reference POCs back to the current PU's reference
-/// indices (the §8.5.3.2.3 candidate copies the neighbour's `refIdxLX`,
+/// indices (the §8.5.3.2.3 candidate copies the neighbor's `refIdxLX`,
 /// which the field does not store directly).
 ///
-/// Returns `None` when the neighbour is §6.4.2-unavailable, off-picture, or
-/// covered by an intra block (intra neighbours contribute no candidate).
-fn neighbour_pu(field: &MotionField, loc: NeighbourLoc, ctx: &PuMvContext) -> Option<NeighbourPu> {
+/// Returns `None` when the neighbor is §6.4.2-unavailable, off-picture, or
+/// covered by an intra block (intra neighbors contribute no candidate).
+fn neighbor_pu(field: &MotionField, loc: NeighborLoc, ctx: &PuMvContext) -> Option<NeighborPu> {
     if !loc.available || loc.x < 0 || loc.y < 0 {
         return None;
     }
@@ -329,7 +329,7 @@ fn neighbour_pu(field: &MotionField, loc: NeighbourLoc, ctx: &PuMvContext) -> Op
     }
     // Map the stored reference POC back to a refIdx in the current PU's
     // reference list, scanning the active entries (the merge candidate
-    // carries the neighbour's refIdx, which must index *this* slice's
+    // carries the neighbor's refIdx, which must index *this* slice's
     // RefPicListX since both slices share the same DPB).
     let ref_idx_l0 = if cell.pred_flag_l0 {
         poc_to_ref_idx(0, cell.ref_poc_l0, ctx.num_ref_idx_l0_active, ctx.ref_poc)
@@ -341,7 +341,7 @@ fn neighbour_pu(field: &MotionField, loc: NeighbourLoc, ctx: &PuMvContext) -> Op
     } else {
         -1
     };
-    Some(NeighbourPu {
+    Some(NeighborPu {
         pred_flag_l0: cell.pred_flag_l0 && ref_idx_l0 >= 0,
         pred_flag_l1: cell.pred_flag_l1 && ref_idx_l1 >= 0,
         ref_idx_l0,
@@ -362,60 +362,60 @@ fn poc_to_ref_idx(x: usize, poc: i32, active: i32, ref_poc: &dyn Fn(usize, i32) 
     -1
 }
 
-/// The five §8.5.3.2.3 neighbour locations (A1, B1, B0, A0, B2) for a PU
+/// The five §8.5.3.2.3 neighbor locations (A1, B1, B0, A0, B2) for a PU
 /// at `(xPb, yPb)` of size `(nPbW, nPbH)`, with the §6.4.2 availability
 /// closure applied.
-fn spatial_neighbours(
+fn spatial_neighbors(
     field: &MotionField,
     geom: &PuGeometry,
     ctx: &PuMvContext,
     available: &dyn Fn(i32, i32) -> bool,
-) -> SpatialMergeNeighbours {
+) -> SpatialMergeNeighbors {
     let (x_pb, y_pb) = (geom.x_pb as i32, geom.y_pb as i32);
     let (w, h) = (geom.n_pb_w as i32, geom.n_pb_h as i32);
     let locs = [
         // A1 = (xPb − 1, yPb + nPbH − 1)
-        NeighbourLoc {
+        NeighborLoc {
             x: x_pb - 1,
             y: y_pb + h - 1,
             available: available(x_pb - 1, y_pb + h - 1),
         },
         // B1 = (xPb + nPbW − 1, yPb − 1)
-        NeighbourLoc {
+        NeighborLoc {
             x: x_pb + w - 1,
             y: y_pb - 1,
             available: available(x_pb + w - 1, y_pb - 1),
         },
         // B0 = (xPb + nPbW, yPb − 1)
-        NeighbourLoc {
+        NeighborLoc {
             x: x_pb + w,
             y: y_pb - 1,
             available: available(x_pb + w, y_pb - 1),
         },
         // A0 = (xPb − 1, yPb + nPbH)
-        NeighbourLoc {
+        NeighborLoc {
             x: x_pb - 1,
             y: y_pb + h,
             available: available(x_pb - 1, y_pb + h),
         },
         // B2 = (xPb − 1, yPb − 1)
-        NeighbourLoc {
+        NeighborLoc {
             x: x_pb - 1,
             y: y_pb - 1,
             available: available(x_pb - 1, y_pb - 1),
         },
     ];
-    SpatialMergeNeighbours {
-        a1: neighbour_pu(field, locs[0], ctx),
-        b1: neighbour_pu(field, locs[1], ctx),
-        b0: neighbour_pu(field, locs[2], ctx),
-        a0: neighbour_pu(field, locs[3], ctx),
-        b2: neighbour_pu(field, locs[4], ctx),
+    SpatialMergeNeighbors {
+        a1: neighbor_pu(field, locs[0], ctx),
+        b1: neighbor_pu(field, locs[1], ctx),
+        b0: neighbor_pu(field, locs[2], ctx),
+        a0: neighbor_pu(field, locs[3], ctx),
+        b2: neighbor_pu(field, locs[4], ctx),
     }
 }
 
 /// The §8.5.3.2.3 parallel-merge-region (`Log2ParMrgLevel`) test for each
-/// of the five neighbour positions — `true` when the neighbour shares the
+/// of the five neighbor positions — `true` when the neighbor shares the
 /// current PB's parallel-merge region (`xPb >> L == xNb >> L && yPb >> L ==
 /// yNb >> L`), which forces it unavailable.
 fn par_mrg_tests(geom: &PuGeometry, log2_par: u32) -> (bool, bool, bool, bool, bool) {
@@ -501,7 +501,7 @@ fn temporal_mv_for_list(
 /// indices and prediction-list utilization flags.
 ///
 /// `field` is the *current* picture's motion field as built so far (the
-/// spatial neighbours are read out of it); `geom` is the PU geometry;
+/// spatial neighbors are read out of it); `geom` is the PU geometry;
 /// `pu` is the parsed §7.3.8.6 syntax; `ctx` carries the reference-picture
 /// resolvers and slice context; `available` is the §6.4.2 prediction-block
 /// availability test (`(xNb, yNb) -> bool`).
@@ -551,7 +551,7 @@ pub struct InterCuDesc {
 /// `cu` describes the CU; `pus` are the parsed prediction units in
 /// §7.3.8.6 order (one per `partIdx`). Each PU is resolved against the
 /// motion field *as updated by the earlier PUs of the same CU* (so the
-/// second partition's A1/B1 neighbours see the first partition's motion,
+/// second partition's A1/B1 neighbors see the first partition's motion,
 /// modulo the §8.5.3.2.3 same-CU partition exclusion).
 ///
 /// Returns the resolved [`PuMotion`] for each PU (same order as `pus`), so
@@ -638,7 +638,7 @@ fn resolve_merge(
         part_mode_vertical_split: merge_geom.part_mode.is_vertical_split(),
         part_mode_horizontal_split: merge_geom.part_mode.is_horizontal_split(),
     };
-    let neigh = spatial_neighbours(field, &merge_geom, ctx, available);
+    let neigh = spatial_neighbors(field, &merge_geom, ctx, available);
     let par = par_mrg_tests(&merge_geom, ctx.log2_par_mrg_level);
     let spatial = derive_spatial_merge_candidates(&neigh, part, par);
     let col = temporal_merge_candidate(&merge_geom, ctx, ctx.slice_is_b);
@@ -703,9 +703,9 @@ fn resolve_amvp(
     let uses_l1 = matches!(idc, InterPredIdc::PredL1 | InterPredIdc::PredBi);
 
     // The §8.5.3.2.7 A/B MVP derivation reads the raw §6.4.2-gated
-    // neighbours; the §8.5.3.2.3 merge redundancy / partition-exclusion
+    // neighbors; the §8.5.3.2.3 merge redundancy / partition-exclusion
     // and the parallel-merge-region test apply only to merge mode.
-    let neigh = spatial_neighbours(field, geom, ctx, available);
+    let neigh = spatial_neighbors(field, geom, ctx, available);
 
     let mut out = PuMotion {
         ref_idx_l0: -1,
@@ -764,7 +764,7 @@ fn resolve_amvp(
 }
 
 /// §8.5.3.2.8 — the temporal MVP `mvLXCol` for the AMVP branch (one list,
-/// the PU's signalled `refIdxLX`).
+/// the PU's signaled `refIdxLX`).
 fn temporal_mvp(geom: &PuGeometry, ctx: &PuMvContext, x: usize, ref_idx: i32) -> Option<Mv> {
     if !ctx.temporal_mvp_enabled {
         return None;
@@ -922,8 +922,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_picks_left_neighbour_motion() {
-        // Left neighbour A1 carries an L0 MV referencing POC 0; the merge
+    fn merge_picks_left_neighbor_motion() {
+        // Left neighbor A1 carries an L0 MV referencing POC 0; the merge
         // candidate at merge_idx 0 copies it verbatim.
         let mut field = intra_field(32, 32);
         field.fill_rect(0, 0, 16, 32, inter_cell_l0(0, [12, -4]));
@@ -944,8 +944,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_all_intra_neighbours_pads_zero() {
-        // No inter neighbours ⇒ the list is filled with zero candidates;
+    fn merge_all_intra_neighbors_pads_zero() {
+        // No inter neighbors ⇒ the list is filled with zero candidates;
         // merge_idx 0 selects a zero-MV uni-L0 candidate (P slice).
         let field = intra_field(32, 32);
         let ref_poc = |_l: usize, r: i32| if r == 0 { 0 } else { -999 };
@@ -965,9 +965,9 @@ mod tests {
 
     #[test]
     fn amvp_adds_mvd_to_predictor() {
-        // AMVP L0: a left neighbour A1 provides the MVP; the signalled mvd
-        // is added (eqs 8-94..8-97). With one neighbour and no scaling the
-        // predictor is the neighbour MV.
+        // AMVP L0: a left neighbor A1 provides the MVP; the signaled mvd
+        // is added (eqs 8-94..8-97). With one neighbor and no scaling the
+        // predictor is the neighbor MV.
         let mut field = intra_field(32, 32);
         field.fill_rect(0, 0, 16, 32, inter_cell_l0(0, [8, 0]));
         let ref_poc = |_l: usize, r: i32| if r == 0 { 0 } else { -999 };
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn merge_rounds_mv_for_curr_pic_reference() {
         let mut field = intra_field(32, 32);
-        // Fractional neighbour MV [13, -6] referencing POC 4 (= curr).
+        // Fractional neighbor MV [13, -6] referencing POC 4 (= curr).
         field.fill_rect(0, 0, 16, 32, inter_cell_l0(4, [13, -6]));
         let ref_poc = |_l: usize, r: i32| if r == 0 { 4 } else { -999 };
         let long = |_l: usize, r: i32| r == 0;
@@ -1030,7 +1030,7 @@ mod tests {
     #[test]
     fn amvp_integer_path_for_curr_pic_reference() {
         let mut field = intra_field(32, 32);
-        // Neighbour predictor [9, 5] (fractional) referencing curr POC 4.
+        // Neighbor predictor [9, 5] (fractional) referencing curr POC 4.
         field.fill_rect(0, 0, 16, 32, inter_cell_l0(4, [9, 5]));
         let ref_poc = |_l: usize, r: i32| if r == 0 { 4 } else { -999 };
         let long = |_l: usize, r: i32| r == 0;
@@ -1173,7 +1173,7 @@ mod tests {
     #[test]
     fn cu_driver_writes_motion_field_and_resolves_second_partition() {
         // A PART_Nx2N CU: PU0 (left) merges with a zero-pad list (no
-        // neighbours); PU1 (right) merges and its A1 neighbour is PU0,
+        // neighbors); PU1 (right) merges and its A1 neighbor is PU0,
         // so it inherits PU0's motion.
         let mut field = intra_field(32, 32);
         let ref_poc = |_l: usize, r: i32| if r == 0 { 5 } else { -999 };
@@ -1202,7 +1202,7 @@ mod tests {
             mvp_l1_flag: None,
         };
         let pu1 = merge_pu(0);
-        // PU0 has no neighbours (zero MVP) ⇒ mv = [20, 0].
+        // PU0 has no neighbors (zero MVP) ⇒ mv = [20, 0].
         // PU1's A1 = (7, 15) lies in PU0 ⇒ inherits [20, 0]; but the
         // §8.5.3.2.3 vertical-split exclusion drops A1 for partIdx 1, so
         // PU1 falls back to B1/.../zero. Here only A1 is in-picture-left,

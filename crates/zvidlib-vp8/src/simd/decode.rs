@@ -10,7 +10,7 @@
 //! A subblock is too small for 32-bit lanes to pay: an `I32x` version of the
 //! predictors measured 0.65x of the scalar code. These work on the block's 16
 //! bytes at once instead. Every directional mode's samples are `avg2` or
-//! `avg3` of neighbouring edge samples, so the kernel computes both rows over
+//! `avg3` of neighboring edge samples, so the kernel computes both rows over
 //! the whole edge in three instructions and gathers each mode's 16 samples
 //! out of them with one table lookup (`pshufb` on x86_64, `tbl` on aarch64).
 //! TM is computed in 16-bit lanes and narrowed with saturation, which is its

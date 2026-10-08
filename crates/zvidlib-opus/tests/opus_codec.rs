@@ -751,7 +751,7 @@ fn ffmpeg_decodes_the_native_encoders_webm_to_its_exact_length() {
         .unwrap();
     std::fs::remove_file(&path).ok();
     if !output.status.success() {
-        // An FFmpeg built without libopus; its own Opus decoder honours
+        // An FFmpeg built without libopus; its own Opus decoder honors
         // the same fields.
         eprintln!(
             "ffmpeg could not use libopus: {}",

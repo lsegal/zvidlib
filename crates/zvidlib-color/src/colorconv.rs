@@ -267,7 +267,7 @@ fn chroma_tail(top: &[u8], bottom: &[u8], cb: &mut [u8], cr: &mut [u8], done: us
 mod x86 {
     use std::arch::x86_64::*;
 
-    /// `pshufb` selectors that scatter one colour channel of four consecutive RGBA pixels into
+    /// `pshufb` selectors that scatter one color channel of four consecutive RGBA pixels into
     /// the low byte of four `i32` lanes, zeroing the rest. Applied to a 256-bit vector they
     /// act per 128-bit lane, which is exactly one group of four pixels each.
     const SHUFFLE_R: [i8; 16] = [0, -1, -1, -1, 4, -1, -1, -1, 8, -1, -1, -1, 12, -1, -1, -1];
@@ -651,7 +651,7 @@ mod tests {
             assert_eq!(
                 super::isa() == Isa::Scalar,
                 isa == SimdIsa::Scalar,
-                "pinning {} did not reach the colour conversion kernels",
+                "pinning {} did not reach the color conversion kernels",
                 isa.name()
             );
             check(isa);

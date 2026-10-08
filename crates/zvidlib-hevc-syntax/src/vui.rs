@@ -30,9 +30,9 @@
 //!   if( video_signal_type_present_flag ) {
 //!     video_format                                  u(3)
 //!     video_full_range_flag                         u(1)
-//!     colour_description_present_flag               u(1)
-//!     if( colour_description_present_flag ) {
-//!       colour_primaries                            u(8)
+//!     color_description_present_flag               u(1)
+//!     if( color_description_present_flag ) {
+//!       color_primaries                            u(8)
 //!       transfer_characteristics                    u(8)
 //!       matrix_coeffs                               u(8)
 //!     }
@@ -139,15 +139,15 @@ impl From<HrdError> for VuiError {
     }
 }
 
-/// `colour_description_present_flag` block from §E.2.1 — the three
-/// `u(8)` colour-signalling code points. Present only when
-/// `colour_description_present_flag == 1`; §E.3.1 infers each value
+/// `color_description_present_flag` block from §E.2.1 — the three
+/// `u(8)` color-signaling code points. Present only when
+/// `color_description_present_flag == 1`; §E.3.1 infers each value
 /// to 2 ("unspecified") otherwise — the parser leaves this `None` and
 /// the inference is the caller's responsibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ColourDescription {
-    /// `colour_primaries` (`u(8)`).
-    pub colour_primaries: u8,
+pub struct ColorDescription {
+    /// `color_primaries` (`u(8)`).
+    pub color_primaries: u8,
     /// `transfer_characteristics` (`u(8)`).
     pub transfer_characteristics: u8,
     /// `matrix_coeffs` (`u(8)`).
@@ -162,9 +162,9 @@ pub struct VideoSignalType {
     pub video_format: u8,
     /// `video_full_range_flag` (`u(1)`). §E.3.1 infers 0 when absent.
     pub video_full_range_flag: bool,
-    /// Parsed `colour_description_present_flag` block; `None` when
-    /// `colour_description_present_flag == 0`.
-    pub colour_description: Option<ColourDescription>,
+    /// Parsed `color_description_present_flag` block; `None` when
+    /// `color_description_present_flag == 0`.
+    pub color_description: Option<ColorDescription>,
 }
 
 /// `default_display_window_flag` block from §E.2.1 — the four
@@ -190,7 +190,7 @@ pub struct VuiTimingInfo {
     pub time_scale: u32,
     /// `vui_poc_proportional_to_timing_flag` (`u(1)`).
     pub poc_proportional_to_timing_flag: bool,
-    /// `vui_num_ticks_poc_diff_one_minus1` (`ue(v)`); only signalled
+    /// `vui_num_ticks_poc_diff_one_minus1` (`ue(v)`); only signaled
     /// when `poc_proportional_to_timing_flag == 1`. §E.3.1 range
     /// 0..=2^32 − 2 (the `ue(v)` ceiling).
     pub num_ticks_poc_diff_one_minus1: Option<u32>,
@@ -232,15 +232,15 @@ pub struct VuiParameters {
     /// when `aspect_ratio_info_present_flag == 0`. The parser carries
     /// the inferred value either way.
     pub aspect_ratio_idc: u8,
-    /// `sar_width` (`u(16)`); only signalled when `aspect_ratio_idc ==`
+    /// `sar_width` (`u(16)`); only signaled when `aspect_ratio_idc ==`
     /// [`EXTENDED_SAR`].
     pub sar_width: Option<u16>,
-    /// `sar_height` (`u(16)`); only signalled when `aspect_ratio_idc ==`
+    /// `sar_height` (`u(16)`); only signaled when `aspect_ratio_idc ==`
     /// [`EXTENDED_SAR`].
     pub sar_height: Option<u16>,
     /// `overscan_info_present_flag` (`u(1)`).
     pub overscan_info_present_flag: bool,
-    /// `overscan_appropriate_flag` (`u(1)`); only signalled when
+    /// `overscan_appropriate_flag` (`u(1)`); only signaled when
     /// `overscan_info_present_flag == 1`.
     pub overscan_appropriate_flag: Option<bool>,
     /// `video_signal_type_present_flag` (`u(1)`).
@@ -314,10 +314,10 @@ impl VuiParameters {
         let video_signal_type = if video_signal_type_present_flag {
             let video_format = br.u(3)? as u8;
             let video_full_range_flag = br.u1()? != 0;
-            let colour_description_present_flag = br.u1()? != 0;
-            let colour_description = if colour_description_present_flag {
-                Some(ColourDescription {
-                    colour_primaries: br.u(8)? as u8,
+            let color_description_present_flag = br.u1()? != 0;
+            let color_description = if color_description_present_flag {
+                Some(ColorDescription {
+                    color_primaries: br.u(8)? as u8,
                     transfer_characteristics: br.u(8)? as u8,
                     matrix_coeffs: br.u(8)? as u8,
                 })
@@ -327,7 +327,7 @@ impl VuiParameters {
             Some(VideoSignalType {
                 video_format,
                 video_full_range_flag,
-                colour_description,
+                color_description,
             })
         } else {
             None
@@ -658,9 +658,9 @@ mod tests {
         assert!(vui.sar_height.is_none());
     }
 
-    /// Overscan + video-signal-type with colour-description.
+    /// Overscan + video-signal-type with color-description.
     #[test]
-    fn parses_video_signal_type_with_colour_description() {
+    fn parses_video_signal_type_with_color_description() {
         let bytes = bits_to_bytes(&[
             "0",        // aspect_ratio_info_present_flag
             "1",        // overscan_info_present_flag
@@ -668,8 +668,8 @@ mod tests {
             "1",        // video_signal_type_present_flag
             &ub(5, 3),  // video_format = 5 (unspecified)
             "1",        // video_full_range_flag = 1
-            "1",        // colour_description_present_flag = 1
-            &ub(9, 8),  // colour_primaries = 9 (BT.2020)
+            "1",        // color_description_present_flag = 1
+            &ub(9, 8),  // color_primaries = 9 (BT.2020)
             &ub(16, 8), // transfer_characteristics = 16 (PQ)
             &ub(9, 8),  // matrix_coeffs = 9 (BT.2020 non-const)
             "0",        // chroma_loc_info_present_flag
@@ -687,22 +687,22 @@ mod tests {
         let vst = vui.video_signal_type.expect("video signal type");
         assert_eq!(vst.video_format, 5);
         assert!(vst.video_full_range_flag);
-        let cd = vst.colour_description.expect("colour description");
-        assert_eq!(cd.colour_primaries, 9);
+        let cd = vst.color_description.expect("color description");
+        assert_eq!(cd.color_primaries, 9);
         assert_eq!(cd.transfer_characteristics, 16);
         assert_eq!(cd.matrix_coeffs, 9);
     }
 
-    /// video-signal-type present but colour-description absent.
+    /// video-signal-type present but color-description absent.
     #[test]
-    fn parses_video_signal_type_without_colour_description() {
+    fn parses_video_signal_type_without_color_description() {
         let bytes = bits_to_bytes(&[
             "0",       // aspect_ratio_info_present_flag
             "0",       // overscan_info_present_flag
             "1",       // video_signal_type_present_flag
             &ub(1, 3), // video_format = 1
             "0",       // video_full_range_flag = 0
-            "0",       // colour_description_present_flag = 0
+            "0",       // color_description_present_flag = 0
             "0",       // chroma_loc_info_present_flag
             "0",       // neutral_chroma_indication_flag
             "0",       // field_seq_flag
@@ -716,7 +716,7 @@ mod tests {
         let vst = vui.video_signal_type.expect("video signal type");
         assert_eq!(vst.video_format, 1);
         assert!(!vst.video_full_range_flag);
-        assert!(vst.colour_description.is_none());
+        assert!(vst.color_description.is_none());
     }
 
     /// chroma-loc-info + default-display-window blocks.

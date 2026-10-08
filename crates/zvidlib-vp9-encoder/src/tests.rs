@@ -382,11 +382,11 @@ fn hardware_requests_map_the_quantizer_onto_quality() {
 }
 
 /// A hardware encoder's samples are sync samples exactly when they open on a
-/// key frame, and that key frame's colour fields are what the `vpcC` declares:
+/// key frame, and that key frame's color fields are what the `vpcC` declares:
 /// checked here against the software encoder's own key and inter frames.
 #[cfg(all(feature = "hardware", any(windows, target_os = "macos")))]
 #[test]
-fn key_frame_vpcc_finds_key_frames_and_their_colour() {
+fn key_frame_vpcc_finds_key_frames_and_their_color() {
     let mut config = configuration(64, 48, PixelFormat::Yuv420p8);
     config.configuration = vec![60, 0, 3];
     let level = pick_level(
@@ -586,7 +586,7 @@ fn vpcc_describes_8_bit_420_profile_0() {
 }
 
 #[test]
-fn vpcc_reads_colour_from_a_key_frame() {
+fn vpcc_reads_color_from_a_key_frame() {
     let mut config = configuration(32, 16, PixelFormat::Yuv420p8);
     let (samples, _, _) = encode_sequence(&config, 2);
     let vpcc = vpcc_from_key_frame(&samples[0].data, 10).unwrap();
@@ -1102,8 +1102,8 @@ mod ffmpeg {
 }
 
 /// The `loop_filter_level` an encoded frame's uncompressed header signals.
-fn signalled_filter_level(sample: &EncodedSample) -> u8 {
-    // Key frames: marker, profile, flags, sync code, colour, size, render
+fn signaled_filter_level(sample: &EncodedSample) -> u8 {
+    // Key frames: marker, profile, flags, sync code, color, size, render
     // size and frame_context_idx. Inter frames: marker, profile, flags,
     // refresh flags, references, sizes, motion vector precision,
     // interpolation filter and frame_context_idx. Frames that are not error
@@ -1148,7 +1148,7 @@ fn encode_group(frames: &[VideoFrame], base_q_idx: u8, loop_filter: bool) -> (us
 /// The coding tools [`encode_group`] codes with: every tool, with the default
 /// coefficient probabilities, so that its comparisons isolate the loop filter.
 /// Fitted to each frame's own tokens (issue #622), the
-/// probabilities move a group's size between neighbouring quantizers, and
+/// probabilities move a group's size between neighboring quantizers, and
 /// between a weighted and an unweighted key frame, by more than either does.
 const GROUP_TOOLS: CodingTools = CodingTools {
     coef_updates: false,
@@ -1218,13 +1218,13 @@ fn every_frame_signals_a_loop_filter_level() {
     config.configuration = vec![DEFAULT_BASE_Q_IDX, 0, 5, FLAG_ERROR_RESILIENT];
     let (samples, _, _) = encode_sequence(&config, 8);
     for (index, sample) in samples.iter().enumerate() {
-        let level = signalled_filter_level(sample);
+        let level = signaled_filter_level(sample);
         assert!((1..=63).contains(&level), "frame {index} level {level}");
     }
 }
 
 /// How far the unfiltered encode of `frames` at `base_q_idx` lands off the
-/// rate and distortion curve through its neighbouring quantizers, and how much
+/// rate and distortion curve through its neighboring quantizers, and how much
 /// larger the filtered encode is than the unfiltered one would have to grow to
 /// match its PSNR at the high-rate 6 dB per doubling of the rate, both in log2
 /// of the size, which that rule is linear in. Also the filter's PSNR gain.
@@ -1269,7 +1269,7 @@ fn loop_filter_is_a_rate_distortion_gain() {
     // Held to that with no margin, the rule tracked the encoder's mode
     // decisions rather than the filter: scaling only the key frame's lambda
     // flipped which quantizer failed, by under 1.5% (issue #619). An
-    // unfiltered encode lands off the curve through its neighbouring
+    // unfiltered encode lands off the curve through its neighboring
     // quantizers by about 2% RMS here, so no point may lose more than that
     // measured noise, and the points together must still be a gain, as
     // `loop_filter_on_sharp_content_costs_less_than_decision_noise` does.
@@ -1304,7 +1304,7 @@ fn loop_filter_is_a_rate_distortion_gain() {
 #[test]
 fn panning_inter_frames_find_the_motion() {
     // The texture's fine detail leaves the motion search many local minima.
-    // Started from the neighbours' vectors alone, a frame whose first blocks
+    // Started from the neighbors' vectors alone, a frame whose first blocks
     // missed the pan fell back to intra nearly everywhere and came out about
     // as large as the key frame, and the loop filter's small changes to the
     // reference decided which frames did: the filtered sequence was up to a
@@ -1545,7 +1545,7 @@ fn moving_rgb_frame(
     range: ColorRange,
 ) -> VideoFrame {
     let (width, height) = (width as usize, height as usize);
-    // A stride wider than the row, so the conversion must honour it.
+    // A stride wider than the row, so the conversion must honor it.
     let stride = width * 4 + 12;
     let mut data = vec![0_u8; stride * height];
     for y in 0..height {
@@ -1730,7 +1730,7 @@ fn loop_filter_on_sharp_content_costs_less_than_decision_noise() {
     // which mode or vector later frames pick from a slightly different
     // reference, a few bytes up or down per frame. The encoder is that noisy
     // without the filter too: an unfiltered encode lands off the rate and
-    // distortion curve through its neighbouring quantizers by more, 3-4% RMS
+    // distortion curve through its neighboring quantizers by more, 3-4% RMS
     // over q 20 to 240 and about 2% at the quantizers here. So no point may
     // lose more than that measured noise, and the points together must still
     // be a gain.

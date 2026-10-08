@@ -275,7 +275,7 @@ impl WebVideoDecodeSession {
     }
 
     /// Whether this browser decodes `track_index` of `bytes` through
-    /// `WebCodecs`, for the tests that exercise that session's own behaviour
+    /// `WebCodecs`, for the tests that exercise that session's own behavior
     /// and have nothing to check where the software fallback takes over.
     #[cfg(all(test, feature = "all"))]
     pub(crate) async fn decodes_through_webcodecs(bytes: &[u8], track_index: u32) -> bool {
@@ -354,7 +354,7 @@ impl SoftwareDecoder {
             _ => (profile, ColorRange::Limited),
         };
         // The decoders validate the configuration record itself, so a stream
-        // they cannot decode (colour AV1, say) is refused here, at open,
+        // they cannot decode (color AV1, say) is refused here, at open,
         // rather than on its first frame.
         let configuration = VideoDecoderConfig {
             codec: track.codec,
@@ -383,7 +383,7 @@ impl SoftwareDecoder {
     }
 }
 
-/// The colour range an AV1 track's sequence header signals: from `av1C`'s
+/// The color range an AV1 track's sequence header signals: from `av1C`'s
 /// `configOBUs` when it carries one, which it need not, and otherwise from the
 /// first sample, a key frame that must. Limited when neither parses, which
 /// leaves the reader to reject the first frame that disagrees.
@@ -411,7 +411,7 @@ fn av1_color_range(
     }
 }
 
-/// The colour range a VP9 track's first key frame signals, which is what
+/// The color range a VP9 track's first key frame signals, which is what
 /// its pictures are decoded in. The `vpcC` box's `videoFullRangeFlag` stands
 /// in when the first sample does not parse, and limited range when neither
 /// says, which leaves the reader to reject the first frame that disagrees.
@@ -577,7 +577,7 @@ impl WebCodecsDecoder {
 
     /// Decodes and returns exactly the requested presentation frame as RGBA bytes.
     ///
-    /// The token is checked on every turn of the decode loop, so cancelling stops the decode
+    /// The token is checked on every turn of the decode loop, so canceling stops the decode
     /// part-way through instead of after it.
     async fn get(
         &mut self,
@@ -1430,7 +1430,7 @@ mod tests {
         }
     }
 
-    /// Issue #509: a colour AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
+    /// Issue #509: a color AV1 track (the bundled SVT-AV1 8-bit 4:2:0 Main
     /// sample) decodes through the fallback. The digests are FFmpeg/libdav1d's
     /// decode of the same frames converted by the crate's own BT.601 RGBA
     /// conversion, the lines of
@@ -1438,7 +1438,7 @@ mod tests {
     /// the native conformance test checks every frame against; frame 20 is
     /// reached by walking forwards from the random-access point at frame 0.
     #[wasm_bindgen_test(async)]
-    async fn software_fallback_decodes_colour_av1_like_an_independent_decoder() {
+    async fn software_fallback_decodes_color_av1_like_an_independent_decoder() {
         const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
         let mut session = WebVideoDecodeSession::open_with(
             COLOR_AV1,
@@ -1482,7 +1482,7 @@ mod tests {
     /// frames. The frame cache used to hold up to `Limits::max_cached_frames`
     /// decoded `VideoFrame`s open, and Chrome's decoder stops emitting frames
     /// once that many of its output buffers are held, so `get()` waited
-    /// forever for frame 14 of this track. Each read is cancelled after ten
+    /// forever for frame 14 of this track. Each read is canceled after ten
     /// seconds so a regression fails the test instead of hanging the suite.
     #[wasm_bindgen_test(async)]
     async fn sequential_webcodecs_reads_do_not_exhaust_the_decoder() {

@@ -121,7 +121,7 @@ impl VideoDecoder for VideoToolboxDecoder {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("HEVC access unit exceeds the allocation limit"));
         }
@@ -151,18 +151,18 @@ impl VideoDecoder for VideoToolboxDecoder {
             return Ok(Vec::new());
         }
         self.wait_for_pending()?;
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         self.take_output()
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         self.session()?
             .finish_delayed_frames()
             .map_err(|error| codec(format!("VideoToolbox could not drain HEVC output: {error}")))?;
         self.pending_async = true;
         self.wait_for_pending()?;
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         self.take_output()
     }
 
@@ -202,7 +202,7 @@ impl VideoDecoder for VideoToolboxDecoder {
 impl Drop for VideoToolboxDecoder {
     fn drop(&mut self) {
         // Same rule as `reset`: the session must not be torn down under frames it has not
-        // finished, and a walk that was cancelled part-way leaves exactly that.
+        // finished, and a walk that was canceled part-way leaves exactly that.
         let _ = self.wait_for_pending();
     }
 }
@@ -467,12 +467,9 @@ fn coded_nal(unit: &super::engine::nal::NalUnit) -> Vec<u8> {
     output
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
-        ))
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
+        Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
     } else {
         Ok(())
     }

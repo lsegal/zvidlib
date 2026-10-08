@@ -171,7 +171,7 @@ pub fn inter_prediction(reference: &[u8], width: usize, height: usize, size: usi
 }
 
 /// TM intra prediction of every whole `size` x `size` block of `plane` that
-/// has neighbours above and to the left, predicting from the plane itself.
+/// has neighbors above and to the left, predicting from the plane itself.
 pub fn tm_prediction(plane: &[u8], width: usize, height: usize, size: usize) -> Vec<u8> {
     let mut plane = plane.to_vec();
     for (x, y) in blocks(width, height, size).filter(|&(x, y)| x > 0 && y > 0) {

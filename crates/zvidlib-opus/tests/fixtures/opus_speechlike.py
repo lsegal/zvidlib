@@ -1,7 +1,7 @@
 """Writes a deterministic speech-like mono signal as 48 kHz f32le.
 
 A glottal pulse train with a gliding pitch, shaped by three formant
-resonators whose centres move between vowels, with an unvoiced (fricative)
+resonators whose centers move between vowels, with an unvoiced (fricative)
 noise burst in the middle. Opus's mode decision treats it as speech, so a
 low-rate encode of it codes in SILK or hybrid mode rather than CELT.
 """

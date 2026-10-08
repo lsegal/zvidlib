@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 # Two runs for one release never upload at the same time. A new run queues
-# behind the one in progress rather than cancelling it, since a cancelled run
+# behind the one in progress rather than canceling it, since a canceled run
 # would only have to be resumed later.
 concurrency:
   group: publish-crates-${{ inputs.tag }}

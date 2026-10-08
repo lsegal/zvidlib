@@ -1,6 +1,6 @@
 //! The registered AV1 decoder against reference RGBA digests (#508, #509),
 //! through sequential, reverse and alternating seeks and an in-order walk of
-//! the bundled colour sample. Moved here from the root package's
+//! the bundled color sample. Moved here from the root package's
 //! `codec_conformance` (#612), so it runs with the crate it covers.
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -180,7 +180,7 @@ fn native_av1_decoder_conforms_for_sequential_reverse_and_alternating_seeks() {
 }
 
 #[test]
-fn native_av1_decoder_matches_an_independent_decode_of_the_colour_sample() {
+fn native_av1_decoder_matches_an_independent_decode_of_the_color_sample() {
     // Issue #509: the bundled SVT-AV1 8-bit 4:2:0 Main sample, decoded through
     // the registered factory. The digests are FFmpeg/libdav1d's decode of the
     // same track converted to RGBA by this crate's BT.601 `convert_to_rgba8`,

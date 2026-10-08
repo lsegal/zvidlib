@@ -20,7 +20,7 @@
 //! - key frames choose among the DC, V, H and TM intra modes per block;
 //! - inter frames predict from the previous frame (`LAST_FRAME`) with motion
 //!   vectors found by a whole-sample diamond search, started from the
-//!   neighbours' vectors and the frame's motion estimated from its
+//!   neighbors' vectors and the frame's motion estimated from its
 //!   projections, then refined to quarter samples, or to eighth samples where
 //!   `allow_high_precision_mv` lets the block code them, through the regular
 //!   8-tap filters the header selects. They are coded as `ZEROMV`,
@@ -301,7 +301,7 @@ enum Node {
 /// How a plane's transform blocks are predicted.
 #[derive(Clone, Copy)]
 enum Prediction {
-    /// Each transform block from its reconstructed neighbours, in turn.
+    /// Each transform block from its reconstructed neighbors, in turn.
     Intra(IntraMode),
     /// From the reference frame along a motion vector, already in place.
     Inter(Mv),
@@ -839,7 +839,7 @@ impl<'a> FrameEncoder<'a> {
         self
     }
 
-    /// Encodes the frame; `full_range` is the colour range the key frame
+    /// Encodes the frame; `full_range` is the color range the key frame
     /// header signals.
     pub(super) fn encode(mut self, full_range: bool) -> EncodedFrame {
         if let Some(reference) = self.reference {
@@ -938,7 +938,7 @@ impl<'a> FrameEncoder<'a> {
     ///
     /// This is libvpx's `search_filter_level`: start from the level libvpx's
     /// `LPF_PICK_FROM_Q` guesses for the quantizer, then step towards lower
-    /// error, halving the step each time neither neighbour improves. Like
+    /// error, halving the step each time neither neighbor improves. Like
     /// libvpx it biases the search towards lower levels, because a level
     /// that only just lowers this frame's error over-smooths the reference
     /// later frames predict from and makes them cost more.
@@ -2137,7 +2137,7 @@ impl<'a> FrameEncoder<'a> {
     /// flat, and its estimate noise, so each direction is also offered on its
     /// own.
     ///
-    /// A diamond search from the neighbours' vectors alone can settle in a
+    /// A diamond search from the neighbors' vectors alone can settle in a
     /// local minimum on fine texture. Once a frame's first blocks miss the
     /// motion and fall back to intra, the blocks after them have no vectors
     /// to start from either, and a panning frame can code nearly all intra:
@@ -3046,7 +3046,7 @@ fn single_ref_context(neighbors: Neighbors) -> usize {
     }
 }
 
-/// `vp9_scan_orders[tx_size][tx_type]`: the scan and its neighbour pairs.
+/// `vp9_scan_orders[tx_size][tx_type]`: the scan and its neighbor pairs.
 fn scan_order(tx_size: usize, tx_type: TxType) -> (&'static [i16], &'static [i16]) {
     match (tx_size, tx_type) {
         (0, TxType::AdstDct) => (&shared::ROW_SCAN_4X4, &shared::ROW_SCAN_4X4_NEIGHBORS),
@@ -3279,7 +3279,7 @@ fn token_bits<const SIZE: usize>(
     let mut bits = 0.0;
     let mut cache = [0_u8; SIZE];
     let mut previous_zero = false;
-    // The neighbours of each coefficient's successor, from which its context
+    // The neighbors of each coefficient's successor, from which its context
     // follows.
     let successors = neighbors[2..].chunks_exact(2);
     for ((&position, &band), successor) in scan[..eob].iter().zip(&bands[..eob]).zip(successors) {

@@ -103,7 +103,7 @@ frame of libvpx's own decode of the fixture, hashed as
 `big_buck_bunny_av1_yuv420.sha256` above, and each `vp9_bbb_*_rgba.sha256` the
 `Rgba8` digests of the same frames after this crate's BT.601
 `convert_to_rgba8`, the conversion `native_vp9_video_decoder_factory` applies to
-a stream that does not name its colour space:
+a stream that does not name its color space:
 
 ```sh
 ffmpeg -c:v libvpx-vp9 -i vp9_bbb_256x144.mp4 -fps_mode passthrough \

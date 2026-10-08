@@ -95,8 +95,8 @@ impl AudioDecoder for NativeAacDecoder {
         sample: &crate::EncodedAudioSample,
         cancellation: &CancellationToken,
     ) -> Result<AudioBuffer> {
-        if cancellation.is_cancelled() {
-            return Err(Error::new(ErrorKind::Cancelled, "AAC decode cancelled"));
+        if cancellation.is_canceled() {
+            return Err(Error::new(ErrorKind::Canceled, "AAC decode canceled"));
         }
         let channels = usize::from(self.channels);
         let expected = usize::try_from(sample.decoded_range.len()).unwrap_or(usize::MAX);
@@ -263,8 +263,8 @@ impl AudioOutputBackend for DefaultAudioOutput {
         let mut state = self.state.lock().expect("audio output lock");
         if generation != state.generation {
             return Err(Error::new(
-                ErrorKind::Cancelled,
-                "scheduled PCM belongs to a cancelled playback generation",
+                ErrorKind::Canceled,
+                "scheduled PCM belongs to a canceled playback generation",
             ));
         }
         state.queued.push_back(QueuedPcm {

@@ -2,7 +2,7 @@
 //! zero-MV merge fallback, and the per-block motion field.
 //!
 //! This module turns the §7.3.8.6 `prediction_unit()` syntax (the
-//! signalled `mvd`, `mvp_lX_flag`, `ref_idx`, `inter_pred_idc` /
+//! signaled `mvd`, `mvp_lX_flag`, `ref_idx`, `inter_pred_idc` /
 //! `merge_idx`) into the resolved per-PU motion data the §8.5.3.3.1
 //! block-walk driver ([`crate::engine::inter_pred::predict_inter_pu`]) consumes,
 //! and stores it in a per-4×4-block [`MotionField`] that the §8.7.2.4
@@ -27,11 +27,11 @@
 //! bi-predictive step ([`append_combined_bi_candidates`]), the §8.5.3.2.2
 //! merge-list driver ([`build_merge_candidate`]), and the §8.5.3.2.6 /
 //! §8.5.3.2.7 luma-MVP candidate derivation ([`derive_mvp_candidate`])
-//! also live here. They take the neighbour PU motion as data ([`NeighbourPu`]
+//! also live here. They take the neighbor PU motion as data ([`NeighborPu`]
 //! snapshots gathered by the picture driver from the per-block motion
 //! field) plus closures resolving a `(list, ref_idx)` to its POC /
 //! long-term flag, so the arithmetic stays self-contained and unit-tested
-//! while the picture driver owns the neighbour-location plumbing.
+//! while the picture driver owns the neighbor-location plumbing.
 //!
 //! The §8.5.3.2.8 temporal (collocated-picture) candidate is still the
 //! picture-driver's follow-up — its `Col` candidate is passed in as an
@@ -116,17 +116,17 @@ pub struct MergeCandidate {
     pub mv_l1: Mv,
 }
 
-/// A spatial neighbour prediction unit's motion data, as read out of the
-/// per-block motion field at a neighbour sample location for the
+/// A spatial neighbor prediction unit's motion data, as read out of the
+/// per-block motion field at a neighbor sample location for the
 /// §8.5.3.2.3 spatial-merge / §8.5.3.2.7 MVP-candidate derivations.
 ///
 /// This is the `(MvLX, RefIdxLX, PredFlagLX)` tuple the spec reads at
 /// `[ xNbN ][ yNbN ]`. Two merge candidates "have the same motion vectors
 /// and the same reference indices" (the §8.5.3.2.3 pruning test) iff their
 /// `pred_flag`/`ref_idx`/`mv` for both lists are equal — i.e. iff their
-/// [`NeighbourPu`] values compare equal.
+/// [`NeighborPu`] values compare equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct NeighbourPu {
+pub struct NeighborPu {
     /// `PredFlagL0[ xNb ][ yNb ]`.
     pub pred_flag_l0: bool,
     /// `PredFlagL1[ xNb ][ yNb ]`.
@@ -141,9 +141,9 @@ pub struct NeighbourPu {
     pub mv_l1: Mv,
 }
 
-impl NeighbourPu {
-    /// The §8.5.3.2.3 candidate built from this neighbour PU's motion
-    /// (eqs 8-128..8-130 and the B0/A0/B1/B2 analogues): the neighbour's
+impl NeighborPu {
+    /// The §8.5.3.2.3 candidate built from this neighbor PU's motion
+    /// (eqs 8-128..8-130 and the B0/A0/B1/B2 analogs): the neighbor's
     /// per-list MV / refIdx / predFlag, copied verbatim into a
     /// [`MergeCandidate`].
     #[inline]
@@ -160,11 +160,11 @@ impl NeighbourPu {
     }
 }
 
-/// The five §8.5.3.2.3 spatial neighbour positions, in the order the
-/// availability tests reference them. Each carries the neighbour sample
-/// location `(xNbN, yNbN)` relative to the picture and the neighbour's
+/// The five §8.5.3.2.3 spatial neighbor positions, in the order the
+/// availability tests reference them. Each carries the neighbor sample
+/// location `(xNbN, yNbN)` relative to the picture and the neighbor's
 /// motion data when the §6.4.2 prediction-block availability test passed
-/// (`None` when the neighbour is unavailable).
+/// (`None` when the neighbor is unavailable).
 ///
 /// Positions (eqs in §8.5.3.2.3), with `(xPb, yPb)` the PB top-left and
 /// `nPbW`/`nPbH` its width/height:
@@ -174,17 +174,17 @@ impl NeighbourPu {
 /// * `A0` = `(xPb − 1,        yPb + nPbH)`
 /// * `B2` = `(xPb − 1,        yPb − 1)`
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SpatialMergeNeighbours {
-    /// Neighbour `A1` motion (`None` when §6.4.2-unavailable).
-    pub a1: Option<NeighbourPu>,
-    /// Neighbour `B1` motion.
-    pub b1: Option<NeighbourPu>,
-    /// Neighbour `B0` motion.
-    pub b0: Option<NeighbourPu>,
-    /// Neighbour `A0` motion.
-    pub a0: Option<NeighbourPu>,
-    /// Neighbour `B2` motion.
-    pub b2: Option<NeighbourPu>,
+pub struct SpatialMergeNeighbors {
+    /// Neighbor `A1` motion (`None` when §6.4.2-unavailable).
+    pub a1: Option<NeighborPu>,
+    /// Neighbor `B1` motion.
+    pub b1: Option<NeighborPu>,
+    /// Neighbor `B0` motion.
+    pub b0: Option<NeighborPu>,
+    /// Neighbor `A0` motion.
+    pub a0: Option<NeighborPu>,
+    /// Neighbor `B2` motion.
+    pub b2: Option<NeighborPu>,
 }
 
 /// §8.5.3.2.3 PartMode-dependent partition exclusion for the current PU.
@@ -205,24 +205,24 @@ pub struct PartitionContext {
 }
 
 /// §8.5.3.2.3 — derive the up-to-five spatial merging candidates and their
-/// availability flags from the neighbouring prediction units.
+/// availability flags from the neighboring prediction units.
 ///
-/// `neigh` carries each neighbour position's §6.4.2 availability (as
+/// `neigh` carries each neighbor position's §6.4.2 availability (as
 /// `Some`/`None`) plus its motion data; `part` carries the current PU's
 /// `partIdx` + `PartMode` split class for the A1/B1 partition-exclusion
-/// rules; `same_par_mrg` is `true` when the neighbour falls in the *same*
+/// rules; `same_par_mrg` is `true` when the neighbor falls in the *same*
 /// `Log2ParMrgLevel` parallel-merge region as the current PB (the
 /// `xPb >> L == xNb >> L && yPb >> L == yNb >> L` test that forces a
-/// neighbour unavailable). The five returned `Option`s are the available
+/// neighbor unavailable). The five returned `Option`s are the available
 /// candidates A1/B1/B0/A0/B2 (eqs 8-128..8-142), already pruned against the
-/// earlier-derived neighbours exactly as the spec's redundancy checks
+/// earlier-derived neighbors exactly as the spec's redundancy checks
 /// require.
 ///
-/// `same_par_mrg` is a 5-tuple `(a1, b1, b0, a0, b2)` of the per-neighbour
+/// `same_par_mrg` is a 5-tuple `(a1, b1, b0, a0, b2)` of the per-neighbor
 /// parallel-merge-region tests.
 #[must_use]
 pub fn derive_spatial_merge_candidates(
-    neigh: &SpatialMergeNeighbours,
+    neigh: &SpatialMergeNeighbors,
     part: PartitionContext,
     same_par_mrg: (bool, bool, bool, bool, bool),
 ) -> SpatialMergeCandidates {
@@ -238,7 +238,7 @@ pub fn derive_spatial_merge_candidates(
 
     // --- A1 (eqs 8-128..8-130) ---
     // availableA1 starts from §6.4.2, then is forced FALSE when the
-    // neighbour is in the same parallel-merge region, or for the second
+    // neighbor is in the same parallel-merge region, or for the second
     // partition of a vertical-split PartMode.
     let a1_excluded = smrg_a1 || (part.part_mode_vertical_split && part.part_idx == 1);
     let raw_a1 = if a1_excluded { None } else { neigh.a1 };
@@ -280,11 +280,11 @@ pub fn derive_spatial_merge_candidates(
     let cand_b2 = if b2_excluded { None } else { neigh.b2 };
 
     SpatialMergeCandidates {
-        a1: cand_a1.map(NeighbourPu::to_candidate),
-        b1: cand_b1.map(NeighbourPu::to_candidate),
-        b0: cand_b0.map(NeighbourPu::to_candidate),
-        a0: cand_a0.map(NeighbourPu::to_candidate),
-        b2: cand_b2.map(NeighbourPu::to_candidate),
+        a1: cand_a1.map(NeighborPu::to_candidate),
+        b1: cand_b1.map(NeighborPu::to_candidate),
+        b0: cand_b0.map(NeighborPu::to_candidate),
+        a0: cand_a0.map(NeighborPu::to_candidate),
+        b2: cand_b2.map(NeighborPu::to_candidate),
     }
 }
 
@@ -293,7 +293,7 @@ pub fn derive_spatial_merge_candidates(
 /// (per-list predFlag / refIdx / MV) to `candidate`.
 #[inline]
 #[must_use]
-fn same_motion(earlier: Option<NeighbourPu>, candidate: Option<NeighbourPu>) -> bool {
+fn same_motion(earlier: Option<NeighborPu>, candidate: Option<NeighborPu>) -> bool {
     match (earlier, candidate) {
         (Some(e), Some(c)) => e == c,
         _ => false,
@@ -575,26 +575,26 @@ fn scale_component(dist_scale: i32, mv: i32) -> i32 {
     (sign * ((v.abs() + 127) >> 8)).clamp(-32768, 32767)
 }
 
-/// The motion of one MVP source neighbour, paired with which list its MV
+/// The motion of one MVP source neighbor, paired with which list its MV
 /// was taken from, so the §8.5.3.2.7 scaling can resolve the source
-/// reference picture. Produced by [`mvp_neighbour_mv`].
+/// reference picture. Produced by [`mvp_neighbor_mv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MvpSource {
     mv: Mv,
-    /// The list (0 or 1) the MV / refIdx were drawn from at the neighbour.
+    /// The list (0 or 1) the MV / refIdx were drawn from at the neighbor.
     src_list: usize,
     /// `RefIdxLY[ xNb ][ yNb ]` for that source list.
     src_ref_idx: i32,
 }
 
-/// §8.5.3.2.7 — the "same POC" (no-scaling) neighbour-MV pick used by the
+/// §8.5.3.2.7 — the "same POC" (no-scaling) neighbor-MV pick used by the
 /// A pass-1 (eqs 8-171/8-172) and the B step-3 (eqs 8-184/8-185): take the
-/// neighbour's L`X` MV when its L`X` reference picture has the same POC as
+/// neighbor's L`X` MV when its L`X` reference picture has the same POC as
 /// the current reference picture; otherwise its L`Y` (Y = 1−X) MV under
 /// the same POC test. Returns `None` when neither matches.
 #[must_use]
-fn mvp_neighbour_mv_same_poc(
-    n: NeighbourPu,
+fn mvp_neighbor_mv_same_poc(
+    n: NeighborPu,
     x: usize,
     cur_ref_poc: i32,
     neigh_ref_poc: &dyn Fn(usize, i32) -> i32,
@@ -611,14 +611,14 @@ fn mvp_neighbour_mv_same_poc(
     None
 }
 
-/// §8.5.3.2.7 — the long-term-matched neighbour-MV pick used by A pass-2
+/// §8.5.3.2.7 — the long-term-matched neighbor-MV pick used by A pass-2
 /// (eqs 8-173..8-178) and B step-5 (eqs 8-187..8-192): take the
-/// neighbour's L`X` MV when the current ref and the neighbour's L`X` ref
+/// neighbor's L`X` MV when the current ref and the neighbor's L`X` ref
 /// have equal long-term status; else its L`Y` MV under the same test.
 /// Returns the source MV + which list it came from (for later scaling).
 #[must_use]
-fn mvp_neighbour_mv_long_term(
-    n: NeighbourPu,
+fn mvp_neighbor_mv_long_term(
+    n: NeighborPu,
     x: usize,
     cur_long_term: bool,
     neigh_long_term: &dyn Fn(usize, i32) -> bool,
@@ -643,10 +643,10 @@ fn mvp_neighbour_mv_long_term(
     None
 }
 
-/// `(predFlagLL, refIdxLL, mvLL)` of a neighbour for list `l` (0 or 1).
+/// `(predFlagLL, refIdxLL, mvLL)` of a neighbor for list `l` (0 or 1).
 #[inline]
 #[must_use]
-fn list_fields(n: NeighbourPu, l: usize) -> (bool, i32, Mv) {
+fn list_fields(n: NeighborPu, l: usize) -> (bool, i32, Mv) {
     if l == 0 {
         (n.pred_flag_l0, n.ref_idx_l0, n.mv_l0)
     } else {
@@ -663,9 +663,9 @@ pub struct MvpContext<'a> {
     pub curr_poc: i32,
     /// The current PU's reference picture `RefPicListX[ refIdxLX ]`.
     pub cur_ref: RefPicId,
-    /// Resolve a neighbour's `(list, ref_idx)` to its reference POC.
+    /// Resolve a neighbor's `(list, ref_idx)` to its reference POC.
     pub neigh_ref_poc: &'a dyn Fn(usize, i32) -> i32,
-    /// Resolve a neighbour's `(list, ref_idx)` to its long-term flag.
+    /// Resolve a neighbor's `(list, ref_idx)` to its long-term flag.
     pub neigh_ref_long_term: &'a dyn Fn(usize, i32) -> bool,
     /// Resolve a `(list, ref_idx)` to whether it is a short-term picture
     /// (the §8.5.3.2.7 scaling gate requires both refs short-term).
@@ -683,28 +683,28 @@ impl std::fmt::Debug for MvpContext<'_> {
 }
 
 /// §8.5.3.2.7 — derive `mvLXA` and `availableFlagLXA` from the left
-/// neighbours A0 (`xPb−1, yPb+nPbH`) then A1 (`xPb−1, yPb+nPbH−1`).
+/// neighbors A0 (`xPb−1, yPb+nPbH`) then A1 (`xPb−1, yPb+nPbH−1`).
 ///
-/// `a0`/`a1` are the §6.4.2-gated neighbour PUs (`None` when unavailable).
+/// `a0`/`a1` are the §6.4.2-gated neighbor PUs (`None` when unavailable).
 /// Returns `(availableFlagLXA, mvLXA, isScaledFlagLX)`.
 #[must_use]
 fn derive_mvp_a(
-    a0: Option<NeighbourPu>,
-    a1: Option<NeighbourPu>,
+    a0: Option<NeighborPu>,
+    a1: Option<NeighborPu>,
     ctx: &MvpContext,
 ) -> (bool, Mv, bool) {
     // step 5: isScaledFlagLX = (availableA0 || availableA1).
     let is_scaled = a0.is_some() || a1.is_some();
     // step 6 (pass 1): same-POC, no scaling, first match over A0 then A1.
     for n in [a0, a1].into_iter().flatten() {
-        if let Some(mv) = mvp_neighbour_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
+        if let Some(mv) = mvp_neighbor_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
             return (true, mv, is_scaled);
         }
     }
     // step 7 (pass 2): long-term-matched, then scale when both short-term.
     for n in [a0, a1].into_iter().flatten() {
         if let Some(src) =
-            mvp_neighbour_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
+            mvp_neighbor_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
         {
             let mv = maybe_scale(src, ctx);
             return (true, mv, is_scaled);
@@ -714,16 +714,16 @@ fn derive_mvp_a(
 }
 
 /// §8.5.3.2.7 — derive `mvLXB` and `availableFlagLXB` from the above
-/// neighbours B0 (`xPb+nPbW, yPb−1`), B1 (`xPb+nPbW−1, yPb−1`), B2
+/// neighbors B0 (`xPb+nPbW, yPb−1`), B1 (`xPb+nPbW−1, yPb−1`), B2
 /// (`xPb−1, yPb−1`), with the `isScaledFlag` interaction (steps 3–5).
 ///
 /// Returns `(availableFlagLXB, mvLXB, mvLXA_override)` where the override
 /// is `Some(mvLXB)` when step 4 copies B into A (isScaledFlag == 0 path).
 #[must_use]
 fn derive_mvp_b(
-    b0: Option<NeighbourPu>,
-    b1: Option<NeighbourPu>,
-    b2: Option<NeighbourPu>,
+    b0: Option<NeighborPu>,
+    b1: Option<NeighborPu>,
+    b2: Option<NeighborPu>,
     is_scaled: bool,
     ctx: &MvpContext,
 ) -> (bool, Mv, Option<Mv>) {
@@ -731,7 +731,7 @@ fn derive_mvp_b(
     let mut avail_b = false;
     let mut mv_b = [0, 0];
     for n in [b0, b1, b2].into_iter().flatten() {
-        if let Some(mv) = mvp_neighbour_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
+        if let Some(mv) = mvp_neighbor_mv_same_poc(n, ctx.x, ctx.cur_ref.poc, ctx.neigh_ref_poc) {
             avail_b = true;
             mv_b = mv;
             break;
@@ -751,7 +751,7 @@ fn derive_mvp_b(
         mv_b = [0, 0];
         for n in [b0, b1, b2].into_iter().flatten() {
             if let Some(src) =
-                mvp_neighbour_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
+                mvp_neighbor_mv_long_term(n, ctx.x, ctx.cur_ref.long_term, ctx.neigh_ref_long_term)
             {
                 avail_b = true;
                 mv_b = maybe_scale(src, ctx);
@@ -780,7 +780,7 @@ fn maybe_scale(src: MvpSource, ctx: &MvpContext) -> Mv {
 /// §8.5.3.2.6 / §8.5.3.2.7 — derive the luma motion-vector predictor
 /// `mvpLX` for one list `X`.
 ///
-/// `neigh` carries the five §6.4.2-gated spatial neighbour PUs (the A/B
+/// `neigh` carries the five §6.4.2-gated spatial neighbor PUs (the A/B
 /// derivation reads A0/A1 and B0/B1/B2); `ctx` carries `X`, the current
 /// PU's reference picture, and the ref-pic resolvers. `col` is the
 /// §8.5.3.2.8 temporal predictor `mvLXCol` (`None` when
@@ -791,7 +791,7 @@ fn maybe_scale(src: MvpSource, ctx: &MvpContext) -> Mv {
 /// available); zero-MV padding to two entries.
 #[must_use]
 pub fn derive_mvp_candidate(
-    neigh: &SpatialMergeNeighbours,
+    neigh: &SpatialMergeNeighbors,
     ctx: &MvpContext,
     col: Option<Mv>,
     mvp_lx_flag: bool,
@@ -1068,7 +1068,7 @@ fn collocated_mv(col: MotionCell, ctx: &TemporalMvContext) -> Option<Mv> {
 
 /// §8.5.3.2.9 eqs 8-205..8-209 — scale `mv` directly from the
 /// `td = colPocDiff` / `tb = currPocDiff` distances (the temporal-MV
-/// flavour of [`scale_temporal_mv`] that takes the differences rather
+/// flavor of [`scale_temporal_mv`] that takes the differences rather
 /// than the POCs).
 #[must_use]
 fn scale_temporal_mv_td_tb(mv: Mv, col_poc_diff: i32, curr_poc_diff: i32) -> Mv {
@@ -1133,9 +1133,9 @@ pub fn derive_temporal_mv(
 mod tests {
     use super::*;
 
-    /// A uni-L0 neighbour PU with the given refIdx + MV.
-    fn uni_l0(ref_idx: i32, mv: Mv) -> NeighbourPu {
-        NeighbourPu {
+    /// A uni-L0 neighbor PU with the given refIdx + MV.
+    fn uni_l0(ref_idx: i32, mv: Mv) -> NeighborPu {
+        NeighborPu {
             pred_flag_l0: true,
             pred_flag_l1: false,
             ref_idx_l0: ref_idx,
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn spatial_merge_all_unavailable_yields_empty() {
-        let neigh = SpatialMergeNeighbours::default();
+        let neigh = SpatialMergeNeighbors::default();
         let c = derive_spatial_merge_candidates(&neigh, no_split(), no_par_mrg());
         let mut list = Vec::new();
         c.append_to(&mut list);
@@ -1166,7 +1166,7 @@ mod tests {
     fn spatial_merge_b1_pruned_against_identical_a1() {
         // A1 and B1 carry identical motion ⇒ B1 is dropped (redundancy).
         let pu = uni_l0(0, [4, 8]);
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(pu),
             b1: Some(pu),
             ..Default::default()
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn spatial_merge_b1_kept_when_motion_differs() {
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [4, 8])),
             b1: Some(uni_l0(0, [4, 9])),
             ..Default::default()
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn spatial_merge_b0_pruned_against_raw_b1_even_when_b1_pruned() {
         let pu = uni_l0(0, [0, 0]);
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(pu),
             b1: Some(pu),
             b0: Some(pu),
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn spatial_merge_b0_kept_when_b1_raw_unavailable() {
         let pu = uni_l0(0, [4, 0]);
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             b1: Some(pu),
             b0: Some(pu),
             ..Default::default()
@@ -1248,7 +1248,7 @@ mod tests {
     fn spatial_merge_b2_dropped_when_four_available() {
         // A0,A1,B0,B1 all available with distinct motion ⇒ list full ⇒ B2
         // excluded even though it is itself available + distinct.
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [1, 0])),
             b1: Some(uni_l0(0, [2, 0])),
             b0: Some(uni_l0(0, [3, 0])),
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn spatial_merge_a1_excluded_for_vertical_split_part1() {
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [7, 7])),
             ..Default::default()
         };
@@ -1277,12 +1277,12 @@ mod tests {
 
     #[test]
     fn spatial_merge_same_par_mrg_forces_unavailable() {
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [1, 1])),
             b1: Some(uni_l0(0, [2, 2])),
             ..Default::default()
         };
-        // A1's neighbour is in the same parallel-merge region.
+        // A1's neighbor is in the same parallel-merge region.
         let c =
             derive_spatial_merge_candidates(&neigh, no_split(), (true, false, false, false, false));
         assert!(c.a1.is_none());
@@ -1388,7 +1388,7 @@ mod tests {
         assert_eq!(chosen.ref_idx_l1, -1);
     }
 
-    /// Build an [`MvpContext`] for list 0 where every neighbour reference
+    /// Build an [`MvpContext`] for list 0 where every neighbor reference
     /// at `(list, ref_idx)` resolves to the same short-term POC `ref_poc`
     /// and the current reference is short-term at `cur_poc`.
     fn mvp_ctx_same<'a>(
@@ -1412,8 +1412,8 @@ mod tests {
     }
 
     #[test]
-    fn mvp_no_neighbours_pads_zero() {
-        let neigh = SpatialMergeNeighbours::default();
+    fn mvp_no_neighbors_pads_zero() {
+        let neigh = SpatialMergeNeighbors::default();
         let rp = |_: usize, _: i32| 0;
         let lt = |_: usize, _: i32| false;
         let st = |_: usize, _: i32| true;
@@ -1426,11 +1426,11 @@ mod tests {
     #[test]
     fn mvp_a_same_poc_no_scaling() {
         // A1 available, same-POC ⇒ mvpListLX[0] = A1's MV unchanged.
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [12, -8])),
             ..Default::default()
         };
-        let rp = |_: usize, _: i32| 0; // neighbour ref POC == cur ref POC.
+        let rp = |_: usize, _: i32| 0; // neighbor ref POC == cur ref POC.
         let lt = |_: usize, _: i32| false;
         let st = |_: usize, _: i32| true;
         let ctx = mvp_ctx_same(4, 0, &rp, &lt, &st);
@@ -1438,10 +1438,10 @@ mod tests {
     }
 
     #[test]
-    fn mvp_b_promotes_to_a_when_no_left_neighbour() {
+    fn mvp_b_promotes_to_a_when_no_left_neighbor() {
         // No A0/A1 ⇒ isScaledFlag == 0. B1 same-POC ⇒ step 4 copies B
         // into A, so mvpListLX[0] = B's MV.
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             b1: Some(uni_l0(0, [5, 5])),
             ..Default::default()
         };
@@ -1456,7 +1456,7 @@ mod tests {
     fn mvp_col_inserted_when_a_b_agree() {
         // A and B both available with the SAME MV ⇒ list has one entry
         // from A, Col fills slot 1 (step 2 keeps Col because mvA == mvB).
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [3, 3])),
             b1: Some(uni_l0(0, [3, 3])),
             ..Default::default()
@@ -1480,7 +1480,7 @@ mod tests {
     fn mvp_col_suppressed_when_a_b_differ() {
         // A and B available with DIFFERENT MVs ⇒ Col suppressed (step 2);
         // list = [mvA, mvB].
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [1, 0])),
             b1: Some(uni_l0(0, [2, 0])),
             ..Default::default()
@@ -1501,18 +1501,18 @@ mod tests {
 
     #[test]
     fn mvp_a_scales_when_poc_differs_short_term() {
-        // A0 unavailable for same-POC (neighbour ref POC != cur ref POC),
+        // A0 unavailable for same-POC (neighbor ref POC != cur ref POC),
         // but long-term status matches ⇒ pass-2 picks A1 + scales.
-        // curr_poc = 8, cur ref POC = 4 ⇒ tb = 4. Neighbour ref POC = 2
+        // curr_poc = 8, cur ref POC = 4 ⇒ tb = 4. Neighbor ref POC = 2
         // ⇒ td = 6. mv = [64, 0].
         // tx = (16384 + 3)/6 = 2731; distScale = clip((4*2731+32)>>6) =
         // (10956>>6) = 171; comp = (171*64 + 127)>>8 = (10944+127)>>8 =
         // 11071>>8 = 43.
-        let neigh = SpatialMergeNeighbours {
+        let neigh = SpatialMergeNeighbors {
             a1: Some(uni_l0(0, [64, 0])),
             ..Default::default()
         };
-        // Same-POC pass fails: neighbour ref POC (2) != cur ref POC (4).
+        // Same-POC pass fails: neighbor ref POC (2) != cur ref POC (4).
         let rp = |_: usize, _: i32| 2;
         let lt = |_: usize, _: i32| false; // long-term status matches (both short).
         let st = |_: usize, _: i32| true;

@@ -41,7 +41,7 @@ use crate::engine::residual::{
 
 /// The §7.3.8.5 `CuPredMode` of the coding unit containing this
 /// transform unit. Selects the §7.3.8.10 cross-component-prediction and
-/// adaptive-colour-transform gates and the §7.4.9.11 scan-order
+/// adaptive-color-transform gates and the §7.4.9.11 scan-order
 /// derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CuPredMode {
@@ -101,9 +101,9 @@ pub struct TransformUnitParams {
     /// `IntraPredModeC[ x0 ][ y0 ]` — the chroma intra-prediction mode
     /// (used by the §7.4.9.11 chroma scan-order derivation).
     pub intra_pred_mode_c: u32,
-    /// `intra_chroma_pred_mode[ x0 ][ y0 ]` — the raw signalled value,
+    /// `intra_chroma_pred_mode[ x0 ][ y0 ]` — the raw signaled value,
     /// needed by the §7.3.8.10 cross-component-prediction /
-    /// adaptive-colour-transform gates (the `intra_chroma_pred_mode == 4`
+    /// adaptive-color-transform gates (the `intra_chroma_pred_mode == 4`
     /// "derived-mode" condition).
     pub intra_chroma_pred_mode: u8,
     /// PPS `cu_qp_delta_enabled_flag` (§7.4.3.3.1) — the §7.3.8.14
@@ -126,9 +126,9 @@ pub struct TransformUnitParams {
     /// PPS `cross_component_prediction_enabled_flag` (§7.4.3.3.1) — the
     /// §7.3.8.10 `cross_comp_pred()` outer gate.
     pub cross_component_prediction_enabled_flag: bool,
-    /// SCC `residual_adaptive_colour_transform_enabled_flag`
+    /// SCC `residual_adaptive_color_transform_enabled_flag`
     /// (§7.4.3.3.1) — the §7.3.8.10 `tu_residual_act_flag` outer gate.
-    pub residual_adaptive_colour_transform_enabled_flag: bool,
+    pub residual_adaptive_color_transform_enabled_flag: bool,
     /// PPS `transform_skip_enabled_flag` (§7.4.3.3.1) — the §7.3.8.11
     /// `transform_skip_flag` presence gate.
     pub transform_skip_enabled_flag: bool,
@@ -155,12 +155,12 @@ pub struct TransformUnitParams {
     /// `BitDepthC` (eq. 9-14 input for chroma blocks).
     pub bit_depth_chroma: u8,
     /// `PartMode == PART_2Nx2N` — part of the §7.3.8.10
-    /// adaptive-colour-transform predicate.
+    /// adaptive-color-transform predicate.
     pub part_mode_2nx2n: bool,
     /// The four corner `intra_chroma_pred_mode` values at the
     /// quarter-block positions `(xP, yP)`, `(xP+nCbS/2, yP)`,
     /// `(xP, yP+nCbS/2)`, `(xP+nCbS/2, yP+nCbS/2)` — used only by the
-    /// `MODE_INTRA` branch of the §7.3.8.10 adaptive-colour-transform
+    /// `MODE_INTRA` branch of the §7.3.8.10 adaptive-color-transform
     /// predicate (all four must be `4`). Order is row-major:
     /// `[tl, tr, bl, br]`.
     pub intra_chroma_pred_mode_corners: [u8; 4],
@@ -229,7 +229,7 @@ pub struct QuantGroupState {
 /// 1. `cbfChroma` is derived (eq. in §7.3.8.10) from the supplied
 ///    `cbf_cb` / `cbf_cr` (plus their `ChromaArrayType == 2` lower-half
 ///    companions).
-/// 2. When `cbfLuma || cbfChroma`, the §7.3.8.10 adaptive-colour-
+/// 2. When `cbfLuma || cbfChroma`, the §7.3.8.10 adaptive-color-
 ///    transform predicate is evaluated; if it holds,
 ///    `tu_residual_act_flag` is read, else it is inferred to 0.
 /// 3. `delta_qp()` and `chroma_qp_offset()` are read, each gated on its
@@ -257,13 +257,13 @@ pub fn decode_transform_unit(
         || (params.chroma_array_type == 2 && (params.cbf_cb_lower || params.cbf_cr_lower));
 
     if params.cbf_luma || cbf_chroma {
-        // §7.3.8.10 adaptive-colour-transform predicate — a THREE-way
+        // §7.3.8.10 adaptive-color-transform predicate — a THREE-way
         // disjunction: MODE_INTER, or a PART_2Nx2N intra CU whose
         // intra_chroma_pred_mode[ x0 ][ y0 ] is 4 (derived-mode), or
         // an intra CU whose four MinCb-quadrant
         // intra_chroma_pred_mode[ xP.. ][ yP.. ] values are ALL 4 (the
         // PART_NxN derived-mode case).
-        let act_gate = params.residual_adaptive_colour_transform_enabled_flag
+        let act_gate = params.residual_adaptive_color_transform_enabled_flag
             && (params.cu_pred_mode == CuPredMode::Inter
                 || (params.part_mode_2nx2n && params.intra_chroma_pred_mode == 4)
                 || params
@@ -379,7 +379,7 @@ pub fn decode_transform_unit(
         // Deferred-chroma path: the chroma residuals of the four luma
         // sub-blocks are coded against the parent node at the last luma
         // leaf. residual_coding( xBase, yBase, log2TrafoSize, 1/2 ),
-        // here parameterised at the parent log2TrafoSize. No
+        // here parameterized at the parent log2TrafoSize. No
         // cross_comp_pred in this branch (the §7.3.8.10 table only
         // invokes cross_comp_pred in the in-place branch).
         let chroma_sub_blocks = if params.chroma_array_type == 2 { 2 } else { 1 };
@@ -554,7 +554,7 @@ mod tests {
             cu_transquant_bypass_flag: false,
             sign_data_hiding_enabled_flag: false,
             cross_component_prediction_enabled_flag: false,
-            residual_adaptive_colour_transform_enabled_flag: false,
+            residual_adaptive_color_transform_enabled_flag: false,
             transform_skip_enabled_flag: false,
             log2_max_transform_skip_size: 2,
             implicit_rdpcm_enabled_flag: false,
@@ -574,7 +574,7 @@ mod tests {
     /// transform unit, no engine bins consumed.
     #[test]
     fn empty_transform_unit_reads_no_bins() {
-        // The engine is initialised but must not be consulted since no
+        // The engine is initialized but must not be consulted since no
         // cbf is set; the context bank must be left untouched.
         let data = [0x5Au8; 96];
         let mut engine = CabacEngine::new(BitReader::new(&data)).unwrap();
@@ -609,7 +609,7 @@ mod tests {
             let mut qg = QuantGroupState::default();
             let mut params = base_params();
             params.chroma_array_type = 3;
-            params.residual_adaptive_colour_transform_enabled_flag = true;
+            params.residual_adaptive_color_transform_enabled_flag = true;
             params.cbf_luma = true;
             params.log2_trafo_size = 2;
             params.part_mode_2nx2n = part_2nx2n;

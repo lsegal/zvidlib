@@ -19,7 +19,7 @@
 //! The hardware backends decode the same chunks. A chunk's headers are read
 //! before it reaches the platform decoder, so each sample still shows exactly
 //! one frame, and the decoded picture is cropped to the size its header names
-//! and converted by [`picture_to_rgba`] with the colour space and range the
+//! and converted by [`picture_to_rgba`] with the color space and range the
 //! header names, exactly as a software picture is.
 
 #[doc(hidden)]

@@ -338,7 +338,7 @@ impl Dpb {
     /// [`CURR_PIC`] sentinel — after `RefPicSetLtCurr` on every pass,
     /// and the equation 8-9 closing clause overrides the last active
     /// `RefPicList0` slot when the temp list was longer than the
-    /// active count and no explicit modification was signalled.
+    /// active count and no explicit modification was signaled.
     #[must_use]
     pub fn build_ref_pic_lists(
         &self,

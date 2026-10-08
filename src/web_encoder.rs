@@ -329,7 +329,7 @@ impl WebVideoEncodeSession {
 
         // AV1's sequence header travels in-band in the bitstream, so the
         // real `av1C` is derived from the key chunk's own bytes, and so is
-        // VP9's colour description for its `vpcC`. HEVC's
+        // VP9's color description for its `vpcC`. HEVC's
         // parameter sets are genuinely out-of-band, so its `hvcC` is instead
         // read from `EncodedVideoChunkMetadata.decoderConfig.description`.
         // VP8 has no configuration record at all: its key frames carry

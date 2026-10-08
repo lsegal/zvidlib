@@ -425,7 +425,7 @@ pub struct ResidualCodingParams {
     /// §9.3.3.4 limited EGk binarization with the eq. 9-14
     /// `log2TransformRange`.
     pub extended_precision_processing_flag: bool,
-    /// `BitDepth` of the block's colour component (eq. 9-14 input;
+    /// `BitDepth` of the block's color component (eq. 9-14 input;
     /// only consulted when `extended_precision_processing_flag`).
     pub bit_depth: u8,
     /// The eq. 9-20/9-21 `sbType` discriminator:
@@ -1163,7 +1163,7 @@ mod tests {
 
     /// 8x8 luma block, last-significant at (4, 4) (sub-block (1, 1)):
     /// exercises the `coded_sub_block_flag` decode + §9.3.4.2.4
-    /// neighbour ctxInc, the §7.4.9.11 `inferSbDcSigCoeffFlag` DC
+    /// neighbor ctxInc, the §7.4.9.11 `inferSbDcSigCoeffFlag` DC
     /// inference (sub-block (0, 1) decodes 15 zero sig bins, so its
     /// DC cell is inferred 1), and the §9.3.4.2.6 eq.-9-58 ctxSet
     /// bump across sub-blocks (prior sub-block's greater-1 bin was 1
@@ -1193,8 +1193,8 @@ mod tests {
         );
         assert_eq!(block.levels.iter().filter(|&&v| v != 0).count(), 2);
 
-        // §9.3.4.2.4 ctxInc: sub-block (1,0) sees below-neighbour
-        // (1,1) coded ⇒ 1; sub-block (0,1) sees right-neighbour (1,1)
+        // §9.3.4.2.4 ctxInc: sub-block (1,0) sees below-neighbor
+        // (1,1) coded ⇒ 1; sub-block (0,1) sees right-neighbor (1,1)
         // coded ⇒ 1.
         let csbf_log: Vec<u32> = bins
             .log

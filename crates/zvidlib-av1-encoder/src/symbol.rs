@@ -33,13 +33,13 @@ pub struct SymbolEncoder {
     /// Low end of the coding interval, kept wider than 16 bits so carries accumulate losslessly
     /// (resolved in [`SymbolEncoder::finish`]).
     low: u64,
-    /// Current range, renormalised into `[1 << 15, 1 << 16)`.
+    /// Current range, renormalized into `[1 << 15, 1 << 16)`.
     rng: u32,
     /// Bit counter; starts at `-9` so the first carry/byte crosses zero at the right moment.
     cnt: i32,
     /// Coded bytes, already carry-resolved. `od_ec` buffers every byte as a `u16` and resolves the
     /// pending carries in a second reverse pass over the whole stream at `finish`; this keeps the
-    /// sink half as wide and drops that pass by normalising each byte as it arrives (see
+    /// sink half as wide and drops that pass by normalizing each byte as it arrives (see
     /// [`SymbolEncoder::push_byte`]).
     out: Vec<u8>,
     /// Length of the run of `0xFF` bytes at the end of `out`, which is exactly the span an
@@ -70,7 +70,7 @@ impl SymbolEncoder {
     ///
     /// # Panics
     ///
-    /// Debug builds assert `symbol < cdf.len()` and the CDF normalisation invariants.
+    /// Debug builds assert `symbol < cdf.len()` and the CDF normalization invariants.
     pub fn encode_symbol(&mut self, symbol: usize, cdf: &[u16]) {
         let nsyms = cdf.len();
         debug_assert!(symbol < nsyms);
@@ -95,7 +95,7 @@ impl SymbolEncoder {
         if n == 0 {
             return;
         }
-        // Specialisation of `encode_q15` for the fixed CDF `{1 << 14, 1 << 15}`, which is the only
+        // Specialization of `encode_q15` for the fixed CDF `{1 << 14, 1 << 15}`, which is the only
         // one `read_bool` ever uses. With `nsyms = 2` both branches collapse onto the same
         // split point
         //
@@ -169,7 +169,7 @@ impl SymbolEncoder {
         self.normalize(low, r);
     }
 
-    /// Renormalises `(low, rng)` back into `[1 << 15, 1 << 16)`, emitting completed bytes into
+    /// Renormalizes `(low, rng)` back into `[1 << 15, 1 << 16)`, emitting completed bytes into
     /// `precarry`. Mirrors `od_ec_enc_normalize`.
     fn normalize(&mut self, mut low: u64, rng: u32) {
         // `d` = number of left shifts to bring `rng` to 16 bits. `rng` is in `[1, 0xFFFF]` here.
@@ -197,10 +197,10 @@ impl SymbolEncoder {
     /// Appends one nine-bit `od_ec` output digit, resolving its carry immediately.
     ///
     /// The buffered stream is a base-256 numeral whose digits arrive most-significant first, so a
-    /// digit above `0xFF` carries one into the byte already written. `out` is kept normalised, so
+    /// digit above `0xFF` carries one into the byte already written. `out` is kept normalized, so
     /// that carry can only sweep the trailing run of `0xFF` bytes — which is what `ff_run` tracks —
     /// before landing on a byte that can absorb it. Each `0xFF` is pushed once and swept at most
-    /// once, so the sweep is amortised constant time. A carry off the front of the stream is
+    /// once, so the sweep is amortized constant time. A carry off the front of the stream is
     /// discarded, exactly as `od_ec_enc_done`'s reverse pass discards it.
     fn push_byte(&mut self, value: u16) {
         debug_assert!(value <= 0x1ff, "od_ec output digits are nine bits wide");
@@ -315,7 +315,7 @@ mod tests {
             }
             self.range = prev - cur;
             self.value -= cur;
-            // Renormalisation (AV1 §8.2.6 ordered steps).
+            // Renormalization (AV1 §8.2.6 ordered steps).
             let bits = 15 - (31 - self.range.leading_zeros());
             self.range <<= bits;
             let num_bits = core::cmp::min(i64::from(bits), self.max_bits.max(0)) as u32;

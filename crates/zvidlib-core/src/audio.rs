@@ -191,8 +191,8 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
                     self.decoder.reset()?;
                 }
                 for index in plan.from..=plan.last {
-                    if cancellation.is_cancelled() {
-                        return Err(cancelled());
+                    if cancellation.is_canceled() {
+                        return Err(canceled());
                     }
                     let buffer = self.decoder.decode(&self.packets[index], cancellation)?;
                     self.accept_decoded(&plan, index, buffer)?;
@@ -227,8 +227,8 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
             let Some(media) = mapping.media else { continue };
             if let Some(plan) = self.plan_decode(media)? {
                 let buffers = decode(plan.reset, &self.packets[plan.from..=plan.last]).await?;
-                if cancellation.is_cancelled() {
-                    return Err(cancelled());
+                if cancellation.is_canceled() {
+                    return Err(canceled());
                 }
                 if buffers.len() != plan.last - plan.from + 1 {
                     return Err(Error::new(
@@ -255,8 +255,8 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         if range.end > self.presentation_length {
             return Err(invalid("audio request exceeds the presentation duration"));
         }
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
+        if cancellation.is_canceled() {
+            return Err(canceled());
         }
         let sample_count = range
             .len()
@@ -591,8 +591,8 @@ fn invalid(message: &str) -> Error {
 fn limit(message: &str) -> Error {
     Error::new(ErrorKind::ResourceLimit, message)
 }
-fn cancelled() -> Error {
-    Error::new(ErrorKind::Cancelled, "audio decode cancelled")
+fn canceled() -> Error {
+    Error::new(ErrorKind::Canceled, "audio decode canceled")
 }
 
 #[cfg(test)]
@@ -616,8 +616,8 @@ mod tests {
             sample: &EncodedAudioSample,
             cancellation: &CancellationToken,
         ) -> Result<AudioBuffer> {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
+            if cancellation.is_canceled() {
+                return Err(canceled());
             }
             self.counts.decodes.set(self.counts.decodes.get() + 1);
             let values = (sample.decoded_range.start..sample.decoded_range.end)
@@ -751,7 +751,7 @@ mod tests {
         let error = reader
             .get_range(SampleRange::new(0, 1).unwrap(), &cancellation)
             .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(error.kind(), ErrorKind::Canceled);
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! sample returns no [`DecodedVideoFrame`].
 //!
 //! Decoded pictures are 4:2:0 BT.601 in the limited range, which is the only
-//! colour space VP8 defines, and are converted to `Rgba8` with
+//! color space VP8 defines, and are converted to `Rgba8` with
 //! [`convert_to_rgba8`]. Like the other software decoders, decoding runs on
 //! the calling thread.
 //!

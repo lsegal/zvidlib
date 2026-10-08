@@ -9,7 +9,7 @@
 //! bits) are surfaced as an **opaque tail**: a copy of the
 //! still-unparsed RBSP bytes plus the bit offset within the first
 //! byte at which the opaque tail begins. The per-extension
-//! `sps_*_extension( )` syntax structures are not materialised yet.
+//! `sps_*_extension( )` syntax structures are not materialized yet.
 //!
 //! When `scaling_list_enabled_flag == 1` and
 //! `sps_scaling_list_data_present_flag == 1`, the §7.3.4
@@ -27,7 +27,7 @@
 //! sps_seq_parameter_set_id                        ue(v)
 //! chroma_format_idc                               ue(v)
 //! if( chroma_format_idc == 3 )
-//!   separate_colour_plane_flag                     u(1)
+//!   separate_color_plane_flag                     u(1)
 //! pic_width_in_luma_samples                       ue(v)
 //! pic_height_in_luma_samples                      ue(v)
 //! conformance_window_flag                          u(1)
@@ -277,8 +277,8 @@ pub struct PcmInfo {
 }
 
 /// Short-term reference picture set per §7.3.7. Only the explicit
-/// (non-inter-predicted) form materialises the per-entry POC and
-/// `used_by_curr_pic` arrays; the inter-RPS-prediction form materialises
+/// (non-inter-predicted) form materializes the per-entry POC and
+/// `used_by_curr_pic` arrays; the inter-RPS-prediction form materializes
 /// only the inputs to the §7.4.8 derivation (`delta_idx_minus1`,
 /// `delta_rps_sign`, `abs_delta_rps_minus1`, and the
 /// `used_by_curr_pic_flag` / `use_delta_flag` arrays of length
@@ -286,7 +286,7 @@ pub struct PcmInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShortTermRefPicSet {
     /// `inter_ref_pic_set_prediction_flag` — inferred to 0 when not
-    /// signalled (i.e. always 0 for `stRpsIdx == 0`).
+    /// signaled (i.e. always 0 for `stRpsIdx == 0`).
     pub inter_ref_pic_set_prediction_flag: bool,
     /// `delta_idx_minus1` (only meaningful when
     /// `inter_ref_pic_set_prediction_flag == 1` and the index this RPS
@@ -332,7 +332,7 @@ impl ShortTermRefPicSet {
     /// `NumDeltaPocs[stRpsIdx]` per §7.4.8: in the explicit form this
     /// is `num_negative_pics + num_positive_pics`; in the inter-RPS
     /// form the exact count requires the §7.4.8 derivation
-    /// (equations 7-61 / 7-62 / 7-71) against a materialised source
+    /// (equations 7-61 / 7-62 / 7-71) against a materialized source
     /// RPS. See [`Self::materialize`] / [`MaterializedShortTermRefPicSet`]
     /// for the full derivation.
     ///
@@ -340,7 +340,7 @@ impl ShortTermRefPicSet {
     /// `use_delta_flag[j] == 1` entries, which is an upper bound that
     /// happens to be exact when none of the source POCs flip sign
     /// across `deltaRps`. Callers that need the exact wire-conformant
-    /// count must materialise the RPS chain.
+    /// count must materialize the RPS chain.
     pub fn num_delta_pocs(&self) -> u32 {
         if self.inter_ref_pic_set_prediction_flag {
             self.use_delta_flag.iter().filter(|&&v| v).count() as u32
@@ -349,7 +349,7 @@ impl ShortTermRefPicSet {
         }
     }
 
-    /// Materialise this `st_ref_pic_set(stRpsIdx)` into the post-§7.4.8
+    /// Materialize this `st_ref_pic_set(stRpsIdx)` into the post-§7.4.8
     /// per-position arrays `(NumNegativePics, DeltaPocS0[],
     /// UsedByCurrPicS0[], NumPositivePics, DeltaPocS1[],
     /// UsedByCurrPicS1[])` consumed by §7.4.7.2 and downstream paths.
@@ -369,7 +369,7 @@ impl ShortTermRefPicSet {
     ///   equations 7-61 (negative side, source-S1-reverse +
     ///   `deltaRps`-self + source-S0-forward) and 7-62 (positive side,
     ///   source-S0-reverse + `deltaRps`-self + source-S1-forward) over
-    ///   the already-materialised source RPS supplied via `source`,
+    ///   the already-materialized source RPS supplied via `source`,
     ///   with `deltaRps = (1 - 2*delta_rps_sign) *
     ///   (abs_delta_rps_minus1 + 1)`. The output's
     ///   `NumNegativePics` / `NumPositivePics` reflect the surviving
@@ -502,11 +502,11 @@ impl ShortTermRefPicSet {
 pub enum ShortTermRefPicSetMaterializeError {
     /// The RPS uses inter-RPS prediction
     /// (`inter_ref_pic_set_prediction_flag == 1`) but the caller did
-    /// not supply a materialised source RPS.
+    /// not supply a materialized source RPS.
     MissingSource,
     /// The on-wire `used_by_curr_pic_flag` / `use_delta_flag` arrays
     /// did not match the source RPS's `NumDeltaPocs[RefRpsIdx] + 1`
-    /// length. This indicates the parser and the materialiser saw
+    /// length. This indicates the parser and the materializer saw
     /// different source RPSes (most likely a `RefRpsIdx` mismatch).
     SourceLengthMismatch {
         /// Expected length: `NumDeltaPocs[RefRpsIdx] + 1`.
@@ -522,7 +522,7 @@ impl core::fmt::Display for ShortTermRefPicSetMaterializeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::MissingSource => f.write_str(
-                "short-term RPS materialise: inter_ref_pic_set_prediction_flag is set but no source RPS supplied",
+                "short-term RPS materialize: inter_ref_pic_set_prediction_flag is set but no source RPS supplied",
             ),
             Self::SourceLengthMismatch {
                 expected,
@@ -530,7 +530,7 @@ impl core::fmt::Display for ShortTermRefPicSetMaterializeError {
                 got_delta,
             } => write!(
                 f,
-                "short-term RPS materialise: per-position array length mismatch: expected {expected}, got used={got_used} delta={got_delta}"
+                "short-term RPS materialize: per-position array length mismatch: expected {expected}, got used={got_used} delta={got_delta}"
             ),
         }
     }
@@ -538,7 +538,7 @@ impl core::fmt::Display for ShortTermRefPicSetMaterializeError {
 
 impl std::error::Error for ShortTermRefPicSetMaterializeError {}
 
-/// Materialised short-term reference-picture-set per §7.4.8 — the
+/// Materialized short-term reference-picture-set per §7.4.8 — the
 /// post-derivation form that exposes the per-position `DeltaPocS0[]`,
 /// `UsedByCurrPicS0[]`, `DeltaPocS1[]`, `UsedByCurrPicS1[]` arrays as
 /// signed POC deltas. `NumNegativePics[stRpsIdx]` and
@@ -652,7 +652,7 @@ pub struct SpsExtensionFlags {
     /// consume but ignore the `sps_extension_data_flag` while-loop it
     /// gates, so the parser surfaces the value verbatim. The trailing
     /// `while( more_rbsp_data() ) sps_extension_data_flag` block (only
-    /// signalled when this field is non-zero) is surfaced inside the
+    /// signaled when this field is non-zero) is surfaced inside the
     /// opaque tail.
     pub sps_extension_4bits: u8,
 }
@@ -672,7 +672,7 @@ impl SpsExtensionFlags {
     }
 
     /// True when the `sps_scc_extension()` body can be decoded in
-    /// place — it is signalled and no still-opaque body
+    /// place — it is signaled and no still-opaque body
     /// (`sps_multilayer_extension()` / `sps_3d_extension()`) precedes
     /// it in the bit stream. When a multilayer / 3D body precedes it,
     /// the SCC body stays inside the opaque tail.
@@ -721,7 +721,7 @@ pub struct SpsSccExtension {
     /// palette_max_size + value` (eq. 7-35).
     pub delta_palette_max_predictor_size: u32,
     /// `sps_palette_predictor_initializers_present_flag` — when 1, the
-    /// sequence palette predictor is initialised from
+    /// sequence palette predictor is initialized from
     /// [`Self::sps_palette_predictor_initializer`].
     pub sps_palette_predictor_initializers_present_flag: bool,
     /// `sps_num_palette_predictor_initializers_minus1` (`ue(v)`),
@@ -732,7 +732,7 @@ pub struct SpsSccExtension {
     /// indexed `[comp][i]`. `comp` runs over `numComps` (1 when
     /// `chroma_format_idc == 0`, else 3). Each value is `u(v)` —
     /// `BitDepthY` bits for `comp == 0`, `BitDepthC` bits otherwise.
-    /// Empty when no initializers are signalled.
+    /// Empty when no initializers are signaled.
     pub sps_palette_predictor_initializer: Vec<Vec<u32>>,
     /// `motion_vector_resolution_control_idc` (`u(2)`) — controls the
     /// presence / inference of `use_integer_mv_flag`.
@@ -871,7 +871,7 @@ pub struct SpsRangeExtension {
     /// transform processing.
     pub extended_precision_processing_flag: bool,
     /// `intra_smoothing_disabled_flag` — when 1, the filtering process
-    /// of neighbouring samples is unconditionally disabled for intra
+    /// of neighboring samples is unconditionally disabled for intra
     /// prediction.
     pub intra_smoothing_disabled_flag: bool,
     /// `high_precision_offsets_enabled_flag` — when 1, weighted
@@ -880,7 +880,7 @@ pub struct SpsRangeExtension {
     pub high_precision_offsets_enabled_flag: bool,
     /// `persistent_rice_adaptation_enabled_flag` — when 1, the Rice
     /// parameter derivation for the binarization of
-    /// `coeff_abs_level_remaining[]` is initialised at the start of
+    /// `coeff_abs_level_remaining[]` is initialized at the start of
     /// each sub-block using mode-dependent statistics accumulated from
     /// previous sub-blocks.
     pub persistent_rice_adaptation_enabled_flag: bool,
@@ -925,9 +925,9 @@ pub struct SeqParameterSet {
     /// `chroma_format_idc` (`ue(v)`, range 0..=3). 0 monochrome, 1
     /// 4:2:0, 2 4:2:2, 3 4:4:4.
     pub chroma_format_idc: u8,
-    /// `separate_colour_plane_flag`. Inferred to false when not
-    /// signalled (which is whenever `chroma_format_idc != 3`).
-    pub separate_colour_plane_flag: bool,
+    /// `separate_color_plane_flag`. Inferred to false when not
+    /// signaled (which is whenever `chroma_format_idc != 3`).
+    pub separate_color_plane_flag: bool,
     /// `pic_width_in_luma_samples` (`ue(v)`).
     pub pic_width_in_luma_samples: u32,
     /// `pic_height_in_luma_samples` (`ue(v)`).
@@ -947,7 +947,7 @@ pub struct SeqParameterSet {
     /// `sps_sub_layer_ordering_info_present_flag`.
     pub sub_layer_ordering_info_present_flag: bool,
     /// Per-sub-layer DPB / reorder / latency triples. Indices outside
-    /// `0..=max_sub_layers_minus1` are zero-initialised; when the
+    /// `0..=max_sub_layers_minus1` are zero-initialized; when the
     /// present flag was 0 every lower-indexed entry is copied from
     /// the `[max_sub_layers_minus1]` slot (§7.4.3.2.1).
     pub sub_layer_ordering_info: [SubLayerOrderingInfo; HEVC_MAX_SUB_LAYERS],
@@ -1055,16 +1055,16 @@ impl SeqParameterSet {
         Self::parse_inner(&mut br, rbsp)
     }
 
-    /// Materialise the full SPS-level `short_term_ref_pic_sets[]`
+    /// Materialize the full SPS-level `short_term_ref_pic_sets[]`
     /// list into the post-§7.4.8 form, chaining inter-RPS-prediction
     /// entries through their `RefRpsIdx = stRpsIdx -
     /// (delta_idx_minus1 + 1)` source.
     ///
     /// The returned vector is the same length as
     /// [`Self::short_term_ref_pic_sets`], and the `idx`-th element is
-    /// the materialisation of
+    /// the materialization of
     /// `self.short_term_ref_pic_sets[idx]`. Returns an error if any
-    /// in-chain materialisation fails (e.g. `RefRpsIdx` underflow,
+    /// in-chain materialization fails (e.g. `RefRpsIdx` underflow,
     /// `used_by_curr_pic_flag` / `use_delta_flag` length mismatch).
     pub fn materialize_short_term_ref_pic_sets(
         &self,
@@ -1125,7 +1125,7 @@ impl SeqParameterSet {
         }
         let chroma_format_idc = chroma_format_idc_raw as u8;
 
-        let separate_colour_plane_flag = if chroma_format_idc == 3 {
+        let separate_color_plane_flag = if chroma_format_idc == 3 {
             br.u1()? != 0
         } else {
             false
@@ -1400,7 +1400,7 @@ impl SeqParameterSet {
 
         let vui_parameters_present_flag = br.u1()? != 0;
         // §E.2.1: the vui_parameters() body is decoded in full when
-        // signalled, with the nested hrd_parameters( 1,
+        // signaled, with the nested hrd_parameters( 1,
         // sps_max_sub_layers_minus1 ) call taking the SPS-level
         // maxNumSubLayersMinus1. Parsing then continues to
         // sps_extension_present_flag in both paths.
@@ -1418,7 +1418,7 @@ impl SeqParameterSet {
             opaque_tail,
         ) = if br.bits_left() == 0 {
             // The fixture corpus encoders sometimes elide the
-            // sps_extension_present_flag if no extension is signalled
+            // sps_extension_present_flag if no extension is signaled
             // and the rbsp_trailing_bits happens to land on a byte
             // boundary; the field is still required, so a buffer with
             // no bits left here is a truncation.
@@ -1440,7 +1440,7 @@ impl SeqParameterSet {
                     sps_scc_extension_flag,
                     sps_extension_4bits,
                 };
-                // §7.3.2.2.1: the range extension body (if signalled)
+                // §7.3.2.2.1: the range extension body (if signaled)
                 // is the first to follow the eight typed flag bits, so
                 // decode it in full.
                 let range_ext = if flags.sps_range_extension_flag {
@@ -1490,7 +1490,7 @@ impl SeqParameterSet {
             ptl,
             sps_id,
             chroma_format_idc,
-            separate_colour_plane_flag,
+            separate_color_plane_flag,
             pic_width_in_luma_samples,
             pic_height_in_luma_samples,
             conformance_window_flag,
@@ -1611,7 +1611,7 @@ impl ShortTermRefPicSet {
     ///
     /// * `st_rps_idx` is `stRpsIdx`.
     /// * `num_short_term_ref_pic_sets` is the SPS-level count being
-    ///   constructed (used to detect when `delta_idx_minus1` is signalled).
+    ///   constructed (used to detect when `delta_idx_minus1` is signaled).
     /// * `prev` is the previously-parsed RPS, used when the
     ///   inter-RPS-prediction form is invoked without explicit
     ///   `delta_idx_minus1` (i.e. `stRpsIdx < num_short_term_ref_pic_sets`).
@@ -1630,7 +1630,7 @@ impl ShortTermRefPicSet {
             false
         };
         if inter_ref_pic_set_prediction_flag {
-            // delta_idx_minus1 is only signalled when the RPS being
+            // delta_idx_minus1 is only signaled when the RPS being
             // constructed is the slice-header in-line RPS, i.e.
             // stRpsIdx == num_short_term_ref_pic_sets. For SPS-resident
             // entries the value is inferred to 0 per §7.4.8.
@@ -1790,7 +1790,7 @@ mod tests {
     /// walk (profile_idc=1, level=30), sps_id=0, chroma_format_idc=1,
     /// conf_win=0, bit_depths=0, log2_max_poc_lsb_minus4=4,
     /// ordering_info present with single triple {0,0,0}`.
-    fn synthesised_header_through_ordering(width_ue: &str, height_ue: &str) -> String {
+    fn synthesized_header_through_ordering(width_ue: &str, height_ue: &str) -> String {
         let mut s = String::new();
         s += "0000"; // vps_id
         s += "000"; // max_sub_layers_minus1
@@ -1841,8 +1841,8 @@ mod tests {
     ///
     /// This is the EXACT same prefix the round-3 tests used; the round-4
     /// tail tests then concatenate the tail bits they want to exercise.
-    fn synthesised_prefix_bits() -> String {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+    fn synthesized_prefix_bits() -> String {
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         // log2_min_cb_minus3 = 0
         s += "1";
         // log2_diff = 1 → '010'
@@ -1893,7 +1893,7 @@ mod tests {
         assert_eq!(sps.ptl.general_level_idc, 30);
         assert_eq!(sps.sps_id, 0);
         assert_eq!(sps.chroma_format_idc, 1);
-        assert!(!sps.separate_colour_plane_flag);
+        assert!(!sps.separate_color_plane_flag);
         assert_eq!(sps.pic_width_in_luma_samples, 16);
         assert_eq!(sps.pic_height_in_luma_samples, 16);
         assert!(!sps.conformance_window_flag);
@@ -1947,7 +1947,7 @@ mod tests {
         let vst = vui.video_signal_type.as_ref().expect("video signal type");
         assert_eq!(vst.video_format, 5); // unspecified
         assert!(!vst.video_full_range_flag);
-        assert!(vst.colour_description.is_none());
+        assert!(vst.color_description.is_none());
         assert!(!vui.chroma_loc_info_present_flag);
         assert!(!vui.neutral_chroma_indication_flag);
         assert!(!vui.field_seq_flag);
@@ -2026,7 +2026,7 @@ mod tests {
     }
 
     /// Hand-assembled SPS exercising the `chroma_format_idc == 3`
-    /// path (so `separate_colour_plane_flag` is signalled) plus the
+    /// path (so `separate_color_plane_flag` is signaled) plus the
     /// `conformance_window_flag == 1` four-`ue(v)` block. The remaining
     /// fields are kept at minimal values to make the bit string
     /// hand-traceable.
@@ -2053,7 +2053,7 @@ mod tests {
         s += "1";
         // chroma_format_idc=3 → '00100'
         s += "00100";
-        // separate_colour_plane_flag=1
+        // separate_color_plane_flag=1
         s += "1";
         // width=16, height=16
         s += "000010001";
@@ -2108,7 +2108,7 @@ mod tests {
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         assert_eq!(sps.chroma_format_idc, 3);
-        assert!(sps.separate_colour_plane_flag);
+        assert!(sps.separate_color_plane_flag);
         assert_eq!(sps.bit_depth_luma(), 10);
         assert!(sps.amp_enabled_flag);
         assert!(sps.sample_adaptive_offset_enabled_flag);
@@ -2212,12 +2212,12 @@ mod tests {
         assert!(sps.strong_intra_smoothing_enabled_flag);
     }
 
-    /// SPS prefix bits identical to `synthesised_prefix_bits()` but
+    /// SPS prefix bits identical to `synthesized_prefix_bits()` but
     /// stopping just *before* `scaling_list_enabled_flag` (i.e. after
     /// `max_transform_hierarchy_depth_intra`). Round 8 scaling-list
     /// tests append their own scaling_list block + the amp/sao bits +
     /// the SPS tail.
-    fn synthesised_prefix_before_scaling_list() -> String {
+    fn synthesized_prefix_before_scaling_list() -> String {
         let mut s = String::new();
         s += "0000"; // vps_id
         s += "000"; // max_sub_layers_minus1
@@ -2259,7 +2259,7 @@ mod tests {
     /// the round-4 minimal tail (sao=1, pcm=0, num_short_term_rps=0,
     /// long_term=0, temporal_mvp=1, strong_intra_smoothing=1, vui=0,
     /// extension=0, stop=1).
-    fn synthesised_tail_after_scaling_list() -> String {
+    fn synthesized_tail_after_scaling_list() -> String {
         let mut s = String::new();
         s += "0"; // amp_enabled=0
         s += "1"; // sao_enabled=1
@@ -2280,10 +2280,10 @@ mod tests {
     /// no explicit [`ScalingListData`].
     #[test]
     fn scaling_list_enabled_default_lists() {
-        let mut s = synthesised_prefix_before_scaling_list();
+        let mut s = synthesized_prefix_before_scaling_list();
         s += "1"; // scaling_list_enabled = 1
         s += "0"; // sps_scaling_list_data_present_flag = 0
-        s += &synthesised_tail_after_scaling_list();
+        s += &synthesized_tail_after_scaling_list();
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         assert!(sps.scaling_list_enabled_flag);
@@ -2298,7 +2298,7 @@ mod tests {
     /// the parsed lists equal the §7.4.5 default tables.
     #[test]
     fn scaling_list_enabled_explicit_all_default() {
-        let mut s = synthesised_prefix_before_scaling_list();
+        let mut s = synthesized_prefix_before_scaling_list();
         s += "1"; // scaling_list_enabled = 1
         s += "1"; // sps_scaling_list_data_present_flag = 1
         // scaling_list_data(): 24 slots, each pred_mode=0
@@ -2313,7 +2313,7 @@ mod tests {
                 m += step;
             }
         }
-        s += &synthesised_tail_after_scaling_list();
+        s += &synthesized_tail_after_scaling_list();
         let bytes = bits_to_bytes(&s);
         let sps = SeqParameterSet::parse(&bytes).expect("SPS parse");
         assert!(sps.scaling_list_enabled_flag);
@@ -2368,7 +2368,7 @@ mod tests {
     /// `CtbSizeY = 1 << CtbLog2SizeY` (eq. 7-13) re-derivation.
     #[test]
     fn rejects_ctb_log2_size_above_6() {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         // log2_min_luma_coding_block_size_minus3 = 0 → MinCbLog2SizeY = 3
         s += "1";
         // log2_diff_max_min_luma_coding_block_size ue = 4 → CtbLog2SizeY = 7
@@ -2388,7 +2388,7 @@ mod tests {
     /// 8×8-CTB SPS must be rejected.
     #[test]
     fn rejects_ctb_log2_size_below_4() {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         // log2_min_cb_minus3 = 0, log2_diff = 0 → CtbLog2SizeY = 3
         s += "1";
         s += "1";
@@ -2407,7 +2407,7 @@ mod tests {
     /// MinTbLog2SizeY greater than or equal to MinCbLog2SizeY".
     #[test]
     fn rejects_min_tb_log2_size_reaching_min_cb() {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         s += "1"; // MinCbLog2SizeY = 3
         s += "010"; // CtbLog2SizeY = 4
         s += "010"; // log2_min_tb_minus2 = 1 → MinTbLog2SizeY = 3 == MinCb
@@ -2426,7 +2426,7 @@ mod tests {
     /// MaxTbLog2SizeY greater than Min( CtbLog2SizeY, 5 )".
     #[test]
     fn rejects_max_tb_log2_size_above_cap() {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         s += "1"; // MinCbLog2SizeY = 3
         s += "010"; // CtbLog2SizeY = 4 → cap = Min(4, 5) = 4
         s += "1"; // MinTbLog2SizeY = 2
@@ -2446,7 +2446,7 @@ mod tests {
     /// to CtbLog2SizeY − MinTbLog2SizeY, inclusive" (= 2 here).
     #[test]
     fn rejects_transform_hierarchy_depth_above_cap() {
-        let mut s = synthesised_header_through_ordering("000010001", "000010001");
+        let mut s = synthesized_header_through_ordering("000010001", "000010001");
         s += "1"; // MinCbLog2SizeY = 3
         s += "010"; // CtbLog2SizeY = 4
         s += "1"; // MinTbLog2SizeY = 2
@@ -2478,7 +2478,7 @@ mod tests {
         for i in (0..len).rev() {
             ue.push(if (code >> i) & 1 == 1 { '1' } else { '0' });
         }
-        let s = synthesised_header_through_ordering(&ue, "000010001");
+        let s = synthesized_header_through_ordering(&ue, "000010001");
         let bytes = bits_to_bytes(&s);
         let err = SeqParameterSet::parse(&bytes).unwrap_err();
         assert_eq!(
@@ -2494,7 +2494,7 @@ mod tests {
     /// branch (§7.3.2.2 PCM block).
     #[test]
     fn parses_pcm_enabled() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         // pcm_enabled_flag = 1
         s += "1";
         // pcm_sample_bit_depth_luma_minus1 = 7 (PcmBitDepthY = 8)
@@ -2538,10 +2538,10 @@ mod tests {
     /// §7.4.3.2 / equation (7-25).
     #[test]
     fn rejects_pcm_bit_depth_exceeding_luma() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "1"; // pcm_enabled_flag
         // pcm_sample_bit_depth_luma_minus1 = 15 (PcmBitDepthY = 16)
-        // BitDepthY in the synthesised prefix is 8.
+        // BitDepthY in the synthesized prefix is 8.
         s += "1111";
         let bytes = bits_to_bytes(&s);
         let err = SeqParameterSet::parse(&bytes).unwrap_err();
@@ -2558,13 +2558,13 @@ mod tests {
     /// inter-RPS-prediction): 1 negative pic, 0 positive pics.
     #[test]
     fn parses_one_short_term_rps_explicit() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         // pcm_enabled_flag = 0
         s += "0";
         // num_short_term_ref_pic_sets = 1 → ue(v) codeNum 1 → '010'
         s += "010";
         // st_ref_pic_set(0): inter_ref_pic_set_prediction_flag is NOT
-        // signalled (st_rps_idx == 0); implicit 0.
+        // signaled (st_rps_idx == 0); implicit 0.
         //   num_negative_pics = 1 → '010'
         s += "010";
         //   num_positive_pics = 0 → '1'
@@ -2604,7 +2604,7 @@ mod tests {
     /// §7.3.7 with the `use_delta_flag` inference of §7.4.8.
     #[test]
     fn parses_inter_rps_prediction() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm_enabled_flag
         // num_short_term_ref_pic_sets = 2 → codeNum 2 → '011'
         s += "011";
@@ -2616,8 +2616,8 @@ mod tests {
         s += "1"; // used=1
         // st_ref_pic_set(1): inter_ref_pic_set_prediction_flag = 1
         s += "1";
-        //   delta_idx_minus1 is NOT signalled (st_rps_idx=1, num=2; only
-        //   signalled when st_rps_idx == num). Inferred to 0 →
+        //   delta_idx_minus1 is NOT signaled (st_rps_idx=1, num=2; only
+        //   signaled when st_rps_idx == num). Inferred to 0 →
         //   RefRpsIdx = 1 - (0+1) = 0.
         //   delta_rps_sign = 0
         s += "0";
@@ -2652,13 +2652,13 @@ mod tests {
     /// Hand-assembled SPS exercising the long-term-ref-pic block.
     #[test]
     fn parses_long_term_ref_pics() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
         s += "1"; // long_term_ref_pics_present_flag = 1
         // num_long_term_ref_pics_sps = 2 → codeNum 2 → '011'
         s += "011";
-        // log2_max_pic_order_cnt_lsb_minus4 = 4 in the synthesised
+        // log2_max_pic_order_cnt_lsb_minus4 = 4 in the synthesized
         // prefix, so lt_ref_pic_poc_lsb_sps[i] is 8 bits wide.
         //   i=0: poc_lsb = 0x10, used_by_curr_pic_lt_sps_flag = 1
         s += "00010000";
@@ -2691,7 +2691,7 @@ mod tests {
     /// tail is captured.
     #[test]
     fn decodes_vui_then_continues_to_extension_flag() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
         s += "0"; // long_term = 0
@@ -2723,7 +2723,7 @@ mod tests {
     /// surfaced as an opaque tail.
     #[test]
     fn decodes_vui_then_captures_extension_tail() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm_enabled_flag = 0
         s += "1"; // num_short_term_ref_pic_sets = 0
         s += "0"; // long_term = 0
@@ -2791,7 +2791,7 @@ mod tests {
     /// This is the RExt-profile entry point (§A.3.5).
     #[test]
     fn decodes_sps_range_extension_body() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -2835,7 +2835,7 @@ mod tests {
     /// are present.
     #[test]
     fn decodes_range_extension_then_scc_body_no_palette() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -2881,7 +2881,7 @@ mod tests {
     /// `BitDepthC`. `chroma_format_idc == 1` here gives `numComps == 3`.
     #[test]
     fn decodes_scc_extension_palette_initializers() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -2937,7 +2937,7 @@ mod tests {
     /// count once drove a multi-GiB `Vec::with_capacity`.
     #[test]
     fn rejects_oversized_palette_predictor_initializer_count() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -2973,7 +2973,7 @@ mod tests {
     /// reserved and rejected as out-of-range.
     #[test]
     fn rejects_reserved_motion_vector_resolution_control_idc() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3005,7 +3005,7 @@ mod tests {
     /// conformance and is rejected.
     #[test]
     fn rejects_delta_palette_when_max_size_zero() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3041,7 +3041,7 @@ mod tests {
     /// — no opaque tail is surfaced because no extension body follows.
     #[test]
     fn decodes_extension_flag_block_without_bodies() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3072,7 +3072,7 @@ mod tests {
     /// is decoded in place with no opaque tail. Palette mode disabled.
     #[test]
     fn decodes_scc_extension_body_no_range() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3114,7 +3114,7 @@ mod tests {
     /// the SCC body — stays in the opaque tail.
     #[test]
     fn scc_stays_opaque_behind_multilayer_body() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3149,7 +3149,7 @@ mod tests {
     /// rbsp_trailing_bits, so the bytes are surfaced as opaque).
     #[test]
     fn captures_extension_data_flag_tail_when_4bits_nonzero() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3174,7 +3174,7 @@ mod tests {
     /// 0 per §7.4.3.2.1.
     #[test]
     fn extension_flags_absent_when_gate_zero() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "0"; // long_term=0
@@ -3194,7 +3194,7 @@ mod tests {
     /// tail is captured (only the rbsp_trailing_bits remain).
     #[test]
     fn no_opaque_tail_when_flags_clear() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short=0
         s += "0"; // long_term=0
@@ -3213,7 +3213,7 @@ mod tests {
     /// `num_short_term_ref_pic_sets > 64` is illegal per §7.4.3.2.
     #[test]
     fn rejects_too_many_short_term_rps() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         // num_short_term_ref_pic_sets = 65 → codeNum 65
         // 65 in 0-th order Exp-Golomb: leadingZeroBits=6,
@@ -3231,7 +3231,7 @@ mod tests {
         ));
     }
 
-    /// §7.4.8 explicit-form materialisation: the cumulative recurrence
+    /// §7.4.8 explicit-form materialization: the cumulative recurrence
     /// for `DeltaPocS0[i]` (equation 7-69) and `DeltaPocS1[i]`
     /// (equation 7-70) starting from the equation-7-67 / 7-68 seeds.
     #[test]
@@ -3257,7 +3257,7 @@ mod tests {
             delta_poc_s1_minus1: vec![1, 0],
             used_by_curr_pic_s1_flag: vec![true, true],
         };
-        let m = rps.materialize(None).expect("explicit materialise");
+        let m = rps.materialize(None).expect("explicit materialize");
         assert_eq!(m.delta_poc_s0, vec![-1, -3, -4]);
         assert_eq!(m.used_by_curr_pic_s0, vec![true, false, true]);
         assert_eq!(m.delta_poc_s1, vec![2, 3]);
@@ -3301,7 +3301,7 @@ mod tests {
         };
         let m = inter
             .materialize(Some(&src))
-            .expect("inter-RPS materialise");
+            .expect("inter-RPS materialize");
         // Negative side (equation 7-61):
         //   * No source positives.
         //   * deltaRps = +1 ≥ 0, skip the self-term.
@@ -3432,7 +3432,7 @@ mod tests {
     /// `parses_inter_rps_prediction`.
     #[test]
     fn sps_materialize_chains_inter_rps_prediction() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm_enabled_flag
         s += "011"; // num_short_term_ref_pic_sets = 2
         // st_ref_pic_set(0): explicit num_neg=1, num_pos=0,
@@ -3480,7 +3480,7 @@ mod tests {
     /// `num_long_term_ref_pics_sps > 32` is illegal per §7.4.3.2.
     #[test]
     fn rejects_too_many_long_term_rps() {
-        let mut s = synthesised_prefix_bits();
+        let mut s = synthesized_prefix_bits();
         s += "0"; // pcm
         s += "1"; // num_short_term=0
         s += "1"; // long_term_ref_pics_present

@@ -356,10 +356,10 @@ fn hardware_refuses_what_the_software_decoder_refuses() {
     let error = decoder.submit(&hidden_only, &cancellation).unwrap_err();
     assert_eq!(error.kind(), ErrorKind::MalformedMedia);
 
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    let error = decoder.submit(&track.samples[0], &cancelled).unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    let canceled = CancellationToken::new();
+    canceled.cancel();
+    let error = decoder.submit(&track.samples[0], &canceled).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Canceled);
 }
 
 /// A 320x240 RGBA test card that pans four pixels a frame under a fixed block.

@@ -10,7 +10,7 @@
 //!
 //! The inter-frame tables below (`IS_INTER` through `MV_FR`) extend the same bounded slice to the
 //! single-reference NEARESTMV/GLOBALMV/NEWMV subset used by [`crate::av1_inter_decoder`]: a single
-//! fixed context (context 0) is used everywhere the full specification varies a CDF by neighbouring
+//! fixed context (context 0) is used everywhere the full specification varies a CDF by neighboring
 //! mode/skip/reference state, matching this module's existing "smallest context that keeps bitstream
 //! conformance" precedent (e.g. `TX_4X4`-only coefficient contexts above).
 
@@ -89,7 +89,7 @@ pub static INTRA_FRAME_Y_MODE_DC_DC: [u16; 13] = [
 
 pub use crate::av1_cdf_tables::TX_SIZE_CTXS;
 
-/// `TX_SIZE_CONTEXTS`: the neighbour-derived contexts `tx_depth` is coded under.
+/// `TX_SIZE_CONTEXTS`: the neighbor-derived contexts `tx_depth` is coded under.
 pub const TX_DEPTH_CTXS: usize = 3;
 
 /// The quantizer context the coefficient CDFs are selected by (spec §8.3.2:
@@ -192,10 +192,10 @@ pub static COEFF_BASE_CTX_OFFSET_4X4: [[u8; 5]; 5] = [
     [0, 0, 0, 0, 0],
 ];
 
-/// `Sig_Ref_Diff_Offset[TX_CLASS_2D]` (§8.3.2): `(row, col)` neighbour offsets for `coeff_base`.
+/// `Sig_Ref_Diff_Offset[TX_CLASS_2D]` (§8.3.2): `(row, col)` neighbor offsets for `coeff_base`.
 pub static SIG_REF_DIFF_OFFSET_2D: [(usize, usize); 5] = [(0, 1), (1, 0), (1, 1), (0, 2), (2, 0)];
 
-/// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbour offsets for `coeff_br`.
+/// `Mag_Ref_Offset_With_Tx_Class[TX_CLASS_2D]` (§8.3.2): neighbor offsets for `coeff_br`.
 pub static MAG_REF_OFFSET_2D: [(usize, usize); 3] = [(0, 1), (1, 0), (1, 1)];
 
 // --- Non-lossless (`base_q_idx != 0`) additions: the square transforms
@@ -397,10 +397,10 @@ pub fn tx_type_cdf(set: Av1TxSet, tx_size: usize, intra_dir: usize) -> Option<&'
 /// `maxTxCat = Max_Tx_Depth[MiSize] - 1`, and codes `maxTxCat == 0` (an 8x8
 /// block) as a single bit and every larger category as a ternary symbol.
 ///
-/// `ctx` counts how many of the above and left neighbours already carry a
+/// `ctx` counts how many of the above and left neighbors already carry a
 /// transform at least as wide (respectively as tall) as this block's
-/// `Max_Tx_Size_Rect`, so it is `0` for a block with no coded neighbour and
-/// `2` when both neighbours match or exceed it. Values above `2` saturate.
+/// `Max_Tx_Size_Rect`, so it is `0` for a block with no coded neighbor and
+/// `2` when both neighbors match or exceed it. Values above `2` saturate.
 #[must_use]
 pub fn tx_depth_cdf(block_width: usize, ctx: usize) -> (&'static [u16], usize) {
     let category = match block_width {
@@ -480,22 +480,22 @@ pub fn up_right_diagonal_scan(size: usize) -> Vec<usize> {
 /// `Default_Is_Inter_Cdf[0]`: is the block inter- or intra-predicted.
 pub static IS_INTER: [u16; 2] = [806, 32768];
 
-/// `Default_Comp_Mode_Cdf[1]`: no-neighbour single versus compound prediction.
+/// `Default_Comp_Mode_Cdf[1]`: no-neighbor single versus compound prediction.
 pub static COMP_MODE: [u16; 2] = [24035, 32768];
 
-/// `Default_Comp_Ref_Type_Cdf[2]`: no-neighbour compound direction type.
+/// `Default_Comp_Ref_Type_Cdf[2]`: no-neighbor compound direction type.
 pub static COMP_REF_TYPE: [u16; 2] = [9166, 32768];
 
-/// `Default_Uni_Comp_Ref_Cdf[1][0]`: no-neighbour forward versus backward pair.
+/// `Default_Uni_Comp_Ref_Cdf[1][0]`: no-neighbor forward versus backward pair.
 pub static UNI_COMP_REF: [u16; 2] = [23152, 32768];
 
-/// `Default_Uni_Comp_Ref_Cdf[1][1]`: no-neighbour LAST/LAST2 selection.
+/// `Default_Uni_Comp_Ref_Cdf[1][1]`: no-neighbor LAST/LAST2 selection.
 pub static UNI_COMP_REF_P1: [u16; 2] = [14173, 32768];
 
 /// `Default_Compound_Mode_Cdf[0]`: compound motion-vector mode.
 pub static COMPOUND_MODE: [u16; 8] = [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768];
 
-/// `Default_Single_Ref_Cdf[1][0]`: no-neighbour `single_ref_p1`.
+/// `Default_Single_Ref_Cdf[1][0]`: no-neighbor `single_ref_p1`.
 pub static SINGLE_REF_P1: [u16; 2] = [16973, 32768];
 
 /// `Default_Single_Ref_Cdf[0][2]`: LAST/LAST2 versus LAST3/GOLDEN.

@@ -40,7 +40,7 @@ pub struct Picture {
     cr: Vec<i32>,
 }
 
-/// The three colour components addressable in a [`Picture`].
+/// The three color components addressable in a [`Picture`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plane {
     /// The luma plane `SL`.

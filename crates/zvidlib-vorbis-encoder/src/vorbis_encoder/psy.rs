@@ -776,7 +776,7 @@ fn bark_fit(acc: &[NoiseAcc], w: i32, reflect: bool) -> (f32, f32, f32) {
     noise_fit(&acc[hi as usize], &acc[lo as usize], reflect)
 }
 
-/// The fit over the `fixed`-bin window centred on bin `i`.
+/// The fit over the `fixed`-bin window centered on bin `i`.
 #[inline(always)]
 fn fixed_fit(acc: &[NoiseAcc], fixed: i32, i: usize, reflect: bool) -> (f32, f32, f32) {
     let hi = i as i32 + fixed / 2;

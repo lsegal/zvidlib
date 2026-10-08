@@ -74,7 +74,7 @@ presentation frame of FFmpeg 6.0's own decode of that track
 (`ffmpeg -i bbb_hevc_main10_128x72.mp4 -f rawvideo -pix_fmt yuv420p10le`),
 the planar little-endian 16-bit layout `Picture::to_planar_le16` produces. It
 is the independent reference: the decoder's 10-bit samples must equal
-FFmpeg's before any colour conversion.
+FFmpeg's before any color conversion.
 
 `bbb_hevc_main10_128x72_rgba.sha256` carries one canonical `FrameDigest` per
 presentation frame of the same track's `Rgba8` output. FFmpeg's scaler has no

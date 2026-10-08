@@ -2,7 +2,7 @@
 //! of the AV1 Bitstream & Decoding Process Specification (with its errata)
 //! for 8-bit 4:2:0 and monochrome streams.
 //!
-//! The decoder is organised as the specification is: `header` parses the
+//! The decoder is organized as the specification is: `header` parses the
 //! sequence and frame headers (sections 5.5 and 5.9), `tile`, `residual` and
 //! `mvpred` implement the tile syntax and motion vector prediction (sections
 //! 5.11 and 7.10), `predict` and `recon` the prediction and reconstruction

@@ -156,7 +156,7 @@ pub struct NalIter<'a> {
 impl<'a> NalIter<'a> {
     /// Construct a walker over `buf`. The walker scans forward for
     /// the first Annex B start code; leading bytes prior to it are
-    /// discarded (this matches the behaviour required by Annex B,
+    /// discarded (this matches the behavior required by Annex B,
     /// which permits arbitrary leading-zero padding).
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, cursor: 0 }

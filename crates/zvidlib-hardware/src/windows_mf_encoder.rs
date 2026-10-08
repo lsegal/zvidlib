@@ -16,12 +16,12 @@
 //! therefore taken from the MFT's sequence header or, for an MFT that does not
 //! publish one, from a one-frame probe encode. VP9 output is already one chunk
 //! a sample, and its `vpcC` always comes from a probe encode's key frame, since
-//! only the bitstream says which colour space the MFT signals. VP9 is rate
+//! only the bitstream says which color space the MFT signals. VP9 is rate
 //! controlled by quality, from the `base_q_idx` the native VP9 encoder takes,
 //! rather than to a bitrate.
 //!
 //! RGBA and BGRA input is handed to a hardware MFT as ARGB32 when it accepts
-//! that, so the colour conversion runs on the GPU; everything else is
+//! that, so the color conversion runs on the GPU; everything else is
 //! converted to NV12 on the CPU with the same BT.601 studio-swing kernels the
 //! native encoder uses.
 
@@ -195,7 +195,7 @@ impl Settings {
             ));
         }
         // A frame shorter than two 100 ns ticks cannot be told apart from its
-        // neighbour once Media Foundation rounds its timestamp.
+        // neighbor once Media Foundation rounds its timestamp.
         if i128::from(self.frame_duration) * HNS_PER_SECOND < 2 * i128::from(self.timescale) {
             return Some(format!(
                 "Media Foundation {name} encoding requires frames of at least 200 ns"
@@ -529,7 +529,7 @@ impl Mft {
                 // to be asked for the same matrix.
                 set(
                     input.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT601.0 as u32),
-                    "colour matrix",
+                    "color matrix",
                 )?;
                 set(
                     input.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32),
@@ -636,18 +636,18 @@ impl Mft {
     fn submit(
         &mut self,
         sample: &IMFSample,
-        cancelled: &AtomicBool,
+        canceled: &AtomicBool,
         out: &mut Vec<RawOutput>,
     ) -> Result<()> {
         if self.events.is_some() {
             while self.need_input == 0 {
-                self.next_event(true, cancelled, out)?;
+                self.next_event(true, canceled, out)?;
             }
             // SAFETY: plain Media Foundation call.
             unsafe { self.transform.ProcessInput(0, sample, 0) }
                 .map_err(|error| mf_error("encoder rejected a frame", error))?;
             self.need_input -= 1;
-            while self.next_event(false, cancelled, out)?.is_some() {}
+            while self.next_event(false, canceled, out)?.is_some() {}
         } else {
             // SAFETY: plain Media Foundation call.
             match unsafe { self.transform.ProcessInput(0, sample, 0) } {
@@ -666,7 +666,7 @@ impl Mft {
     }
 
     /// Ends the stream and collects every output still inside the MFT.
-    fn drain(&mut self, cancelled: &AtomicBool, out: &mut Vec<RawOutput>) -> Result<()> {
+    fn drain(&mut self, canceled: &AtomicBool, out: &mut Vec<RawOutput>) -> Result<()> {
         // SAFETY: plain Media Foundation calls.
         unsafe {
             let _ = self
@@ -677,8 +677,7 @@ impl Mft {
                 .map_err(|error| mf_error("could not drain the encoder", error))?;
         }
         if self.events.is_some() {
-            while self.next_event(true, cancelled, out)? != Some(METransformDrainComplete.0 as u32)
-            {
+            while self.next_event(true, canceled, out)? != Some(METransformDrainComplete.0 as u32) {
             }
         } else {
             self.drain_sync(out)?;
@@ -686,7 +685,7 @@ impl Mft {
         Ok(())
     }
 
-    /// Discards everything inside the MFT, for a cancelled stream.
+    /// Discards everything inside the MFT, for a canceled stream.
     fn flush(&mut self) {
         // SAFETY: plain Media Foundation call.
         let _ = unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) };
@@ -774,7 +773,7 @@ impl Mft {
     fn next_event(
         &mut self,
         wait: bool,
-        cancelled: &AtomicBool,
+        canceled: &AtomicBool,
         out: &mut Vec<RawOutput>,
     ) -> Result<Option<u32>> {
         let events = self
@@ -793,8 +792,8 @@ impl Mft {
                     if !wait {
                         return Ok(None);
                     }
-                    if cancelled.load(Ordering::Acquire) {
-                        return Err(cancelled_error());
+                    if canceled.load(Ordering::Acquire) {
+                        return Err(canceled_error());
                     }
                     if Instant::now() >= deadline {
                         return Err(device_lost(format!(
@@ -902,7 +901,7 @@ fn set(result: windows::core::Result<()>, what: &str) -> Result<()> {
 enum Declared {
     /// The parameter sets the `hvcC` carries.
     Hevc(ParameterSets),
-    /// The `vpcC`, and the level it names, as the probe's key frame signalled
+    /// The `vpcC`, and the level it names, as the probe's key frame signaled
     /// them.
     Vp9 { vpcc: Vec<u8>, level: u8 },
 }
@@ -926,7 +925,7 @@ struct Core {
     pending: std::collections::VecDeque<u64>,
     /// The last frame an output was emitted for.
     last_emitted: Option<u64>,
-    /// Set once the stream has failed, been cancelled or been finished; every
+    /// Set once the stream has failed, been canceled or been finished; every
     /// later request answers with it.
     failure: Option<Error>,
     // Declared last so COM and Media Foundation outlive the MFT.
@@ -986,7 +985,7 @@ impl Core {
                 Declared::Hevc(sets)
             }
             OutputFormat::Vp9 => {
-                // VP9 carries everything in band, so the colour space the
+                // VP9 carries everything in band, so the color space the
                 // `vpcC` declares is whatever the encoder's key frames signal.
                 drop(mft);
                 let declared = probe_vpcc(activate.clone(), class, &settings)?;
@@ -1002,21 +1001,21 @@ impl Core {
         &mut self,
         index: u64,
         payload: &[u8],
-        cancelled: &AtomicBool,
+        canceled: &AtomicBool,
     ) -> Result<Vec<EncodedSample>> {
-        self.guard(cancelled, |core| {
+        self.guard(canceled, |core| {
             let sample = input_sample(payload, &core.settings, index)?;
             let mut out = Vec::new();
-            core.mft.submit(&sample, cancelled, &mut out)?;
+            core.mft.submit(&sample, canceled, &mut out)?;
             core.pending.push_back(index);
             core.samples(out)
         })
     }
 
-    fn finish(&mut self, cancelled: &AtomicBool) -> Result<Vec<EncodedSample>> {
-        let samples = self.guard(cancelled, |core| {
+    fn finish(&mut self, canceled: &AtomicBool) -> Result<Vec<EncodedSample>> {
+        let samples = self.guard(canceled, |core| {
             let mut out = Vec::new();
-            core.mft.drain(cancelled, &mut out)?;
+            core.mft.drain(canceled, &mut out)?;
             core.samples(out)
         })?;
         self.failure = Some(Error::new(
@@ -1030,22 +1029,22 @@ impl Core {
     }
 
     /// Runs `work` unless the stream has already stopped, and stops it if
-    /// `work` fails or is cancelled.
+    /// `work` fails or is canceled.
     fn guard(
         &mut self,
-        cancelled: &AtomicBool,
+        canceled: &AtomicBool,
         work: impl FnOnce(&mut Self) -> Result<Vec<EncodedSample>>,
     ) -> Result<Vec<EncodedSample>> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
-        let result = if cancelled.load(Ordering::Acquire) {
-            Err(cancelled_error())
+        let result = if canceled.load(Ordering::Acquire) {
+            Err(canceled_error())
         } else {
             work(self)
         };
         if let Err(error) = &result {
-            if error.kind() == ErrorKind::Cancelled {
+            if error.kind() == ErrorKind::Canceled {
                 self.mft.flush();
             }
             self.failure = Some(error.clone());
@@ -1079,7 +1078,7 @@ impl Core {
                     let key = zvidlib_vp9_syntax::key_frame_vpcc(&output.stream, *level);
                     if key.as_ref().is_some_and(|key| key != vpcc) {
                         return Err(codec(
-                            "encoder changed its colour signalling mid-stream, which a vp09 track cannot carry",
+                            "encoder changed its color signaling mid-stream, which a vp09 track cannot carry",
                         ));
                     }
                     (output.stream, key.is_some())
@@ -1171,7 +1170,7 @@ fn probe_parameter_sets(
     }
 }
 
-/// Encodes one black frame on a throwaway instance to learn the colour space
+/// Encodes one black frame on a throwaway instance to learn the color space
 /// and range a VP9 MFT's key frames signal, as the `vpcC` declaring them.
 fn probe_vpcc(activate: IMFActivate, class: MftClass, settings: &Settings) -> Result<Declared> {
     let level = zvidlib_vp9_syntax::pick_level(
@@ -1297,11 +1296,11 @@ impl Reply {
 
 /// Awaits one request. Dropping it before it resolves cancels the stream:
 /// the worker stops waiting on the MFT, flushes it, and every later call on
-/// the encoder reports [`ErrorKind::Cancelled`], since the caller can no
+/// the encoder reports [`ErrorKind::Canceled`], since the caller can no
 /// longer know which frames were encoded.
 struct Pending {
     reply: Arc<Reply>,
-    cancelled: Arc<AtomicBool>,
+    canceled: Arc<AtomicBool>,
     done: bool,
 }
 
@@ -1331,7 +1330,7 @@ impl Future for Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if !self.done {
-            self.cancelled.store(true, Ordering::Release);
+            self.canceled.store(true, Ordering::Release);
         }
     }
 }
@@ -1339,7 +1338,7 @@ impl Drop for Pending {
 struct MfVideoEncoder {
     commands: Option<Sender<Command>>,
     worker: Option<JoinHandle<()>>,
-    cancelled: Arc<AtomicBool>,
+    canceled: Arc<AtomicBool>,
     config: EncoderConfig,
     settings: Settings,
     feed: Feed,
@@ -1353,8 +1352,8 @@ impl MfVideoEncoder {
     fn spawn(settings: Settings, class: MftClass, limits: Limits) -> Result<Self> {
         let (command_tx, command_rx) = channel();
         let (ready_tx, ready_rx) = sync_channel(1);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
+        let canceled = Arc::new(AtomicBool::new(false));
+        let worker_canceled = Arc::clone(&canceled);
         let worker = thread::Builder::new()
             .name("zvidlib-mf-encode".into())
             .spawn(move || match Core::open(settings, class, limits) {
@@ -1365,7 +1364,7 @@ impl MfVideoEncoder {
                         core.mft.name.clone(),
                     );
                     if ready_tx.send(Ok(ready)).is_ok() {
-                        run_worker(core, &command_rx, &worker_cancelled);
+                        run_worker(core, &command_rx, &worker_canceled);
                     }
                 }
                 Err(error) => {
@@ -1388,7 +1387,7 @@ impl MfVideoEncoder {
         Ok(Self {
             commands: Some(command_tx),
             worker: Some(worker),
-            cancelled,
+            canceled,
             config: EncoderConfig {
                 codec: settings.format.codec(),
                 timescale: settings.timescale,
@@ -1414,14 +1413,14 @@ impl MfVideoEncoder {
         }
         Pending {
             reply,
-            cancelled: Arc::clone(&self.cancelled),
+            canceled: Arc::clone(&self.canceled),
             done: false,
         }
     }
 
     fn ready(&self) -> Result<()> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Err(cancelled_error());
+        if self.canceled.load(Ordering::Acquire) {
+            return Err(canceled_error());
         }
         if self.finished {
             return Err(Error::new(
@@ -1603,7 +1602,7 @@ impl VideoEncoder for MfVideoEncoder {
 impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
         // Closing the channel stops the worker once any request it is still
-        // on returns, which a cancelled one does within a poll interval.
+        // on returns, which a canceled one does within a poll interval.
         self.commands.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1611,15 +1610,15 @@ impl Drop for MfVideoEncoder {
     }
 }
 
-fn run_worker(mut core: Core, commands: &Receiver<Command>, cancelled: &AtomicBool) {
+fn run_worker(mut core: Core, commands: &Receiver<Command>, canceled: &AtomicBool) {
     while let Ok(command) = commands.recv() {
         match command {
             Command::Encode {
                 index,
                 payload,
                 reply,
-            } => reply.complete(core.encode(index, &payload, cancelled)),
-            Command::Finish { reply } => reply.complete(core.finish(cancelled)),
+            } => reply.complete(core.encode(index, &payload, canceled)),
+            Command::Finish { reply } => reply.complete(core.finish(canceled)),
         }
     }
 }
@@ -1687,8 +1686,8 @@ fn device_lost(detail: impl std::fmt::Display) -> Error {
     )
 }
 
-fn cancelled_error() -> Error {
-    Error::new(ErrorKind::Cancelled, "encoding was cancelled")
+fn canceled_error() -> Error {
+    Error::new(ErrorKind::Canceled, "encoding was canceled")
 }
 
 fn windows_error(context: &str, error: windows::core::Error) -> Error {
@@ -2076,9 +2075,9 @@ mod tests {
                 drop(encoder.finish());
             }
             let error = encode_frame(encoder.as_mut(), &source, 2).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Cancelled, "{pending}: {error}");
+            assert_eq!(error.kind(), ErrorKind::Canceled, "{pending}: {error}");
             let error = block_on(encoder.finish()).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::Cancelled, "{pending}: {error}");
+            assert_eq!(error.kind(), ErrorKind::Canceled, "{pending}: {error}");
             let started = Instant::now();
             drop(encoder);
             assert!(

@@ -6,29 +6,29 @@
 //! The symbol coder itself is serial by construction: every symbol updates the
 //! CDF and the range coder state the next symbol is written against. The
 //! *context derivation* around it is not. `getCoeffBaseCtx` and `getCoeffBrCtx`
-//! read only the neighbours *down and to the right* of a coefficient
+//! read only the neighbors *down and to the right* of a coefficient
 //! (`Sig_Ref_Diff_Offset` and `Mag_Ref_Offset` for `TX_CLASS_2D` are all
 //! non-negative), and the encoder walks the up-right diagonal scan **backwards**
-//! from the end-of-block. Every neighbour a position consults therefore sits on
+//! from the end-of-block. Every neighbor a position consults therefore sits on
 //! a strictly later anti-diagonal, so it has already been coded and its level is
 //! final — and positions at or past the end-of-block are zero by the definition
 //! of `eob`. The whole level plane is consequently known before the first symbol
 //! is written, and every position's context can be derived in one pass, ahead of
 //! the serial loop, independently of every other position.
 //!
-//! That pass is what this module vectorizes: the clamped neighbour magnitude
+//! That pass is what this module vectorizes: the clamped neighbor magnitude
 //! sums, the `(mag + 1) >> 1` saturation, and the position-dependent context
 //! offsets, computed `LANES` coefficients at a time along each row of the
 //! transform block.
 //!
 //! # The padded level plane
 //!
-//! A neighbour at `(row + dr, col + dc)` is defined as zero once it leaves the
+//! A neighbor at `(row + dr, col + dc)` is defined as zero once it leaves the
 //! block, and both offset tables reach at most two rows down and two columns
 //! right. Rather than branch per lane, the caller keeps the levels in a plane
 //! padded by `MAX_ROW_OFFSET` zero rows and `MAX_COL_OFFSET` zero columns
 //! (plus a vector's worth of slack so a full-width load at the last column
-//! stays in bounds), which turns each neighbour into an unaligned load. The
+//! stays in bounds), which turns each neighbor into an unaligned load. The
 //! padding is written once when the plane is sized and never again: a block only
 //! ever overwrites the `size x size` interior, so the per-block cost is the
 //! clamped copy of the levels themselves and nothing more.
@@ -38,7 +38,7 @@
 //! The kernel is a lane-by-lane transliteration of `tile.rs`'s scalar
 //! `coeff_base_ctx` and `coeff_br_ctx`, including the DC position's special
 //! cases, and levels are clamped to 15 on the way into the plane so a lane can
-//! never overflow: 5 neighbours x 15 fits in a handful of bits. The encoded
+//! never overflow: 5 neighbors x 15 fits in a handful of bits. The encoded
 //! bitstream is identical under every instruction set, which `tests/av1_simd.rs`
 //! and the encoder's own round-trip tests assert.
 
@@ -172,13 +172,13 @@ pub(crate) unsafe fn block_contexts<V: I32x>(
 
                 let mut base_mag = V::zero();
                 for &(dr, dc) in &SIG_REF_DIFF_OFFSET_2D {
-                    let neighbour = V::load(&plane[(row + dr) * stride + column + dc..]);
-                    base_mag = base_mag.add(neighbour.min(three));
+                    let neighbor = V::load(&plane[(row + dr) * stride + column + dc..]);
+                    base_mag = base_mag.add(neighbor.min(three));
                 }
                 let mut br_mag = V::zero();
                 for &(dr, dc) in &MAG_REF_OFFSET_2D {
-                    let neighbour = V::load(&plane[(row + dr) * stride + column + dc..]);
-                    br_mag = br_mag.add(neighbour.min(fifteen));
+                    let neighbor = V::load(&plane[(row + dr) * stride + column + dc..]);
+                    br_mag = br_mag.add(neighbor.min(fifteen));
                 }
 
                 // `coeff_base_ctx_offset` is a function of the anti-diagonal
@@ -231,10 +231,10 @@ pub(crate) unsafe fn block_contexts<V: I32x>(
 /// What changes against the row-at-a-time kernel is only where the operands
 /// come from:
 ///
-/// * the neighbour loads are no longer contiguous across the halves - the
+/// * the neighbor loads are no longer contiguous across the halves - the
 ///   padded stride is 14 at size 4 - so each becomes the two 128-bit loads and
 ///   the `vinserti128` of [`HalfPairs::load_halves`], amortized over the five
-///   `SIG_REF_DIFF_OFFSET_2D` plus three `MAG_REF_OFFSET_2D` neighbours an
+///   `SIG_REF_DIFF_OFFSET_2D` plus three `MAG_REF_OFFSET_2D` neighbors an
 ///   iteration reads;
 /// * the row-dependent terms become per-half vector constants rather than
 ///   scalars: the anti-diagonal adds `[row; 4] ++ [row + 1; 4]`, and the
@@ -283,14 +283,14 @@ pub(crate) unsafe fn block_contexts_row_pairs<V: HalfPairs>(
             let mut base_mag = V::zero();
             for &(dr, dc) in &SIG_REF_DIFF_OFFSET_2D {
                 let at = (row + dr) * stride + dc;
-                let neighbour = V::load_halves(&plane[at..], &plane[at + stride..]);
-                base_mag = base_mag.add(neighbour.min(three));
+                let neighbor = V::load_halves(&plane[at..], &plane[at + stride..]);
+                base_mag = base_mag.add(neighbor.min(three));
             }
             let mut br_mag = V::zero();
             for &(dr, dc) in &MAG_REF_OFFSET_2D {
                 let at = (row + dr) * stride + dc;
-                let neighbour = V::load_halves(&plane[at..], &plane[at + stride..]);
-                br_mag = br_mag.add(neighbour.min(fifteen));
+                let neighbor = V::load_halves(&plane[at..], &plane[at + stride..]);
+                br_mag = br_mag.add(neighbor.min(fifteen));
             }
 
             let diagonal = columns.add(rows);
@@ -391,9 +391,9 @@ mod tests {
         }
     }
 
-    /// The padded plane exists so a neighbour load never leaves the buffer.
+    /// The padded plane exists so a neighbor load never leaves the buffer.
     #[test]
-    fn the_padding_covers_every_neighbour_offset() {
+    fn the_padding_covers_every_neighbor_offset() {
         for &(dr, dc) in SIG_REF_DIFF_OFFSET_2D.iter().chain(&MAG_REF_OFFSET_2D) {
             assert!(dr <= MAX_ROW_OFFSET, "row offset {dr}");
             assert!(dc <= MAX_COL_OFFSET, "column offset {dc}");

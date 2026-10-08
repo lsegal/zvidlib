@@ -146,7 +146,7 @@ pub struct HrdCommonInfo {
     pub nal_hrd_parameters_present_flag: bool,
     /// `vcl_hrd_parameters_present_flag` (`u(1)`).
     pub vcl_hrd_parameters_present_flag: bool,
-    /// `sub_pic_hrd_params_present_flag` (`u(1)`). Only signalled when
+    /// `sub_pic_hrd_params_present_flag` (`u(1)`). Only signaled when
     /// at least one of `nal_hrd_parameters_present_flag` or
     /// `vcl_hrd_parameters_present_flag` is 1; inferred to be 0
     /// otherwise per §E.3.2.
@@ -172,7 +172,7 @@ pub struct HrdCommonInfo {
     /// `sub_pic_hrd_params_present_flag` is 1.
     pub cpb_size_du_scale: u8,
     /// `initial_cpb_removal_delay_length_minus1` (`u(5)`). Inferred
-    /// to 23 when absent per §E.3.2 — the parser reports the signalled
+    /// to 23 when absent per §E.3.2 — the parser reports the signaled
     /// value; the §E.3.2 inference is the caller's responsibility.
     pub initial_cpb_removal_delay_length_minus1: u8,
     /// `au_cpb_removal_delay_length_minus1` (`u(5)`). Inferred to 23
@@ -366,16 +366,16 @@ impl SubLayerHrdParameters {
 pub struct SubLayerHrd {
     /// `fixed_pic_rate_general_flag[i]` (`u(1)`).
     pub fixed_pic_rate_general_flag: bool,
-    /// `fixed_pic_rate_within_cvs_flag[i]` (`u(1)`); only signalled
+    /// `fixed_pic_rate_within_cvs_flag[i]` (`u(1)`); only signaled
     /// when `fixed_pic_rate_general_flag[i] == 0`. When
     /// `fixed_pic_rate_general_flag[i] == 1`, §E.3.2 infers this to 1
     /// — the parser pre-fills the inferred value rather than leaving an
     /// `Option`.
     pub fixed_pic_rate_within_cvs_flag: bool,
     /// `elemental_duration_in_tc_minus1[i]` (`ue(v)`, range 0..=2047);
-    /// only signalled when `fixed_pic_rate_within_cvs_flag[i] == 1`.
+    /// only signaled when `fixed_pic_rate_within_cvs_flag[i] == 1`.
     pub elemental_duration_in_tc_minus1: Option<u32>,
-    /// `low_delay_hrd_flag[i]` (`u(1)`); only signalled when
+    /// `low_delay_hrd_flag[i]` (`u(1)`); only signaled when
     /// `fixed_pic_rate_within_cvs_flag[i] == 0`. §E.3.2 infers 0
     /// otherwise — pre-filled.
     pub low_delay_hrd_flag: bool,
@@ -443,7 +443,7 @@ impl HrdParameters {
         // Pick the effective common info: the freshly-parsed block if
         // present, else the inherited one from prev_common. When neither
         // is available, sub-layer parsing falls back to "no HRD gates",
-        // which matches the spec's silent-default behaviour.
+        // which matches the spec's silent-default behavior.
         let effective = common.as_ref().or(prev_common);
         let nal_hrd_present = effective.is_some_and(|c| c.nal_hrd_parameters_present_flag);
         let vcl_hrd_present = effective.is_some_and(|c| c.vcl_hrd_parameters_present_flag);
@@ -651,7 +651,7 @@ mod tests {
             "1", // fixed_pic_rate_general_flag[0] = 1
             // within_cvs_flag inferred = 1, so elemental_duration_in_tc_minus1[0] ue(v)
             "1", // ue(v) = 0
-            // low_delay_hrd_flag not signalled (within_cvs == 1); inferred 0.
+            // low_delay_hrd_flag not signaled (within_cvs == 1); inferred 0.
             // cpb_cnt_minus1 IS read because !low_delay_hrd_flag.
             "1", // cpb_cnt_minus1 ue(v) = 0
                  // no NAL/VCL HRD bodies (gates = 0)
@@ -721,7 +721,7 @@ mod tests {
             "0",        // fixed_pic_rate_general_flag = 0
             "1",        // fixed_pic_rate_within_cvs_flag = 1
             &ue(0),     // elemental_duration_in_tc_minus1 = 0
-            // low_delay_hrd_flag not signalled (within_cvs == 1)
+            // low_delay_hrd_flag not signaled (within_cvs == 1)
             &ue(1), // cpb_cnt_minus1 = 1
             &nal_cpb0_brv,
             &nal_cpb0_cpb,
@@ -929,7 +929,7 @@ mod tests {
     fn vps_hrd_entry_skips_cprms_for_index_zero() {
         let bytes = bits_to_bytes(&[
             "1", // hrd_layer_set_idx = 0 ue(v)
-            // cprms_present_flag not signalled (i == 0); inferred 1
+            // cprms_present_flag not signaled (i == 0); inferred 1
             "0", // nal = 0
             "0", // vcl = 0
             "1", // fixed_pic_rate_general = 1 → within_cvs inferred 1
@@ -989,7 +989,7 @@ mod tests {
 
     /// `commonInfPresentFlag = 0` with no `prev_common` results in no
     /// NAL/VCL bodies being parsed regardless of subsequent state — the
-    /// spec's silent-default behaviour when no prior context exists.
+    /// spec's silent-default behavior when no prior context exists.
     #[test]
     fn cprms_zero_without_previous_yields_no_hrd_bodies() {
         let bytes = bits_to_bytes(&[

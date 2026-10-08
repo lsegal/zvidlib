@@ -475,7 +475,7 @@ const LUMA_FILTER: [[i32; 8]; 4] = [
 ];
 
 /// One separable 8-tap luma sample at fractional offset `( x_frac, y_frac )`,
-/// centred on integer location `( x_int, y_int )` (§8.5.3.3.3.2).
+/// centered on integer location `( x_int, y_int )` (§8.5.3.3.3.2).
 ///
 /// Returns the intermediate sample value (`>> shift1` / `>> shift2`, or
 /// `A << shift3` for the full-pel `( 0, 0 )` corner) at the
@@ -855,7 +855,7 @@ fn narrows(
 /// binary, the same decoder and the same frames, and the only difference
 /// between them is the branch under test.
 ///
-/// Internal and unstable. The decoder's own behaviour is `None`, and
+/// Internal and unstable. The decoder's own behavior is `None`, and
 /// nothing outside a measurement should set this.
 pub mod narrow_interp {
     use core::sync::atomic::{AtomicU8, Ordering};
@@ -1079,7 +1079,7 @@ const CHROMA_FILTER: [[i32; 4]; 8] = [
 ];
 
 /// One separable 4-tap chroma sample at eighth-pel offset
-/// `( x_frac, y_frac )`, centred on integer location `( x_int, y_int )`
+/// `( x_frac, y_frac )`, centered on integer location `( x_int, y_int )`
 /// (§8.5.3.3.3.3). Returns the intermediate-precision value (not clipped).
 #[inline]
 fn interp_chroma_sample(
@@ -1223,7 +1223,7 @@ pub fn interp_chroma_block_with(
 ///
 /// `pred_l0` / `pred_l1` are the intermediate-precision arrays produced by
 /// [`interp_luma_block`] / [`interp_chroma_block`]; `pred_flag_l0` /
-/// `pred_flag_l1` are the §8.5.3.2.1 prediction-list utilisation flags. At
+/// `pred_flag_l1` are the §8.5.3.2.1 prediction-list utilization flags. At
 /// least one flag must be set (the spec only invokes this process for a
 /// predicted block). Output is the clipped `[0, (1 << bitDepth) − 1]`
 /// sample array.

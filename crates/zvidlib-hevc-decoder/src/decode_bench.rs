@@ -57,7 +57,7 @@ const INTER_CELL: usize = 64;
 /// * **Size.** 62% of predicted luma samples are in 64x64 units and 31% in
 ///   32x32; 16x16 is 5% and 8x8 is 1.4%. The old grid's block was the third
 ///   most common size by sample and carried 5% of the real work.
-/// * **List utilisation.** 38% of predicted luma samples are uni-predicted,
+/// * **List utilization.** 38% of predicted luma samples are uni-predicted,
 ///   which runs one interpolation rather than two and takes the
 ///   §8.5.3.3.4.2 single-list combine rather than the two-list one. The old
 ///   grid was bi-predicted throughout.
@@ -81,7 +81,7 @@ const INTER_PU_MIX: [(usize, bool, f64); 8] = [
 ];
 /// The §7.3.8.3 SAO parameter mix a real decode runs, as issue #310 measured
 /// it: 48 frames of `examples/media/BigBuckBunny.mp4` at 1920x1080, all 26,520
-/// coding tree blocks the decoder resolved parameters for, counted per colour
+/// coding tree blocks the decoder resolved parameters for, counted per color
 /// component.
 ///
 /// Row 0 is luma, row 1 chroma — Cb and Cr came out identical CTB for CTB, as
@@ -829,9 +829,9 @@ fn build_sao_inputs(width: usize, height: usize, luma: &[i32]) -> (Picture, Vec<
 /// The §8.7.3.2 boundary grids for a single-slice, single-tile picture, plus
 /// the number of samples the grid's switched-on CTBs classify.
 ///
-/// Every CTB is in slice 0 and tile 0, so nothing here denies a neighbour read
+/// Every CTB is in slice 0 and tile 0, so nothing here denies a neighbor read
 /// — but the decoder still carries the grids, and the per-CTB
-/// [`SaoBoundaries::ctb_neighbourhood_unconstrained`] test that clears the
+/// [`SaoBoundaries::ctb_neighborhood_unconstrained`] test that clears the
 /// vector path has to run over them. Passing them is what makes this group time
 /// the dispatch a decode takes.
 fn build_sao_boundaries(width: usize, height: usize, grid: &[ResolvedSao]) -> (SaoBoundaries, u64) {
@@ -897,7 +897,7 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 /// Decodes `frames` frames of `samples` and stops at the decoded `Picture`.
 ///
 /// Issue #220: the public decoder's `submit` returns RGBA, so a whole-frame
-/// benchmark through it measures decoding *plus* the colour conversion of
+/// benchmark through it measures decoding *plus* the color conversion of
 /// [`HevcStageInputs::run_color_convert`] — a third of the interval, which
 /// until issue #219 gave it a kernel had no vector path at all and diluted
 /// every scalar-versus-SIMD ratio taken off those groups. This is the same
@@ -922,7 +922,7 @@ fn convert_config(width: usize, height: usize) -> VideoDecoderConfig {
 /// [`decode_pictures`]: same decoder, same access units, same frame count, same
 /// output fold — the only difference is the `picture_to_rgba` pass on each
 /// decoded picture, which is what makes the gap between the two groups the
-/// conversion rather than an artefact of how each arm identifies its output.
+/// conversion rather than an artifact of how each arm identifies its output.
 ///
 /// # Panics
 /// Panics under the same conditions as [`decode_pictures`].
@@ -1147,7 +1147,7 @@ mod tests {
                 );
             }
         }
-        // Cb and Cr are signalled as one in §7.3.8.3, so they resolve alike.
+        // Cb and Cr are signaled as one in §7.3.8.3, so they resolve alike.
         assert!(
             inputs.sao_ctbs.iter().all(|r| r.components[1].sao_type_idx
                 == r.components[2].sao_type_idx

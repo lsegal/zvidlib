@@ -609,7 +609,7 @@ mod tests {
     struct FixtureBackend {
         clock: Arc<Mutex<u64>>,
         scheduled: Arc<Mutex<Vec<(SampleRange, u64)>>>,
-        cancelled: Arc<Mutex<Vec<u64>>>,
+        canceled: Arc<Mutex<Vec<u64>>>,
     }
 
     impl AudioOutputBackend for FixtureBackend {
@@ -627,7 +627,7 @@ mod tests {
             Ok(())
         }
         fn cancel_queued(&mut self, generation: u64) -> Result<()> {
-            self.cancelled.lock().unwrap().push(generation);
+            self.canceled.lock().unwrap().push(generation);
             Ok(())
         }
         fn stop(&mut self) -> Result<()> {
@@ -641,11 +641,11 @@ mod tests {
         let reads = Arc::new(Mutex::new(Vec::new()));
         let clock = Arc::new(Mutex::new(0));
         let scheduled = Arc::new(Mutex::new(Vec::new()));
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let canceled = Arc::new(Mutex::new(Vec::new()));
         let backend = FixtureBackend {
             clock: clock.clone(),
             scheduled: scheduled.clone(),
-            cancelled: cancelled.clone(),
+            canceled: canceled.clone(),
         };
         match kind {
             AudioOutputKind::Native => run_playback(
@@ -663,7 +663,7 @@ mod tests {
                 clock.clone(),
             ),
         }
-        assert_eq!(&*cancelled.lock().unwrap(), &[1]);
+        assert_eq!(&*canceled.lock().unwrap(), &[1]);
         assert!(
             scheduled
                 .lock()
@@ -739,7 +739,7 @@ mod tests {
         let backend = FixtureBackend {
             clock: clock.clone(),
             scheduled: scheduled.clone(),
-            cancelled: Arc::new(Mutex::new(Vec::new())),
+            canceled: Arc::new(Mutex::new(Vec::new())),
         };
         let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
         let mut playback = PlaybackController::new(
@@ -788,7 +788,7 @@ mod tests {
         let backend = FixtureBackend {
             clock: clock.clone(),
             scheduled: Arc::new(Mutex::new(Vec::new())),
-            cancelled: Arc::new(Mutex::new(Vec::new())),
+            canceled: Arc::new(Mutex::new(Vec::new())),
         };
         let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
         let mut playback = PlaybackController::new(
@@ -826,7 +826,7 @@ mod tests {
         let backend = FixtureBackend {
             clock: clock.clone(),
             scheduled: scheduled.clone(),
-            cancelled: Arc::new(Mutex::new(Vec::new())),
+            canceled: Arc::new(Mutex::new(Vec::new())),
         };
         let timeline = Timeline::new(crate::FrameRate::new(30, 1).unwrap(), 48_000).unwrap();
         let mut playback = PlaybackController::new(
@@ -899,7 +899,7 @@ mod tests {
         let backend = FixtureBackend {
             clock: clock.clone(),
             scheduled,
-            cancelled: Arc::new(Mutex::new(Vec::new())),
+            canceled: Arc::new(Mutex::new(Vec::new())),
         };
         let timeline = IndexedPresentationTimeline::new(vec![
             SampleRange::new(0, 100).unwrap(),

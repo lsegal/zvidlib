@@ -833,7 +833,7 @@ impl Geometry {
             return Err(SequenceError::Malformed("zero picture dimensions"));
         }
         let ctb = 1u32 << ctb_log2;
-        let chroma_array_type = if sps.separate_colour_plane_flag {
+        let chroma_array_type = if sps.separate_color_plane_flag {
             0
         } else {
             sps.chroma_format_idc
@@ -1307,10 +1307,10 @@ fn build_slice_data_params(
         sign_data_hiding_enabled_flag: pps.sign_data_hiding_enabled_flag,
         cross_component_prediction_enabled_flag: pps_range
             .is_some_and(|r| r.cross_component_prediction_enabled_flag),
-        residual_adaptive_colour_transform_enabled_flag: pps
+        residual_adaptive_color_transform_enabled_flag: pps
             .pps_scc_extension
             .as_ref()
-            .is_some_and(|s| s.residual_adaptive_colour_transform_enabled_flag),
+            .is_some_and(|s| s.residual_adaptive_color_transform_enabled_flag),
         transform_skip_enabled_flag: pps.transform_skip_enabled_flag,
         log2_max_transform_skip_size: pps_range
             .map_or(2, |r| r.log2_max_transform_skip_block_size_minus2 + 2),
@@ -1467,7 +1467,7 @@ fn decode_slice_segment_data(
         c.palette_predictor = base_palette_predictor.clone();
         c
     };
-    // §6.4.1-gated availability of the spatial neighbour T (eq. 9-3,
+    // §6.4.1-gated availability of the spatial neighbor T (eq. 9-3,
     // the above-right CTB) for the §9.3.2.5 WPP synchronization: T
     // must exist, lie in the SAME slice (the stored snapshot may come
     // from an earlier slice segment of that slice) and the same tile.
@@ -1544,7 +1544,7 @@ fn decode_slice_segment_data(
             let tile_start =
                 tiles_on && tiling.tile_id(ctb_addr_ts) != tiling.tile_id(ctb_addr_ts - 1);
             // §9.3.2.1: CtbAddrInRs % PicWidthInCtbsY == 0, or the
-            // raster-left neighbour lies in a different tile.
+            // raster-left neighbor lies in a different tile.
             let wpp_row_start = wpp
                 && !tile_start
                 && (rx == 0
@@ -1565,7 +1565,7 @@ fn decode_slice_segment_data(
                     // start.
                     ctx = fresh_contexts();
                 } else {
-                    // Spatial neighbour T = the CTB at ( x0 + CtbSizeY,
+                    // Spatial neighbor T = the CTB at ( x0 + CtbSizeY,
                     // y0 − CtbSizeY ) (eq. 9-3), §6.4.1-gated.
                     ctx = match (&*wpp_stored, t_available(ctb_addr_ts, slice_addr_of)) {
                         (Some(stored), true) => stored.clone(),

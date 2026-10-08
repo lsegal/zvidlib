@@ -77,7 +77,7 @@ pub struct PreviewOptions {
     /// How far each preview is shrunk on each axis.
     ///
     /// A preview is drawn stretched back over the whole video quad, so this is a
-    /// resolution the picture is recognisable at rather than one it is sharp at:
+    /// resolution the picture is recognizable at rather than one it is sharp at:
     /// a quarter on each axis is a sixteenth of the memory and reads as the right
     /// shot on a 1080p source. The exact frame replaces it shortly anyway.
     pub scale: u32,
@@ -295,8 +295,8 @@ impl PreviewPass {
     /// named, and advances past it.
     ///
     /// A picture that cannot be shrunk leaves its slot empty, exactly as a frame
-    /// that would not decode does: the index is an optimisation, and a gap in it
-    /// costs a fallback to the neighbour rather than an error the caller has to
+    /// that would not decode does: the index is an optimization, and a gap in it
+    /// costs a fallback to the neighbor rather than an error the caller has to
     /// show.
     pub fn accept(&mut self, picture: &VideoFrame, limits: &Limits) {
         let slot = self.next_slot;
@@ -421,7 +421,7 @@ impl PreviewIndex {
     ///
     /// The pass leaves a slot empty when its frame will not decode, so this
     /// returns once nothing more is coming rather than once every slot is full,
-    /// and it returns immediately on a cancelled index.
+    /// and it returns immediately on a canceled index.
     pub fn wait_for_coverage(&self) {
         while let Some(worker) = self.worker.as_ref() {
             if worker.is_finished() {
@@ -474,12 +474,12 @@ impl Drop for PreviewIndex {
 fn build(mut reader: ExactFrameReader, mut pass: PreviewPass, cancellation: &CancellationToken) {
     let limits = Limits::default();
     while let Some(frame) = pass.next_frame() {
-        if cancellation.is_cancelled() {
+        if cancellation.is_canceled() {
             return;
         }
         // A preview that cannot be decoded leaves its slot empty and the pass
-        // carries on: the index is an optimisation, and a gap in it costs a
-        // fallback to the neighbour rather than an error the caller has to show.
+        // carries on: the index is an optimization, and a gap in it costs a
+        // fallback to the neighbor rather than an error the caller has to show.
         //
         // A step, not a destination: this pass walks forwards and never comes
         // back, so the frames behind each preview would be converted at full
@@ -580,7 +580,7 @@ mod tests {
     }
 
     /// A preview is the source averaged down, not point-sampled: a block that is half black and
-    /// half white has to come out grey, or a scrub over fine detail flickers between the two
+    /// half white has to come out gray, or a scrub over fine detail flickers between the two
     /// pixels the sampling happens to land on.
     #[test]
     fn a_preview_averages_the_block_it_replaces() {
@@ -651,7 +651,7 @@ mod tests {
     /// A drag ahead of where the pass has reached draws the newest picture behind it, and one
     /// behind a gap draws the nearest picture either side.
     #[test]
-    fn the_nearest_preview_falls_back_to_a_neighbour() {
+    fn the_nearest_preview_falls_back_to_a_neighbor() {
         let picture = |value: u8| rgba(4, 4, move |_, _| [value, value, value, 255]);
         let store = Store {
             stride: 10,

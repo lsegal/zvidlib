@@ -54,7 +54,7 @@ pub(super) struct StreamSettings {
     pub(super) base_q_idx: u8,
     pub(super) tools: CodingTools,
     pub(super) error_resilient: bool,
-    /// The colour range key frames signal.
+    /// The color range key frames signal.
     pub(super) full_range: bool,
     /// Whether frames choose a loop filter level; cleared only to compare
     /// against an unfiltered encode.

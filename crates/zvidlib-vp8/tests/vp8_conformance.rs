@@ -375,12 +375,12 @@ fn a_frame_of_the_wrong_size_or_a_malformed_frame_is_an_error() {
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::MalformedMedia);
 
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
+    let canceled = CancellationToken::new();
+    canceled.cancel();
     let error = decoder
-        .submit(&sample(frames[0].data), &cancelled)
+        .submit(&sample(frames[0].data), &canceled)
         .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert_eq!(error.kind(), ErrorKind::Canceled);
 }
 
 /// The hardware configuration for `dimensions`, or `None`, after saying why,

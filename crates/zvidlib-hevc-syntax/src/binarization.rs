@@ -41,36 +41,36 @@
 //! reusable per-element building block.
 //!
 //! Round 27 extends the ctxInc-derivation surface with three more
-//! syntax elements that are pure-functional given their neighbour /
+//! syntax elements that are pure-functional given their neighbor /
 //! sub-block context (no CABAC engine drive needed at this layer —
 //! callers compose the engine call themselves):
 //!
 //! * **`coded_sub_block_flag`** (H.265 §7.3.8.11, §7.4.9.11) — the
-//!   §9.3.4.2.4 derivation of `ctxInc` from the colour-component
+//!   §9.3.4.2.4 derivation of `ctxInc` from the color-component
 //!   index, the current sub-block scan location `(xS, yS)`, the
 //!   transform-block size, and the previously decoded
 //!   `coded_sub_block_flag[xS+1][yS]` / `coded_sub_block_flag[xS][yS+1]`
-//!   neighbours. Implemented in
+//!   neighbors. Implemented in
 //!   [`coded_sub_block_flag_ctx_inc`] following equations 9-35..9-39.
 //!
 //! * **`split_cu_flag` / `cu_skip_flag`** (H.265 §7.3.8.4, §7.4.9.4,
 //!   §7.3.8.5, §7.4.9.5) — the §9.3.4.2.2 Table 9-49 derivation of
-//!   `ctxInc` from the left and above neighbours' `condL` / `condA`
+//!   `ctxInc` from the left and above neighbors' `condL` / `condA`
 //!   booleans plus their availability:
 //!   `ctxInc = (condL && availableL) + (condA && availableA)`.
 //!   Implemented as the shared
 //!   [`left_above_ctx_inc`] helper (the body of Table 9-49) plus
 //!   the [`split_cu_flag_cond`] and [`cu_skip_flag_cond`] callbacks
 //!   the caller wires into it. The Table 9-49 row for
-//!   `split_cu_flag` compares each neighbour's `CtDepth[xNb][yNb]`
+//!   `split_cu_flag` compares each neighbor's `CtDepth[xNb][yNb]`
 //!   to the current `cqtDepth`; the row for `cu_skip_flag` reads
-//!   each neighbour's `cu_skip_flag[xNb][yNb]` directly. Both rows
+//!   each neighbor's `cu_skip_flag[xNb][yNb]` directly. Both rows
 //!   produce a `ctxInc` in `{0, 1, 2}`.
 //!
 //! Round 28 extends the ctxInc-derivation surface with six more
 //! syntax elements whose Table 9-48 entry is itself a closed-form
 //! expression on parameters the caller already has in hand (no
-//! neighbour table walk, no CABAC engine drive at this layer):
+//! neighbor table walk, no CABAC engine drive at this layer):
 //!
 //! * **`split_transform_flag[ ][ ][ ]`** (H.265 §7.3.8.10, §7.4.9.10)
 //!   — Table 9-48 row: `ctxInc = 5 − log2TrafoSize`. Valid
@@ -123,7 +123,7 @@
 //! Round 30 extends the surface with the §7.3.4 `sao()` per-CTU
 //! syntax-element family. Every element has either a single
 //! context-coded bin-0 followed by zero or more bypass-coded bins
-//! (Table 9-48) or is fully bypass-coded; no neighbour walk is
+//! (Table 9-48) or is fully bypass-coded; no neighbor walk is
 //! needed at this layer.
 //!
 //! * **`sao_merge_left_flag` / `sao_merge_up_flag`** (H.265 §7.3.4,
@@ -165,7 +165,7 @@
 //! * **`coeff_abs_level_greater1_flag[ n ]`** (H.265 §7.3.8.11,
 //!   §7.4.9.11) — §9.3.4.2.6, equations 9-56..9-60. The per-bin
 //!   `ctxInc = (ctxSet * 4) + min(3, greater1Ctx)` for luma; chroma
-//!   adds `+16`. `ctxSet` is initialised at the start of each
+//!   adds `+16`. `ctxSet` is initialized at the start of each
 //!   sub-block from the previous sub-block's terminal `greater1Ctx`
 //!   value, and rotates within `{0, 1, 2, 3}` per the spec's
 //!   `lastGreater1Ctx == 0` increment rule. Implemented as a
@@ -178,7 +178,7 @@
 //! * **`coeff_abs_level_greater2_flag[ lastGreater1ScanPos ]`**
 //!   (H.265 §7.3.8.11, §7.4.9.11) — §9.3.4.2.7, equations
 //!   9-61..9-62. `ctxInc = ctxSet` (luma) / `ctxInc = ctxSet + 4`
-//!   (chroma). The element is signalled at most once per sub-block
+//!   (chroma). The element is signaled at most once per sub-block
 //!   at the first scan position that took the greater-1 escape
 //!   (`lastGreater1ScanPos`). Implemented in
 //!   [`coeff_abs_level_greater2_flag_ctx_inc`], reading the
@@ -195,7 +195,7 @@
 //!
 //! * **transform-skip / transquant-bypass fast path** (eq. 9-40):
 //!   `sigCtx = 42` (luma) / `sigCtx = 16` (chroma). One context
-//!   per colour component, position-independent. Implemented in
+//!   per color component, position-independent. Implemented in
 //!   [`sig_coeff_flag_sig_ctx_transform_skip`].
 //!
 //! * **`log2TrafoSize == 2`** (eq. 9-41) — the 4×4 TB case reads
@@ -205,15 +205,15 @@
 //!   [`SIG_COEFF_FLAG_CTX_IDX_MAP_LOG2_TRAFO_SIZE_2`].
 //!
 //! * **DC position** (eq. 9-42) — `xC + yC == 0` on `log2 > 2` skips
-//!   the eq.-9-43..9-48 neighbour walk; `sigCtx` starts at 0 and
-//!   only the colour / size tail (eq.-9-49..9-53) applies.
+//!   the eq.-9-43..9-48 neighbor walk; `sigCtx` starts at 0 and
+//!   only the color / size tail (eq.-9-49..9-53) applies.
 //!   Implemented in [`sig_coeff_flag_sig_ctx_dc`].
 //!
 //! * **general case** (eq. 9-43..9-53) — for `log2 > 2`, `xC +
 //!   yC > 0` the `prevCsbf` parity of the right / below sub-block
-//!   neighbours plus the inner sub-block position `(xC & 3, yC & 3)`
+//!   neighbors plus the inner sub-block position `(xC & 3, yC & 3)`
 //!   route through one of four `sigCtx` rules (eq. 9-45..9-48), then
-//!   the colour / size / scan-order tail (eq. 9-49..9-53). Implemented
+//!   the color / size / scan-order tail (eq. 9-49..9-53). Implemented
 //!   in [`sig_coeff_flag_sig_ctx_general`], with the eq.-9-43 / 9-44
 //!   edge gates on `xS / yS < (1 << (log2TrafoSize − 2)) − 1`
 //!   applied internally.
@@ -468,7 +468,7 @@ use crate::cabac::{CabacEngine, CabacError, ContextModel};
 /// `cRiceParam = 0` (the only configuration this module currently
 /// needs). The prefix is unary up to a maximum of `cMax >> 0` = `cMax`
 /// bins; a value of `cMax / (1 << 0)` = `cMax` is the "escape" form
-/// signalling that a suffix follows for callers that pair TR with an
+/// signaling that a suffix follows for callers that pair TR with an
 /// EGk continuation.
 ///
 /// `read_bin(bin_idx)` decodes the bin at index `bin_idx` (0-based)
@@ -476,7 +476,7 @@ use crate::cabac::{CabacEngine, CabacError, ContextModel};
 /// returns the decoded bin (0 = continue, 1 = terminate / escape).
 ///
 /// Returns `(prefix_val, is_escape)`. `is_escape` is `true` exactly
-/// when `prefix_val == cMax`: i.e. all `cMax` bins were 1, signalling
+/// when `prefix_val == cMax`: i.e. all `cMax` bins were 1, signaling
 /// that a TR + EGk continuation suffix must be read by the caller.
 #[doc(hidden)]
 pub fn read_truncated_rice_prefix<F>(c_max: u32, mut read_bin: F) -> Result<(u32, bool), CabacError>
@@ -597,7 +597,7 @@ pub struct CuQpDelta {
     /// `cu_qp_delta_abs` from the wire.
     pub abs: u32,
     /// `cu_qp_delta_sign_flag` from the wire; `None` when
-    /// `abs == 0` (the flag is not signalled in that case).
+    /// `abs == 0` (the flag is not signaled in that case).
     pub sign_flag: Option<u8>,
     /// Derived signed delta:
     /// `cu_qp_delta_abs * (1 − 2 * cu_qp_delta_sign_flag)`.
@@ -639,7 +639,7 @@ pub fn decode_cu_qp_delta(
         prefix
     };
 
-    // §7.4.9.14: the sign flag is signalled only when abs != 0.
+    // §7.4.9.14: the sign flag is signaled only when abs != 0.
     let (sign_flag, signed) = if abs == 0 {
         (None, 0i32)
     } else {
@@ -705,7 +705,7 @@ pub fn cu_chroma_qp_offset_idx_ctx_inc(bin_idx: u32) -> u32 {
 
 /// §9.3.3.10 / Table 9-43 row for `cu_chroma_qp_offset_idx`: TR with
 /// `cMax = chroma_qp_offset_list_len_minus1`, `cRiceParam = 0`.
-/// `chroma_qp_offset_list_len_minus1` is the PPS-signalled length of
+/// `chroma_qp_offset_list_len_minus1` is the PPS-signaled length of
 /// `cb_qp_offset_list[ ]` / `cr_qp_offset_list[ ]` minus one
 /// (§7.4.3.3.1: a `u(3)` field, bounded by `<= 5`).
 #[must_use]
@@ -721,9 +721,9 @@ pub struct CuChromaQpOffset {
     /// `cu_chroma_qp_offset_flag` from the wire.
     pub flag: u8,
     /// `cu_chroma_qp_offset_idx` from the wire; `None` when the flag
-    /// is 0 (the idx is not signalled in that case per §7.3.8.11).
+    /// is 0 (the idx is not signaled in that case per §7.3.8.11).
     /// When the flag is 1 and `chroma_qp_offset_list_len_minus1 == 0`
-    /// the idx is also not signalled (the TR prefix has `cMax = 0`,
+    /// the idx is also not signaled (the TR prefix has `cMax = 0`,
     /// emitting zero bins) and the value is inferred to be 0.
     pub idx: Option<u32>,
 }
@@ -739,7 +739,7 @@ impl CuChromaQpOffset {
             None
         } else {
             // §7.4.9.10: when present, idx defaults to 0; absent ⇒
-            // also 0 (the cMax = 0 / not-signalled paths share the
+            // also 0 (the cMax = 0 / not-signaled paths share the
             // same inferred value).
             Some(self.idx.unwrap_or(0))
         }
@@ -780,7 +780,7 @@ pub fn decode_cu_chroma_qp_offset(
     // bin.
     let flag = engine.decode_decision(ctx_flag)?;
 
-    // §7.3.8.11: the idx is signalled only when the flag is 1 and
+    // §7.3.8.11: the idx is signaled only when the flag is 1 and
     // the list has more than one entry (else the TR cMax = 0 shape
     // emits no bins and the idx is inferred to be 0 per §7.4.9.10).
     let idx = if flag == 1 && chroma_qp_offset_list_len_minus1 > 0 {
@@ -820,7 +820,7 @@ pub const CU_TRANSQUANT_BYPASS_FLAG_FL_NBITS: u32 = 1;
 ///
 /// The flag's Table 9-8 ctxIdx layout (`initValue = 154` at every
 /// initType slot — same `pStateIdx`/`valMps` start at all three
-/// slice-type initialisation rows) is consumed at slice-init scope;
+/// slice-type initialization rows) is consumed at slice-init scope;
 /// this layer hands back the bank-relative `ctxInc` only.
 #[must_use]
 pub fn cu_transquant_bypass_flag_ctx_inc() -> u32 {
@@ -956,7 +956,7 @@ pub fn decode_rqt_root_cbf(
 // Table 9-43 FL binarization + Table 9-48 ctxInc + Table 9-15 ctxIdx
 // initValue. Read in the §7.3.8.6 `else /* MODE_INTER */` branch
 // (i.e. cu_skip_flag == 0); when present and 1 the inter-prediction
-// parameters are inferred from a neighbouring inter partition
+// parameters are inferred from a neighboring inter partition
 // (merge_idx follows), when 0 the explicit motion fields
 // (inter_pred_idc / ref_idx / mvp) are coded. Absent ⇒ inferred per
 // §7.4.9.6 from CuPredMode (MODE_SKIP ⇒ 1, otherwise 0).
@@ -965,7 +965,7 @@ pub fn decode_rqt_root_cbf(
 /// Table 9-43 binarization shape for `merge_flag`: FL with `cMax = 1`
 /// (a single context-coded bin per non-skip inter prediction unit).
 /// Selects between the merge path (value 1 — inter-prediction
-/// parameters inferred from a neighbouring inter-predicted partition)
+/// parameters inferred from a neighboring inter-predicted partition)
 /// and the explicit-motion path (value 0) per §7.4.9.6.
 pub const MERGE_FLAG_FL_CMAX: u32 = 1;
 
@@ -1031,7 +1031,7 @@ pub fn merge_flag_inferred(cu_pred_mode: CuPredMode) -> u8 {
 /// see [`merge_flag_inferred`] for the §7.4.9.6 not-present value.
 ///
 /// Returns the decoded `u8` (0 or 1) — 1 selects the merge path (the
-/// inter-prediction parameters are inferred from a neighbouring
+/// inter-prediction parameters are inferred from a neighboring
 /// inter-predicted partition, `merge_idx` follows per §7.3.8.6); 0
 /// selects the explicit-motion path (`inter_pred_idc` / `ref_idx_lX` /
 /// `mvp_lX_flag` / `mvd_coding` are coded).
@@ -1105,7 +1105,7 @@ pub enum CuPredMode {
     /// or B slice, non-skip CU).
     Inter,
     /// MODE_INTRA — intra-picture prediction (samples derived from
-    /// neighbouring reconstructed samples in the current picture).
+    /// neighboring reconstructed samples in the current picture).
     /// Reachable from `pred_mode_flag == 1` and from the I-slice
     /// not-present inference (§7.4.9.5).
     Intra,
@@ -1417,12 +1417,12 @@ pub fn decode_rem_intra_luma_pred_mode(engine: &mut CabacEngine<'_>) -> Result<u
 
 // ---------------------------------------------------------------------
 // IntraPredModeY derivation (§8.4.2 — derivation process for luma intra
-// prediction mode). This is the process the §7.3.8.5 luma-mode signalling
+// prediction mode). This is the process the §7.3.8.5 luma-mode signaling
 // group (prev_intra_luma_pred_flag, mpm_idx, rem_intra_luma_pred_mode)
-// feeds: given the two §8.4.2-step-2 candidate neighbour modes
+// feeds: given the two §8.4.2-step-2 candidate neighbor modes
 // candIntraPredModeA / candIntraPredModeB it builds the three-entry
 // candModeList (step 3) and then resolves IntraPredModeY from the
-// signalled fields (step 4 — either candModeList[ mpm_idx ] on the Mpm
+// signaled fields (step 4 — either candModeList[ mpm_idx ] on the Mpm
 // path, or rem_intra_luma_pred_mode passed through the sorted-list
 // increment pass on the Remaining path).
 //
@@ -1430,10 +1430,10 @@ pub fn decode_rem_intra_luma_pred_mode(engine: &mut CabacEngine<'_>) -> Result<u
 // 2..34 = INTRA_ANGULAR2..INTRA_ANGULAR34 (35 modes total). The
 // §8.4.2-step-2 candidate reduction (availability via §6.4.1,
 // CuPredMode / pcm_flag tests, the CTB-row-boundary B clamp) is the
-// slice-data parser's responsibility — it holds the neighbour state and
+// slice-data parser's responsibility — it holds the neighbor state and
 // the §6.4.1 z-scan availability — and yields the two candidate mode
 // values this process consumes, matching the availability-as-input
-// convention the §9.3.4.2.2 neighbour ctxInc derivations use.
+// convention the §9.3.4.2.2 neighbor ctxInc derivations use.
 // ---------------------------------------------------------------------
 
 /// Table 8-1 — `INTRA_PLANAR`, the mode-0 planar predictor.
@@ -1441,7 +1441,7 @@ pub const INTRA_PLANAR: u8 = 0;
 
 /// Table 8-1 — `INTRA_DC`, the mode-1 DC predictor. This is also the
 /// §8.4.2-step-2 substitute value `candIntraPredModeX` takes when the
-/// neighbour is unavailable, inter-coded, PCM, or (for B) lies in the
+/// neighbor is unavailable, inter-coded, PCM, or (for B) lies in the
 /// CTB row above the current one.
 pub const INTRA_DC: u8 = 1;
 
@@ -1457,18 +1457,18 @@ pub const INTRA_PRED_MODE_MAX: u8 = 34;
 
 /// §8.4.2 step 3 — build the three-entry most-probable-mode candidate
 /// list `candModeList[ 0..=2 ]` from the two §8.4.2-step-2 candidate
-/// neighbour modes `candIntraPredModeA` (left, location `(xPb − 1, yPb)`)
+/// neighbor modes `candIntraPredModeA` (left, location `(xPb − 1, yPb)`)
 /// and `candIntraPredModeB` (above, location `(xPb, yPb − 1)`).
 ///
 /// Both candidate inputs are already the reduced step-2 values (an
-/// available intra neighbour's `IntraPredModeY`, else `INTRA_DC`); this
+/// available intra neighbor's `IntraPredModeY`, else `INTRA_DC`); this
 /// function implements only the step-3 list construction:
 ///
 /// * `candIntraPredModeB == candIntraPredModeA`:
 ///   * candidate `< 2` (PLANAR or DC) ⇒ `{PLANAR, DC, ANGULAR26}`
 ///     (eqs. 8-21..8-23).
 ///   * otherwise (an angular candidate) ⇒ the candidate plus its two
-///     neighbouring angular modes (eqs. 8-24..8-26):
+///     neighboring angular modes (eqs. 8-24..8-26):
 ///     `{candA, 2 + ((candA + 29) % 32), 2 + ((candA − 2 + 1) % 32)}`.
 /// * `candIntraPredModeB != candIntraPredModeA`:
 ///   * `candModeList[ 0 ] = candA`, `candModeList[ 1 ] = candB`
@@ -1497,7 +1497,7 @@ pub fn intra_luma_cand_mode_list(
             [INTRA_PLANAR, INTRA_DC, INTRA_ANGULAR26]
         } else {
             // eqs. 8-24..8-26 — equal angular candidate; the `% 32`
-            // arithmetic wraps the two neighbouring angular modes back
+            // arithmetic wraps the two neighboring angular modes back
             // into the 2..=33 angular band (the `2 +` re-bases the
             // 0..=31 residue onto INTRA_ANGULAR2).
             let a = u32::from(cand_intra_pred_mode_a);
@@ -1523,7 +1523,7 @@ pub fn intra_luma_cand_mode_list(
 }
 
 /// §8.4.2 step 4 — derive `IntraPredModeY[ xPb ][ yPb ]` from the step-3
-/// `candModeList` and the §7.3.8.5 signalled luma-mode fields.
+/// `candModeList` and the §7.3.8.5 signaled luma-mode fields.
 ///
 /// `cand_mode_list` is the [`intra_luma_cand_mode_list`] output; `source`
 /// is the [`LumaIntraModeSource`] the round-40 `prev_intra_luma_pred_flag`
@@ -1598,7 +1598,7 @@ pub fn derive_intra_pred_mode_y(
 // (monochrome — §8.4.3 is only invoked when ChromaArrayType != 0).
 // ---------------------------------------------------------------------
 
-/// Table 9-46 — the `intra_chroma_pred_mode` value signalled by the
+/// Table 9-46 — the `intra_chroma_pred_mode` value signaled by the
 /// single-bin string `0`: 4. Per Table 8-2 row 4 the §8.4.3 `modeIdx`
 /// for this value is `IntraPredModeY` itself (the chroma prediction
 /// mode tracks the luma mode; for `ChromaArrayType == 2` the tracked
@@ -1830,7 +1830,7 @@ pub fn last_sig_coeff_prefix_cmax(log2_trafo_size: u32) -> u32 {
 /// §7.4.9.11 equations 7-74..7-77 — derive the final
 /// `LastSignificantCoeffX/Y` position from a decoded
 /// `(prefix, optional suffix)` pair. When `prefix <= 3` no suffix is
-/// signalled and the position equals the prefix. When `prefix > 3` the
+/// signaled and the position equals the prefix. When `prefix > 3` the
 /// suffix is `nBits = (prefix >> 1) − 1` bits, and the position is
 ///
 /// ```text
@@ -1853,7 +1853,7 @@ pub fn last_sig_coeff_position(prefix: u32, suffix: Option<u32>) -> u32 {
 
 /// Suffix bit count for `last_sig_coeff_{x,y}_suffix`: `nBits =
 /// (prefix >> 1) − 1` when `prefix > 3`, otherwise 0 (no suffix
-/// signalled).
+/// signaled).
 #[must_use]
 pub fn last_sig_coeff_suffix_n_bits(prefix: u32) -> u32 {
     if prefix > 3 { (prefix >> 1) - 1 } else { 0 }
@@ -1866,7 +1866,7 @@ pub struct LastSigCoeff {
     /// `last_sig_coeff_*_prefix` from the wire.
     pub prefix: u32,
     /// `last_sig_coeff_*_suffix` from the wire (`None` when
-    /// `prefix <= 3`, the no-suffix-signalled case).
+    /// `prefix <= 3`, the no-suffix-signaled case).
     pub suffix: Option<u32>,
     /// §7.4.9.11 derived `LastSignificantCoeff{X,Y}` position. Range
     /// 0..=(1 << log2TrafoSize) - 1.
@@ -1924,9 +1924,9 @@ pub fn decode_last_sig_coeff(
 // ---------------------------------------------------------------------
 
 /// §9.3.4.2.4 — derive the `ctxInc` for one bin of
-/// `coded_sub_block_flag` from the colour-component index, the
+/// `coded_sub_block_flag` from the color-component index, the
 /// current sub-block scan location `(xS, yS)`, the transform-block
-/// size `log2TrafoSize`, and the two previously decoded neighbour
+/// size `log2TrafoSize`, and the two previously decoded neighbor
 /// bins in sub-block scan order.
 ///
 /// Spec equations:
@@ -1944,11 +1944,11 @@ pub fn decode_last_sig_coeff(
 ///     ctxInc = 2 + min(csbfCtx, 1)
 /// ```
 ///
-/// `right_neighbour` is the previously decoded
+/// `right_neighbor` is the previously decoded
 /// `coded_sub_block_flag[xS + 1][yS]` (0/1); pass `0` whenever the
 /// current sub-block sits on the right edge of the TB
 /// (`xS == (1 << (log2TrafoSize - 2)) - 1`), where equation 9-36 does
-/// not apply. `below_neighbour` is the previously decoded
+/// not apply. `below_neighbor` is the previously decoded
 /// `coded_sub_block_flag[xS][yS + 1]` (0/1); pass `0` whenever the
 /// current sub-block sits on the bottom edge of the TB
 /// (`yS == (1 << (log2TrafoSize - 2)) - 1`).
@@ -1957,18 +1957,18 @@ pub fn decode_last_sig_coeff(
 /// `{2, 3}` for chroma (`cIdx > 0`).
 ///
 /// # Panics
-/// Does not panic; both neighbour inputs are clamped via the boolean
+/// Does not panic; both neighbor inputs are clamped via the boolean
 /// `>= 1` comparison.
 #[must_use]
 pub fn coded_sub_block_flag_ctx_inc(
     is_chroma: bool,
-    right_neighbour: u8,
-    below_neighbour: u8,
+    right_neighbor: u8,
+    below_neighbor: u8,
 ) -> u32 {
-    // §9.3.4.2.4: csbfCtx is the unsigned sum of the two neighbour
+    // §9.3.4.2.4: csbfCtx is the unsigned sum of the two neighbor
     // bins (each either 0 or 1), so it lies in {0, 1, 2}. The final
     // ctxInc clamps to {0, 1} via min(csbfCtx, 1).
-    let csbf_ctx = (right_neighbour & 1) as u32 + (below_neighbour & 1) as u32;
+    let csbf_ctx = (right_neighbor & 1) as u32 + (below_neighbor & 1) as u32;
     let clipped = csbf_ctx.min(1);
     if is_chroma {
         // §9.3.4.2.4 equation 9-39: chroma uses the {2, 3} bank.
@@ -1997,19 +1997,19 @@ pub fn coded_sub_block_flag_ctx_inc_with_edge(
     xs: u32,
     ys: u32,
     log2_trafo_size: u32,
-    right_neighbour: u8,
-    below_neighbour: u8,
+    right_neighbor: u8,
+    below_neighbor: u8,
 ) -> u32 {
     // §9.3.4.2.4 edge gates: ( 1 << ( log2TrafoSize − 2 ) ) − 1 is
     // the maximum sub-block index along each axis for the TB.
     let max_sub_block_idx = (1u32 << (log2_trafo_size - 2)) - 1;
     let right = if xs < max_sub_block_idx {
-        right_neighbour & 1
+        right_neighbor & 1
     } else {
         0
     };
     let below = if ys < max_sub_block_idx {
-        below_neighbour & 1
+        below_neighbor & 1
     } else {
         0
     };
@@ -2022,7 +2022,7 @@ pub fn coded_sub_block_flag_ctx_inc_with_edge(
 
 /// §9.3.4.2.2 Table 9-49 — the shared `ctxInc` derivation for
 /// syntax elements that take their `ctxInc` from a `condL` / `condA`
-/// neighbour pair plus the §6.4.1 availability of the neighbour
+/// neighbor pair plus the §6.4.1 availability of the neighbor
 /// blocks:
 ///
 /// ```text
@@ -2043,31 +2043,31 @@ pub fn left_above_ctx_inc(cond_l: bool, available_l: bool, cond_a: bool, availab
 }
 
 /// §9.3.4.2.2 Table 9-49 — `condL` / `condA` predicate for
-/// `split_cu_flag`: each neighbour contributes `CtDepth[xNb][yNb] >
+/// `split_cu_flag`: each neighbor contributes `CtDepth[xNb][yNb] >
 /// cqtDepth`. Returns the predicate as a `bool` ready to feed into
 /// [`left_above_ctx_inc`].
 ///
-/// `neighbour_ct_depth` is the `CtDepth[xNb][yNb]` value already
-/// derived by the caller for the neighbouring (left or above) block;
+/// `neighbor_ct_depth` is the `CtDepth[xNb][yNb]` value already
+/// derived by the caller for the neighboring (left or above) block;
 /// `cqt_depth` is the current block's coding-quadtree depth.
 #[must_use]
-pub fn split_cu_flag_cond(neighbour_ct_depth: u32, cqt_depth: u32) -> bool {
-    neighbour_ct_depth > cqt_depth
+pub fn split_cu_flag_cond(neighbor_ct_depth: u32, cqt_depth: u32) -> bool {
+    neighbor_ct_depth > cqt_depth
 }
 
 /// §9.3.4.2.2 Table 9-49 — `condL` / `condA` predicate for
-/// `cu_skip_flag`: each neighbour contributes
+/// `cu_skip_flag`: each neighbor contributes
 /// `cu_skip_flag[xNb][yNb]` as-is.
 #[must_use]
-pub fn cu_skip_flag_cond(neighbour_cu_skip_flag: u8) -> bool {
-    (neighbour_cu_skip_flag & 1) != 0
+pub fn cu_skip_flag_cond(neighbor_cu_skip_flag: u8) -> bool {
+    (neighbor_cu_skip_flag & 1) != 0
 }
 
 /// §9.3.4.2.2 Table 9-49 row for `split_cu_flag`. Convenience: takes
-/// the neighbour `CtDepth` values and availability and returns
+/// the neighbor `CtDepth` values and availability and returns
 /// `ctxInc` directly.
 ///
-/// The neighbour `CtDepth` arguments are ignored when the matching
+/// The neighbor `CtDepth` arguments are ignored when the matching
 /// `available` flag is false (the `(condX && availableX)` AND in the
 /// Table 9-49 formula short-circuits in that case), but the caller
 /// may pass any placeholder for them.
@@ -2088,7 +2088,7 @@ pub fn split_cu_flag_ctx_inc(
 }
 
 /// §9.3.4.2.2 Table 9-49 row for `cu_skip_flag`. Convenience: takes
-/// the neighbour `cu_skip_flag` values and availability and returns
+/// the neighbor `cu_skip_flag` values and availability and returns
 /// `ctxInc` directly.
 #[must_use]
 pub fn cu_skip_flag_ctx_inc(
@@ -2115,7 +2115,7 @@ pub fn cu_skip_flag_ctx_inc(
 //   log2CbSize > MinCbLog2SizeY
 // otherwise it is inferred (§7.4.9.4): 1 when the block extends past the
 // picture boundary or log2CbSize > MinCbLog2SizeY, else 0. The caller
-// owns that gate / inference and the §9.3.4.2.2 neighbour `CtDepth`
+// owns that gate / inference and the §9.3.4.2.2 neighbor `CtDepth`
 // lookup that feeds [`split_cu_flag_ctx_inc`]; this primitive reads the
 // single context-coded bin once the bank slot is selected.
 // ---------------------------------------------------------------------
@@ -2136,7 +2136,7 @@ pub const SPLIT_CU_FLAG_FL_NBITS: u32 = 1;
 /// `ctx` is the caller's `(pStateIdx, valMps)` state for the
 /// §9.3.4.2.2 ctxInc slot in the §7.3.8.4 `split_cu_flag[3]` bank
 /// (derive the slot with [`split_cu_flag_ctx_inc`] from the left /
-/// above neighbours' `CtDepth` and §6.4.1 availability); it is mutated
+/// above neighbors' `CtDepth` and §6.4.1 availability); it is mutated
 /// in place per the §9.3.4.3.2.2 state transition.
 ///
 /// The §7.3.8.4 split-presence gate and the §7.4.9.4 not-present
@@ -2184,7 +2184,7 @@ pub const CU_SKIP_FLAG_FL_NBITS: u32 = 1;
 /// `ctx` is the caller's `(pStateIdx, valMps)` state for the
 /// §9.3.4.2.2 ctxInc slot in the §7.3.8.5 `cu_skip_flag[3]` bank
 /// (derive the slot with [`cu_skip_flag_ctx_inc`] from the left /
-/// above neighbours' decoded `cu_skip_flag` and §6.4.1 availability);
+/// above neighbors' decoded `cu_skip_flag` and §6.4.1 availability);
 /// it is mutated in place per the §9.3.4.3.2.2 state transition.
 ///
 /// The §7.3.8.5 read is gated on `slice_type != I`; for I slices the
@@ -2212,7 +2212,7 @@ pub fn decode_cu_skip_flag(
 /// `cu_skip_flag == 1` (only reachable for `slice_type != I`) maps to
 /// [`CuPredMode::Skip`]; `cu_skip_flag == 0` in a P / B slice leaves the
 /// mode to be decided by the subsequent `pred_mode_flag` (returns
-/// `None`, signalling the caller must read that flag). For an I slice
+/// `None`, signaling the caller must read that flag). For an I slice
 /// `cu_skip_flag` is inferred to 0 and the mode is MODE_INTRA without a
 /// `pred_mode_flag` read.
 ///
@@ -2257,7 +2257,7 @@ pub fn cu_pred_mode_from_skip(slice_type_is_i: bool, cu_skip_flag: u8) -> Option
 /// returned `ctxInc` lies in `{0, 1, 2, 3}`.
 ///
 /// The §7.4.9.10 `split_transform_flag` syntax element is itself
-/// only signalled when `log2TrafoSize > MaxTbLog2SizeY` is false and
+/// only signaled when `log2TrafoSize > MaxTbLog2SizeY` is false and
 /// `log2TrafoSize > MinTbLog2SizeY` is true; the caller is responsible
 /// for that gate. This function is the per-bin ctxInc derivation
 /// only.
@@ -2266,7 +2266,7 @@ pub fn cu_pred_mode_from_skip(slice_type_is_i: bool, cu_skip_flag: u8) -> Option
 /// Does not panic. For `log2TrafoSize > 5` the result is `u32::MAX`
 /// (a wrap of the `5 − x` subtraction); the spec only defines the
 /// derivation for `log2TrafoSize ∈ {2, 3, 4, 5}` and the caller is
-/// expected to honour that range.
+/// expected to honor that range.
 #[must_use]
 pub fn split_transform_flag_ctx_inc(log2_trafo_size: u32) -> u32 {
     // §7.4.9.10 restricts the syntax element to log2TrafoSize in
@@ -2528,7 +2528,7 @@ pub const LOG2_RES_SCALE_ABS_PLUS1_TR_CMAX: u32 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossCompPred {
     /// `log2_res_scale_abs_plus1[ c ]` from the wire (TR, `cMax = 4`).
-    /// When this is 0, `res_scale_sign_flag` is not signalled and
+    /// When this is 0, `res_scale_sign_flag` is not signaled and
     /// `ResScaleVal` is 0.
     pub log2_res_scale_abs_plus1: u32,
     /// `res_scale_sign_flag[ c ]` from the wire; `None` when
@@ -2596,7 +2596,7 @@ pub fn decode_cross_comp_pred(
 // ---------------------------------------------------------------------
 // tu_residual_act_flag (§7.3.8.10 transform_unit() / §7.4.9.10)
 // Table 9-39 ctxIdx initValue; FL (cMax = 1) binarization; Table 9-48
-// ctxInc = 0. Present only when the SCC residual adaptive colour
+// ctxInc = 0. Present only when the SCC residual adaptive color
 // transform gate is satisfied (§7.3.8.10).
 // ---------------------------------------------------------------------
 
@@ -2613,8 +2613,8 @@ pub fn tu_residual_act_flag_ctx_inc() -> u32 {
 }
 
 /// §7.4.9.10 — inferred value of `tu_residual_act_flag` when it is not
-/// present (the adaptive-colour-transform gate is not satisfied): the
-/// spec mandates an inferred value of `0` (no adaptive colour
+/// present (the adaptive-color-transform gate is not satisfied): the
+/// spec mandates an inferred value of `0` (no adaptive color
 /// transform).
 #[must_use]
 pub fn tu_residual_act_flag_inferred() -> u8 {
@@ -2624,7 +2624,7 @@ pub fn tu_residual_act_flag_inferred() -> u8 {
 /// Decode `tu_residual_act_flag` (§7.3.8.10 / §7.4.9.10) from the CABAC
 /// engine, consuming one Table 9-39 context for the single FL bin
 /// (Table 9-48 ctxInc = 0). The gate that decides whether the element
-/// is present (the §7.3.8.10 `residual_adaptive_colour_transform_enabled_flag`
+/// is present (the §7.3.8.10 `residual_adaptive_color_transform_enabled_flag`
 /// predicate) is the caller's responsibility; see
 /// [`tu_residual_act_flag_inferred`] for the absent case.
 pub fn decode_tu_residual_act_flag(
@@ -2647,7 +2647,7 @@ pub fn decode_tu_residual_act_flag(
 // family, all decoded inside the §7.3.4 `sao()` per-CTU block. Every
 // element is either a single context-coded bin-0 followed by zero or
 // more bypass-coded bins (Table 9-48), or fully bypass-coded; no
-// neighbour-table walk is needed at this layer.
+// neighbor-table walk is needed at this layer.
 //
 // Table 9-48 rows captured here:
 //
@@ -2762,7 +2762,7 @@ pub const SAO_EO_CLASS_FL_NBITS: u32 = 2;
 /// prefix are bypass-coded per Table 9-48.
 ///
 /// `bit_depth` is the §7.4.7.1 `BitDepthY` or `BitDepthC` value
-/// for the colour component being decoded.
+/// for the color component being decoded.
 #[must_use]
 pub fn sao_offset_abs_tr_cmax(bit_depth: u32) -> u32 {
     // §9.3.3.5: Min(bitDepth, 10). Clamp at the spec maximum so the
@@ -3130,7 +3130,7 @@ pub enum InterPredIdc {
 /// `nPbW + nPbH`: when `!= 12` bin 0 (`PRED_BI` = "1", else two bins)
 /// uses `ctxInc = CtDepth`, bin 1 uses `ctxInc = 4` (Table 9-48); when
 /// `== 12` the single bin uses `ctxInc = 4`. Read only on B slices;
-/// a non-B inter PB is `PRED_L0` (§7.4.9.6, not signalled here).
+/// a non-B inter PB is `PRED_L0` (§7.4.9.6, not signaled here).
 ///
 /// * `ctx_b0` — the `inter_pred_idc` bank slot `CtDepth` (bin 0,
 ///   `nPbW + nPbH != 12` case) or slot 4 (`== 12` case), selected by
@@ -3236,8 +3236,8 @@ pub fn decode_mvp_flag(
 ///
 /// The machine is the §9.3.4.2.6 equations encoded as a tiny FSM:
 ///
-/// * Equations 9-56 / 9-57 initialise `ctxSet` for each sub-block
-///   based on the sub-block scan index `i` and the colour-component
+/// * Equations 9-56 / 9-57 initialize `ctxSet` for each sub-block
+///   based on the sub-block scan index `i` and the color-component
 ///   index `cIdx`.
 /// * The §9.3.4.2.6 `lastGreater1Ctx == 0` step (the spec's
 ///   "increment `ctxSet` by one") routes the sub-block into the
@@ -3269,7 +3269,7 @@ pub struct Greater1State {
     /// the next sub-block's entry will bump `ctxSet`.
     greater1_ctx: u32,
     /// Has any sub-block been entered yet in this transform block?
-    /// Used to recognise the "first sub-block" case the spec calls
+    /// Used to recognize the "first sub-block" case the spec calls
     /// out (`lastGreater1Ctx = 1`).
     seen_any_subblock: bool,
     /// True iff at least one `coeff_abs_level_greater1_flag` bin has
@@ -3312,7 +3312,7 @@ impl Greater1State {
     /// returns, [`current_ctx_inc`](Self::current_ctx_inc) yields
     /// the eq.-9-59 `ctxInc` for the sub-block's first bin.
     pub fn on_subblock_entry(&mut self, i: u32, is_chroma: bool, last_greater1_flag: u8) {
-        // Eq. 9-56 / 9-57: initialise ctxSet from (i, cIdx).
+        // Eq. 9-56 / 9-57: initialize ctxSet from (i, cIdx).
         self.ctx_set = if i == 0 || is_chroma { 0 } else { 2 };
 
         // §9.3.4.2.6 lastGreater1Ctx derivation. The spec branches
@@ -3434,7 +3434,7 @@ impl Default for Greater1State {
 /// `ctxSet` is the value derived by §9.3.4.2.6 for the same
 /// sub-block, available from [`Greater1State::ctx_set`].
 ///
-/// The element is signalled at most once per sub-block at the first
+/// The element is signaled at most once per sub-block at the first
 /// scan position that took the greater-1 escape; the per-sub-block
 /// `Greater1State` already has the matching `ctxSet` at the time
 /// the residual loop reaches that scan position, so the caller
@@ -3460,7 +3460,7 @@ pub const COEFF_ABS_LEVEL_GREATER_X_FL_CMAX: u32 = 1;
 ///
 /// The published Table 9-50 renders only `i ∈ 0..=14`; the `i = 15`
 /// cell is cropped past the page margin (a publishing/layout
-/// artefact — eq. 9-41 indexes the map by `( yC << 2 ) + xC` over a
+/// artifact — eq. 9-41 indexes the map by `( yC << 2 ) + xC` over a
 /// full 4×4 sub-block, so the 16th entry is normative content). The
 /// staged H.265 errata file
 /// (`docs/video/h265/h265-errata-and-clarifications.md`, entry #93)
@@ -3501,13 +3501,13 @@ pub fn sig_coeff_flag_sig_ctx_log2_2(xc: u32, yc: u32) -> u32 {
 /// §9.3.4.2.5 fourth-branch sigCtx derivation (equations 9-43..9-53)
 /// for `log2TrafoSize > 2` and `xC + yC > 0`. Combines:
 ///
-/// * `prevCsbf` from the right / below sub-block neighbours of the
+/// * `prevCsbf` from the right / below sub-block neighbors of the
 ///   current sub-block (equations 9-43, 9-44; edge-gated by the
 ///   `xS < (1 << (log2TrafoSize − 2)) − 1` /
 ///   `yS < (1 << (log2TrafoSize − 2)) − 1` conditions),
 /// * the inner-sub-block position `(xP, yP) = (xC & 3, yC & 3)`
 ///   routed through equations 9-45..9-48 based on `prevCsbf`,
-/// * the colour / size / scan-order tail offsets in equations
+/// * the color / size / scan-order tail offsets in equations
 ///   9-49..9-53.
 ///
 /// Inputs:
@@ -3522,7 +3522,7 @@ pub fn sig_coeff_flag_sig_ctx_log2_2(xc: u32, yc: u32) -> u32 {
 ///   (`xs = xC >> 2`, `ys = yC >> 2`),
 /// * `right_csbf` / `below_csbf` — the previously decoded
 ///   `coded_sub_block_flag[ xS + 1 ][ yS ]` / `[ xS ][ yS + 1 ]`
-///   neighbour bits (each 0 or 1); ignored when on the right /
+///   neighbor bits (each 0 or 1); ignored when on the right /
 ///   bottom TB edge per the equation 9-43 / 9-44 gates,
 /// * `scan_idx` — the §6.5.2 scan order index in `{0, 1, 2}`
 ///   (`0` = up-right diagonal, `1` = horizontal, `2` = vertical);
@@ -3601,7 +3601,7 @@ pub fn sig_coeff_flag_sig_ctx_general(
         _ => 2,
     };
 
-    // Equations 9-49..9-53: colour / size / scan tail offsets.
+    // Equations 9-49..9-53: color / size / scan tail offsets.
     if !is_chroma {
         // Luma branch.
         // Eq. 9-49: when (xS + yS) > 0, sigCtx += 3.
@@ -3630,11 +3630,11 @@ pub fn sig_coeff_flag_sig_ctx_general(
 /// §9.3.4.2.5 DC sigCtx for `log2TrafoSize > 2` and `xC + yC == 0`
 /// (equation 9-42). The DC coefficient takes the third branch of the
 /// §9.3.4.2.5 cascade: `sigCtx = 0`, full stop — the
-/// equations-9-49..9-53 size / colour / scan modifications are nested
+/// equations-9-49..9-53 size / color / scan modifications are nested
 /// inside the *fourth* ("Otherwise") branch and do **not** apply to the
 /// DC position. The resulting ctxInc is 0 for luma and 27 for chroma
 /// (equations 9-54 / 9-55): every `log2TrafoSize > 2` transform block
-/// shares one dedicated DC context per colour component.
+/// shares one dedicated DC context per color component.
 ///
 /// The `is_chroma` / `log2_trafo_size` / `scan_idx` inputs are retained
 /// for signature parity with the sibling branch helpers; equation 9-42
@@ -3736,7 +3736,7 @@ pub fn palette_run_prefix_ctx_inc_eq_9_63(palette_idx_idc: u32) -> u32 {
 ///   branch returns `{0, 1, 2}`; otherwise the value is read from
 ///   [`PALETTE_RUN_PREFIX_CTX_IDX_MAP`].
 /// * `None` — when `bin_idx >= 5`, the Table 9-51 ">4" column,
-///   signalling that the bin is bypass-coded per Table 9-48 and the
+///   signaling that the bin is bypass-coded per Table 9-48 and the
 ///   caller must invoke the engine's bypass path.
 #[must_use]
 pub fn palette_run_prefix_ctx_inc(
@@ -4239,7 +4239,7 @@ pub struct MvdComponent {
 ///
 /// `greater0_flag == 0` short-circuits to `0` (the whole product
 /// vanishes), matching the §7.3.8.9 parse where no further fields are
-/// signalled.
+/// signaled.
 #[must_use]
 pub fn mvd_component_value(greater0_flag: u8, minus2: Option<u32>, sign_flag: Option<u8>) -> i32 {
     if greater0_flag == 0 {
@@ -4286,7 +4286,7 @@ where
 {
     let greater0_flag = read_ctx_bin()?;
     if greater0_flag == 0 {
-        // §7.3.8.9: no further fields signalled; all inferred absent.
+        // §7.3.8.9: no further fields signaled; all inferred absent.
         return Ok(MvdComponent {
             greater0_flag: 0,
             greater1_flag: None,
@@ -4596,7 +4596,7 @@ mod tests {
     #[test]
     fn cu_qp_delta_zero_when_first_bin_zero() {
         // All-zero stream: 9 init bits = 0, then the first
-        // cu_qp_delta_abs bin is 0 → abs = 0, sign flag NOT signalled,
+        // cu_qp_delta_abs bin is 0 → abs = 0, sign flag NOT signaled,
         // value = 0.
         let buf = [0u8; 8];
         let mut eng = CabacEngine::new(BitReader::new(&buf)).unwrap();
@@ -4724,22 +4724,22 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn coded_sub_block_flag_ctx_inc_luma_no_neighbours_active() {
-        // §9.3.4.2.4: both neighbours = 0 → csbfCtx = 0 →
+    fn coded_sub_block_flag_ctx_inc_luma_no_neighbors_active() {
+        // §9.3.4.2.4: both neighbors = 0 → csbfCtx = 0 →
         // ctxInc = min(0, 1) = 0 for luma.
         assert_eq!(coded_sub_block_flag_ctx_inc(false, 0, 0), 0);
     }
 
     #[test]
-    fn coded_sub_block_flag_ctx_inc_luma_one_neighbour_active() {
-        // One neighbour set → csbfCtx = 1 → ctxInc = min(1, 1) = 1.
+    fn coded_sub_block_flag_ctx_inc_luma_one_neighbor_active() {
+        // One neighbor set → csbfCtx = 1 → ctxInc = min(1, 1) = 1.
         assert_eq!(coded_sub_block_flag_ctx_inc(false, 1, 0), 1);
         assert_eq!(coded_sub_block_flag_ctx_inc(false, 0, 1), 1);
     }
 
     #[test]
-    fn coded_sub_block_flag_ctx_inc_luma_both_neighbours_active_clamps() {
-        // Both neighbours set → csbfCtx = 2 → min(2, 1) = 1
+    fn coded_sub_block_flag_ctx_inc_luma_both_neighbors_active_clamps() {
+        // Both neighbors set → csbfCtx = 2 → min(2, 1) = 1
         // (equation 9-38 clamps the sum). The luma bank is {0, 1}
         // so the maximum value is 1.
         assert_eq!(coded_sub_block_flag_ctx_inc(false, 1, 1), 1);
@@ -4757,7 +4757,7 @@ mod tests {
 
     #[test]
     fn coded_sub_block_flag_ctx_inc_ignores_high_bits() {
-        // Only the LSB of each neighbour input is consulted (the
+        // Only the LSB of each neighbor input is consulted (the
         // function masks with & 1). Confirms a defensive input
         // does not leak into csbfCtx.
         assert_eq!(coded_sub_block_flag_ctx_inc(false, 0xFE, 0), 0);
@@ -4768,13 +4768,13 @@ mod tests {
     fn coded_sub_block_flag_ctx_inc_with_edge_drops_right() {
         // 4×4 TB: log2 = 2, max sub-block index = (1 << 0) − 1 = 0.
         // So xs = 0 == max → equation 9-36 does NOT apply; the
-        // right_neighbour input is ignored.
+        // right_neighbor input is ignored.
         assert_eq!(
             coded_sub_block_flag_ctx_inc_with_edge(false, 0, 0, 2, 1, 0),
             0
         );
         // 8×8 TB: log2 = 3, max sub-block index = (1 << 1) − 1 = 1.
-        // xs = 0 < 1 → right neighbour counts; xs = 1 == max → it
+        // xs = 0 < 1 → right neighbor counts; xs = 1 == max → it
         // does not.
         assert_eq!(
             coded_sub_block_flag_ctx_inc_with_edge(false, 0, 0, 3, 1, 0),
@@ -4803,7 +4803,7 @@ mod tests {
     #[test]
     fn coded_sub_block_flag_ctx_inc_with_edge_32x32_interior() {
         // 32×32 TB: log2 = 5, max sub-block index = (1 << 3) − 1 =
-        // 7. An interior sub-block at (3, 3) with both neighbours
+        // 7. An interior sub-block at (3, 3) with both neighbors
         // active → csbfCtx = 2 → ctxInc = min(2, 1) = 1.
         assert_eq!(
             coded_sub_block_flag_ctx_inc_with_edge(false, 3, 3, 5, 1, 1),
@@ -4833,7 +4833,7 @@ mod tests {
 
     #[test]
     fn left_above_ctx_inc_unavailable_zeroes_branch() {
-        // If a neighbour is unavailable per §6.4.1, its branch
+        // If a neighbor is unavailable per §6.4.1, its branch
         // contributes 0 regardless of the cond value.
         assert_eq!(left_above_ctx_inc(true, false, true, false), 0);
         assert_eq!(left_above_ctx_inc(true, false, true, true), 1);
@@ -4862,8 +4862,8 @@ mod tests {
     }
 
     #[test]
-    fn split_cu_flag_ctx_inc_both_neighbours_deeper() {
-        // Both neighbours at depth 2, current cqtDepth = 1 → both
+    fn split_cu_flag_ctx_inc_both_neighbors_deeper() {
+        // Both neighbors at depth 2, current cqtDepth = 1 → both
         // conds true. Both available → ctxInc = 2.
         assert_eq!(split_cu_flag_ctx_inc(2, true, 2, true, 1), 2);
     }
@@ -4892,7 +4892,7 @@ mod tests {
         assert_eq!(cu_skip_flag_ctx_inc(1, true, 0, true), 1);
         assert_eq!(cu_skip_flag_ctx_inc(0, true, 1, true), 1);
         assert_eq!(cu_skip_flag_ctx_inc(1, true, 1, true), 2);
-        // Unavailable neighbours zero their contribution even if
+        // Unavailable neighbors zero their contribution even if
         // the flag itself is set.
         assert_eq!(cu_skip_flag_ctx_inc(1, false, 1, true), 1);
         assert_eq!(cu_skip_flag_ctx_inc(1, true, 1, false), 1);
@@ -5362,7 +5362,7 @@ mod tests {
     #[test]
     fn greater1_ctx_inc_clamps_at_min_three() {
         // Eq. 9-59 explicitly takes Min(3, greater1Ctx). The state
-        // machine tracks the clamped value, so synthesising ctxSet=1,
+        // machine tracks the clamped value, so synthesizing ctxSet=1,
         // greater1Ctx=3 gives ctxInc = 4 + 3 = 7 for luma; greater1Ctx
         // can never exceed 3 internally so this is enforced by the
         // type, not the read path.
@@ -5625,7 +5625,7 @@ mod tests {
     }
 
     #[test]
-    fn sig_coeff_flag_general_edge_gates_neighbour_inputs() {
+    fn sig_coeff_flag_general_edge_gates_neighbor_inputs() {
         // log2 = 3 (8×8) ⇒ max sub-block index 1. (xS, yS) = (1, 0):
         // xS is at the right edge (1 == 1) ⇒ eq.-9-43 gate suppresses
         // right_csbf. yS is not at the bottom edge ⇒ eq.-9-44 admits
@@ -5641,7 +5641,7 @@ mod tests {
         assert_eq!(with_below, without_below);
 
         // Sanity: (xS, yS) = (0, 0) on a 16×16 TB admits both
-        // neighbours (max sub-block index = 3, both 0 < 3).
+        // neighbors (max sub-block index = 3, both 0 < 3).
         let admits = sig_coeff_flag_sig_ctx_general(false, 4, 0, 0, 0, 0, 1, 1, 0);
         // prevCsbf = 3 ⇒ eq.-9-48 sigCtx = 2; eq. 9-51 + 21 = 23.
         assert_eq!(admits, 23);
@@ -6118,7 +6118,7 @@ mod tests {
     // The §9.3.4.3.4 bypass arithmetic decoder does not map stream
     // bits to bins 1-for-1 (the offset accumulator gates `bin == 1`
     // by a 510 threshold), so end-to-end engine tests can't trivially
-    // synthesise a target bin sequence. Instead we drive the
+    // synthesize a target bin sequence. Instead we drive the
     // [`decode_coeff_abs_level_remaining_with`] entry point with a
     // flat bin queue — the algorithm logic is identical and the
     // engine wrapper is a one-line trampoline.
@@ -6241,7 +6241,7 @@ mod tests {
     #[test]
     fn decode_coeff_abs_level_remaining_round_trips_tr_path_r0_thru_r4() {
         // For each (cRiceParam, level) in the TR-only range
-        // (0..cMax), synthesise the §9.3.3.11 bin sequence,
+        // (0..cMax), synthesize the §9.3.3.11 bin sequence,
         // run the decoder, and confirm the original level comes back.
         for r in 0..=4u32 {
             let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
@@ -6262,7 +6262,7 @@ mod tests {
     #[test]
     fn decode_coeff_abs_level_remaining_round_trips_escape_path_anchors() {
         // Escape-path anchors for cRiceParam ∈ {0..=4}: pick a few
-        // (suffix-value) anchors per r, synthesise the all-ones TR
+        // (suffix-value) anchors per r, synthesize the all-ones TR
         // prefix + EGk(r + 1) suffix, decode, and confirm.
         for r in 0..=4u32 {
             let c_max = coeff_abs_level_remaining_c_max_eq_9_26(r);
@@ -6432,7 +6432,7 @@ mod tests {
     fn decode_coeff_sign_flag_matches_underlying_decode_bypass() {
         // The wrapper is `engine.decode_bypass()` — these two paths
         // must produce identical sequences when fed the same engine
-        // state. Confirm via two engines initialised from the same
+        // state. Confirm via two engines initialized from the same
         // buffer: the first runs the wrapper N times; the second
         // runs `decode_bypass` N times; the bin sequences agree.
         let mut buf = [0u8; 16];
@@ -6504,7 +6504,7 @@ mod tests {
         };
         assert_eq!(off1.offset_indices(), Some(3));
 
-        // flag = 1, idx not signalled (cMax = 0 case) ⇒ inferred 0.
+        // flag = 1, idx not signaled (cMax = 0 case) ⇒ inferred 0.
         let off2 = CuChromaQpOffset { flag: 1, idx: None };
         assert_eq!(off2.offset_indices(), Some(0));
     }
@@ -6530,7 +6530,7 @@ mod tests {
 
     #[test]
     fn cu_chroma_qp_offset_flag_one_and_zero_len_skips_idx_read() {
-        // Even when flag = 1, the idx is not signalled when
+        // Even when flag = 1, the idx is not signaled when
         // chroma_qp_offset_list_len_minus1 == 0 (TR cMax = 0 emits
         // zero bins). §7.4.9.10 then infers idx = 0. Engineer the
         // flag = 1 path with a (valMps = 1) MPS-only context.
@@ -7343,14 +7343,14 @@ mod tests {
     #[test]
     fn cand_mode_list_equal_angular_candidate_eqs_8_24_8_26() {
         // candB == candA and candA >= 2 ⇒ the candidate plus its two
-        // neighbouring angular modes (mod-32 wrap into 2..=33).
+        // neighboring angular modes (mod-32 wrap into 2..=33).
         // candA = 26: {26, 2 + (55 % 32) = 25, 2 + (25 % 32) = 27}.
         assert_eq!(intra_luma_cand_mode_list(26, 26), [26, 25, 27]);
         // candA = 2 (low angular edge): {2, 2 + (31 % 32) = 33,
-        // 2 + (1 % 32) = 3} — the −1 neighbour wraps to the top mode 33.
+        // 2 + (1 % 32) = 3} — the −1 neighbor wraps to the top mode 33.
         assert_eq!(intra_luma_cand_mode_list(2, 2), [2, 33, 3]);
         // candA = 34 (top angular edge): {34, 2 + (63 % 32) = 2 + 31 = 33,
-        // 2 + (33 % 32) = 2 + 1 = 3} — the +1 neighbour wraps to mode 3.
+        // 2 + (33 % 32) = 2 + 1 = 3} — the +1 neighbor wraps to mode 3.
         assert_eq!(intra_luma_cand_mode_list(34, 34), [34, 33, 3]);
     }
 
@@ -7467,7 +7467,7 @@ mod tests {
 
     #[test]
     fn intra_pred_mode_y_end_to_end_remaining() {
-        // End-to-end §8.4.2: distinct neighbour candidates A = 10, B = 2
+        // End-to-end §8.4.2: distinct neighbor candidates A = 10, B = 2
         // ⇒ candModeList {10, 2, 0} (slot 2 = PLANAR, neither slot is
         // PLANAR), Remaining with rem = 0:
         //   sorted {0, 2, 10}; 0>=0→1, 1>=2? no, 1>=10? no ⇒ 1.

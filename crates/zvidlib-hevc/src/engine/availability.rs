@@ -2,7 +2,7 @@
 //! scanning conversions they depend on.
 //!
 //! Intra (and, later, inter) sample prediction asks, for each candidate
-//! neighbour location `( xNbY, yNbY )`, whether that neighbour is
+//! neighbor location `( xNbY, yNbY )`, whether that neighbor is
 //! *available for prediction* — i.e. it lies inside the picture, has
 //! already been decoded in the current decoding order, and sits in the
 //! same slice segment and tile as the current block. ITU-T Rec. H.265
@@ -378,7 +378,7 @@ impl PictureTiling {
 
     /// §6.4.1 — derivation process for z-scan order block availability.
     ///
-    /// Returns whether the neighbouring block covering luma location
+    /// Returns whether the neighboring block covering luma location
     /// `( x_nb_y, y_nb_y )` is available for the current block whose
     /// top-left luma sample is `( x_curr, y_curr )`.
     ///
@@ -403,7 +403,7 @@ impl PictureTiling {
             y_curr >> self.min_tb_log2_size_y,
         );
 
-        // eq. 6-2 — out-of-picture neighbours get minBlockAddrN = −1.
+        // eq. 6-2 — out-of-picture neighbors get minBlockAddrN = −1.
         if x_nb_y < 0
             || y_nb_y < 0
             || x_nb_y as u32 >= self.pic_width_in_luma_samples
@@ -418,7 +418,7 @@ impl PictureTiling {
             y_nb_y >> self.min_tb_log2_size_y,
         );
 
-        // The neighbour must already be decoded (z-scan order test).
+        // The neighbor must already be decoded (z-scan order test).
         if min_block_addr_n > min_block_addr_curr {
             return false;
         }
@@ -432,7 +432,7 @@ impl PictureTiling {
             return false;
         }
 
-        // Tile boundary: the neighbour must be in the same tile.
+        // Tile boundary: the neighbor must be in the same tile.
         if self.tile_id_at_luma(x_nb_y, y_nb_y) != self.tile_id_at_luma(x_curr, y_curr) {
             return false;
         }
@@ -443,18 +443,18 @@ impl PictureTiling {
     /// §6.4.2 — derivation process for prediction block availability.
     ///
     /// Wraps [`Self::z_scan_availability`] with the `sameCb` short-cut
-    /// (a neighbour in the *same* coding block is unavailable when it
+    /// (a neighbor in the *same* coding block is unavailable when it
     /// would not yet have been decoded under the §7.4.9 partitioning
     /// order) and the final `MODE_INTRA` masking.
     ///
     /// * `( x_cb, y_cb )` / `n_cb_s` — the current coding block.
     /// * `( x_pb, y_pb )` / `n_pb_w` / `n_pb_h` / `part_idx` — the
     ///   current prediction block and its partition index.
-    /// * `( x_nb_y, y_nb_y )` — the neighbour location.
+    /// * `( x_nb_y, y_nb_y )` — the neighbor location.
     /// * `slice_addr_rs` — as in [`Self::z_scan_availability`].
     /// * `cu_pred_mode` — maps a luma location to its `CuPredMode`
     ///   (`MODE_INTRA` / `MODE_INTER` / `MODE_SKIP`). Only consulted for
-    ///   in-picture neighbours that are otherwise available.
+    ///   in-picture neighbors that are otherwise available.
     #[allow(clippy::too_many_arguments)]
     pub fn prediction_block_availability<S, M>(
         &self,
@@ -475,7 +475,7 @@ impl PictureTiling {
         S: Fn(u32) -> u32,
         M: Fn(u32, u32) -> u8,
     {
-        // sameCb: does the neighbour cover the current coding block?
+        // sameCb: does the neighbor cover the current coding block?
         let same_cb = x_nb_y >= 0
             && y_nb_y >= 0
             && x_cb <= x_nb_y as u32
@@ -498,7 +498,7 @@ impl PictureTiling {
             true
         };
 
-        // Final §6.4.2 step: intra neighbours are unavailable for the
+        // Final §6.4.2 step: intra neighbors are unavailable for the
         // (inter) prediction-block availability query.
         if available_n {
             let x = x_nb_y as u32;

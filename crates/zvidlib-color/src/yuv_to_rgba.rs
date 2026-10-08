@@ -2,7 +2,7 @@
 //! YUV-to-RGBA output conversion (issue #574).
 //!
 //! Every picture those three decoders return passes through
-//! `crate::av1_filters::convert_to_rgba8`, which applies the signalled colour
+//! `crate::av1_filters::convert_to_rgba8`, which applies the signaled color
 //! range and matrix coefficients to each pixel. Its definition is a
 //! floating-point one: normalize each sample, apply the matrix in `f64`, clamp
 //! to `0..=1`, scale by 255 and round half away from zero. That definition is
@@ -11,7 +11,7 @@
 //!
 //! # The kernel
 //!
-//! For each colour range and matrix the conversion is an affine map of the
+//! For each color range and matrix the conversion is an affine map of the
 //! three 8-bit samples, so each output component is
 //!
 //! ```text
@@ -158,7 +158,7 @@ const TIE_MARGIN: i32 = 1 << 9;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const OPAQUE: i32 = 0xFF00_0000_u32 as i32;
 
-/// One colour range and matrix, as both the `f64` reference and the Q20 table
+/// One color range and matrix, as both the `f64` reference and the Q20 table
 /// the kernels evaluate.
 #[derive(Clone, Copy, Debug)]
 pub struct Conversion {
@@ -261,7 +261,7 @@ impl Conversion {
     }
 }
 
-/// `(y_low, y_scale, uv_scale)` for a colour range.
+/// `(y_low, y_scale, uv_scale)` for a color range.
 fn range_scales(range: ColorRange) -> (f64, f64, f64) {
     match range {
         ColorRange::Limited => (16.0, 235.0 - 16.0, 224.0),

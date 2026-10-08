@@ -1,5 +1,5 @@
 //! Tests against data captured from the C reference (libvorbis 1.3.7, see
-//! tools/vorbis_encoder/make_fixtures.py) plus API behaviour tests. No external tools needed.
+//! tools/vorbis_encoder/make_fixtures.py) plus API behavior tests. No external tools needed.
 
 use super::test_fixtures::{BITRATES, ENCODES, HEADERS};
 use super::*;
@@ -223,7 +223,7 @@ fn every_supported_rate_and_quality_initializes() {
 }
 
 /// Absurd amplitudes, infinities and NaNs must not panic (C has undefined
-/// behaviour there; the port uses wrapping integer arithmetic and saturating
+/// behavior there; the port uses wrapping integer arithmetic and saturating
 /// float->int conversions instead). Run in debug builds too (overflow checks).
 #[test]
 fn pathological_input_does_not_panic() {

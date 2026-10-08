@@ -172,7 +172,7 @@ fn tool_available(name: &str) -> bool {
 }
 
 #[test]
-fn the_factory_honours_hardware_preference_and_reports_the_implementation() {
+fn the_factory_honors_hardware_preference_and_reports_the_implementation() {
     let _serial = serial();
     let factory = native_hevc_video_encoder_factory();
     let limits = Limits::default();

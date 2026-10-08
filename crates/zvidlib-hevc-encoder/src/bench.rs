@@ -398,7 +398,7 @@ pub fn plan_reconstruct(
 ///
 /// This is the stage that reaches the decoder's already-vectorized §8.7.2
 /// deblocking and §8.7.3 SAO kernels from the encode side: `deblocking` and
-/// `sao` select the loop-filter shape of the access unit being modelled, and
+/// `sao` select the loop-filter shape of the access unit being modeled, and
 /// with both set the reconstruction runs the same filters a decoder would.
 /// The returned planes are the stage's own output, so the bit-exactness guard
 /// covers every filtered sample.

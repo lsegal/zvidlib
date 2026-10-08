@@ -18,7 +18,7 @@
 //! `general_profile_space` / `general_tier_flag` / `general_profile_idc`
 //! / `general_level_idc` fields and the per-sub-layer
 //! `sub_layer_profile_present_flag` / `sub_layer_level_present_flag`
-//! gates are materialised. The remaining (mostly-reserved-zero or
+//! gates are materialized. The remaining (mostly-reserved-zero or
 //! constraint-flag) fields are skipped, but the bit-walk advances the
 //! reader correctly so subsequent VPS fields land on the right bit
 //! boundary.
@@ -74,7 +74,7 @@ use crate::sps::OpaqueTail;
 pub const HEVC_MAX_SUB_LAYERS: usize = 7;
 
 /// Maximum number of layer IDs the VPS layer-set inclusion matrix may
-/// span. `vps_max_layer_id` is u(6), so the maximum signalled value is
+/// span. `vps_max_layer_id` is u(6), so the maximum signaled value is
 /// 63; the inclusion matrix column count is `vps_max_layer_id + 1`,
 /// which is bounded at 64.
 pub const HEVC_VPS_MAX_NUM_LAYERS: usize = 64;
@@ -157,7 +157,7 @@ impl From<HrdError> for VpsError {
 /// Parsed profile-tier-level structure (§7.3.3).
 ///
 /// Only the leading "general" fields and the per-sub-layer
-/// present-flag gates are materialised at round-2 scope. The
+/// present-flag gates are materialized at round-2 scope. The
 /// constraint flags / reserved-zero blocks are walked over to keep
 /// bit alignment but their values are intentionally discarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,9 +175,9 @@ pub struct ProfileTierLevel {
     /// 120 == level 4.0.
     pub general_level_idc: u8,
     /// For each present sub-layer, whether its profile entry was
-    /// signalled (`sub_layer_profile_present_flag[i]`).
+    /// signaled (`sub_layer_profile_present_flag[i]`).
     pub sub_layer_profile_present: [bool; HEVC_MAX_SUB_LAYERS],
-    /// For each present sub-layer, whether its level_idc was signalled
+    /// For each present sub-layer, whether its level_idc was signaled
     /// (`sub_layer_level_present_flag[i]`).
     pub sub_layer_level_present: [bool; HEVC_MAX_SUB_LAYERS],
     /// Per-sub-layer `sub_layer_level_idc[i]`; only valid for indices
@@ -240,7 +240,7 @@ impl ProfileTierLevel {
         // §7.3.3: if maxNumSubLayersMinus1 > 0, then for i in
         // max..8: reserved_zero_2bits — exactly 2 bits each — to keep
         // the per-sub-layer body byte-aligned regardless of how many
-        // sublayers were actually signalled.
+        // sublayers were actually signaled.
         if max_num_sub_layers_minus1 > 0 {
             for _ in max..8 {
                 br.skip(2)?;
@@ -315,7 +315,7 @@ pub struct VpsTimingInfo {
 /// Parsed Video Parameter Set per §7.3.2.1.
 ///
 /// The structural prefix (through the per-sub-layer ordering loop) is
-/// fully materialised; the layer-set inclusion matrix and the
+/// fully materialized; the layer-set inclusion matrix and the
 /// optional VPS timing-info block follow. When
 /// `vps_timing_info_present_flag == 1` and `vps_num_hrd_parameters >
 /// 0`, the per-HRD `hrd_parameters()` payloads are decoded into
@@ -342,18 +342,18 @@ pub struct HevcVps {
     /// Parsed `profile_tier_level()` subroutine.
     pub ptl: ProfileTierLevel,
     /// `vps_sub_layer_ordering_info_present_flag`. When 0, only entry
-    /// `[max_sub_layers_minus1]` is signalled and the others inherit
+    /// `[max_sub_layers_minus1]` is signaled and the others inherit
     /// its value.
     pub sub_layer_ordering_info_present_flag: bool,
     /// Per-sub-layer DPB / reorder / latency triples. Indices outside
-    /// `0..=max_sub_layers_minus1` are zero-initialised.
+    /// `0..=max_sub_layers_minus1` are zero-initialized.
     pub sub_layer_ordering_info: [SubLayerOrderingInfo; HEVC_MAX_SUB_LAYERS],
     /// `vps_max_layer_id` (`u(6)`, range 0..=62). The inclusion-matrix
     /// column count is `value + 1`.
     pub max_layer_id: u8,
     /// `vps_num_layer_sets_minus1` (`ue(v)`, range 0..=1023). The
-    /// number of layer sets signalled by the inclusion matrix is
-    /// `value + 1`; layer set 0 is implicit and not signalled in the
+    /// number of layer sets signaled by the inclusion matrix is
+    /// `value + 1`; layer set 0 is implicit and not signaled in the
     /// matrix.
     pub num_layer_sets_minus1: u16,
     /// `layer_id_included_flag[i][j]` matrix. The outer index is
@@ -464,13 +464,13 @@ impl HevcVps {
         let num_layer_sets_minus1 = num_layer_sets_minus1_raw as u16;
 
         // Layer-set inclusion matrix. The for-loop in the spec starts
-        // at i = 1 (layer set 0 is the base set, not signalled), so the
-        // signalled-row count is `num_layer_sets_minus1`. Each row has
+        // at i = 1 (layer set 0 is the base set, not signaled), so the
+        // signaled-row count is `num_layer_sets_minus1`. Each row has
         // `max_layer_id + 1` u(1) flags.
         let row_width = max_layer_id as usize + 1;
-        let signalled_rows = num_layer_sets_minus1 as usize;
-        let mut layer_id_included_flag = Vec::with_capacity(signalled_rows);
-        for _ in 0..signalled_rows {
+        let signaled_rows = num_layer_sets_minus1 as usize;
+        let mut layer_id_included_flag = Vec::with_capacity(signaled_rows);
+        for _ in 0..signaled_rows {
             let mut row = Vec::with_capacity(row_width);
             for _ in 0..row_width {
                 row.push(br.u1()? != 0);
@@ -803,7 +803,7 @@ mod tests {
     fn parses_ordering_info_present_flag_zero_propagates() {
         // max_sub_layers_minus1 = 1, but
         // sub_layer_ordering_info_present_flag = 0 → only the [1]
-        // entry is signalled; the [0] entry inherits it per §7.4.3.1.
+        // entry is signaled; the [0] entry inherits it per §7.4.3.1.
         let mut bits = Vec::<u8>::new();
         let mut push = |s: &str| {
             for c in s.chars() {
@@ -853,7 +853,7 @@ mod tests {
         }
         let vps = HevcVps::parse(&bytes).expect("VPS parse");
         assert!(!vps.sub_layer_ordering_info_present_flag);
-        // [1] was signalled; [0] inherits.
+        // [1] was signaled; [0] inherits.
         assert_eq!(
             vps.sub_layer_ordering_info[1].max_dec_pic_buffering_minus1,
             2
@@ -903,7 +903,7 @@ mod tests {
         push("1"); // ue=0 (max_latency_increase_plus1[0])
         // Tail:
         push("000001"); // vps_max_layer_id = 1 (so row width 2)
-        push("010"); // vps_num_layer_sets_minus1 ue=1 (one signalled row)
+        push("010"); // vps_num_layer_sets_minus1 ue=1 (one signaled row)
         // layer_id_included_flag[1][0..=1]: pick 1, 0
         push("10");
         push("1"); // vps_timing_info_present_flag = 1
@@ -998,7 +998,7 @@ mod tests {
         push("010"); // num_hrd_parameters ue=1
         // HRD entry i=0:
         push("1"); // hrd_layer_set_idx ue=0
-        // cprms_present_flag not signalled (i == 0); inferred 1
+        // cprms_present_flag not signaled (i == 0); inferred 1
         // hrd_parameters( 1, 0 ):
         push("0"); // nal_hrd_parameters_present_flag
         push("0"); // vcl_hrd_parameters_present_flag
@@ -1006,7 +1006,7 @@ mod tests {
         // sub-layer i=0:
         push("1"); // fixed_pic_rate_general_flag = 1 → within_cvs inferred 1
         push("1"); // elemental_duration_in_tc_minus1 ue=0
-        // low_delay not signalled, inferred 0
+        // low_delay not signaled, inferred 0
         push("1"); // cpb_cnt_minus1 ue=0
         // no NAL/VCL HRD bodies (gates = 0)
         push("0"); // vps_extension_flag = 0

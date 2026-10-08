@@ -442,7 +442,7 @@ pub(crate) struct IntraModeDecision {
     pub mode: u8,
     /// The winning mode's SATD against the source block.
     pub satd: u32,
-    /// `satd + lambda * signalling bits`, the value that selected it.
+    /// `satd + lambda * signaling bits`, the value that selected it.
     pub rd_cost: u64,
 }
 
@@ -455,7 +455,7 @@ pub(crate) struct IntraModeDecision {
 /// makes the decision consistent with the reconstruction the writer returns.
 ///
 /// Distortion is the prediction's SATD, which needs no transform per mode, and
-/// the rate term is the §7.3.8.5 luma mode signalling: a most-probable mode
+/// the rate term is the §7.3.8.5 luma mode signaling: a most-probable mode
 /// costs `prev_intra_luma_pred_flag` plus its `mpm_idx` bins, and any other
 /// mode costs the flag plus the five `rem_intra_luma_pred_mode` bins.
 /// `candidates` is the §8.4.2 `candModeList`. Ties go to the lower mode index,
@@ -521,14 +521,14 @@ impl ResidualBinSink for BinCounter {
 /// the number of CABAC bins §7.3.8.11 `residual_coding( )` emits for `levels`,
 /// counted by running the real writer's walk against a sink that only tallies.
 ///
-/// Counting bins rather than modelling each one's arithmetic-coded length
-/// charges a context-coded bin a full bit, which overstates the well-modelled
+/// Counting bins rather than modeling each one's arithmetic-coded length
+/// charges a context-coded bin a full bit, which overstates the well-modeled
 /// ones — a `sig_coeff_flag` in a context that has settled costs a fraction of
 /// a bit. What it preserves is the ordering: every bin the writer emits is
 /// counted exactly once, in the same walk, so two candidate residuals for the
 /// same block size and component are compared on the same scale. That is the
 /// property a mode decision needs, and it is what the levels themselves cost,
-/// as opposed to the mode signalling [`intra_mode_bit_cost`] covers.
+/// as opposed to the mode signaling [`intra_mode_bit_cost`] covers.
 ///
 /// A block whose levels are all zero codes no `residual_coding( )` at all —
 /// the decoder infers it from `cbf == 0` — so its residual rate is zero. The
@@ -548,7 +548,7 @@ pub(crate) fn residual_rate_bits(levels: &[i32], params: &ResidualWriteParams) -
     counter.bins
 }
 
-/// §7.3.8.5 bin count for signalling one luma intra mode: the
+/// §7.3.8.5 bin count for signaling one luma intra mode: the
 /// `prev_intra_luma_pred_flag` bin plus either the TR (`cMax` 2) `mpm_idx`
 /// bins or the five FL `rem_intra_luma_pred_mode` bins.
 pub(crate) fn intra_mode_bit_cost(mode: u8, candidates: [u8; 3]) -> u32 {

@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn roundtrip_extremes() {
-        // Checkerboard ±255 maximises Walsh–Hadamard coefficient magnitude; verifies no overflow
+        // Checkerboard ±255 maximizes Walsh–Hadamard coefficient magnitude; verifies no overflow
         // and no decoder-side dequant clamp (Quant * 4 must stay within [-32768, 32767]).
         let mut r = [0i32; 16];
         for (idx, v) in r.iter_mut().enumerate() {

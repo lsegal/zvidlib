@@ -401,7 +401,7 @@ fn motion_bs_is_one(
 ///   position is *also* a transform-block edge (the §8.7.2.4 second
 ///   bullet `cbf` test only fires on transform-block edges).
 ///
-/// The bS at every sampled `(xDi, yDj)` is 2 when either neighbouring
+/// The bS at every sampled `(xDi, yDj)` is 2 when either neighboring
 /// sample is intra; 1 when the edge is a transform-block edge and either
 /// transform block holds a non-zero coefficient; 1 on the §8.7.2.4
 /// motion criteria; otherwise 0. Positions not sampled by §8.7.2.4 are 0.
@@ -1113,7 +1113,7 @@ pub fn filter_chroma_block_edge_gated(
 /// `qp_y` is the CU's `QpY`; the `*_offset_div2` are the per-slice
 /// `slice_beta_offset_div2` / `slice_tc_offset_div2`; the `pps_c*_qp_offset`
 /// are the picture chroma QP offsets; the bit depths are `BitDepthY` /
-/// `BitDepthC`. The driver reads neighbour `QpY` from `qp_y_at` so a
+/// `BitDepthC`. The driver reads neighbor `QpY` from `qp_y_at` so a
 /// boundary edge can use the p-side CU's `QpY` for `qP,p` (eq. 8-347).
 #[derive(Debug, Clone, Copy)]
 pub struct DeblockCuParams {
@@ -1149,11 +1149,11 @@ pub struct DeblockCu {
     pub log2_cb_size: u32,
     /// The CU QP / offset / chroma context.
     pub params: DeblockCuParams,
-    /// The left-neighbour CU's `QpY` at the vertical coding-block
+    /// The left-neighbor CU's `QpY` at the vertical coding-block
     /// boundary edge (xDk == 0); interior edges use `params.qp_y` on
     /// both sides.
     pub qp_y_p_left: i32,
-    /// The above-neighbour CU's `QpY` at the horizontal coding-block
+    /// The above-neighbor CU's `QpY` at the horizontal coding-block
     /// boundary edge (yDm == 0).
     pub qp_y_p_top: i32,
 }
@@ -1229,7 +1229,7 @@ pub fn filter_cu_edges_full(
             if s == 0 {
                 continue;
             }
-            // p-side QpY: the neighbour CU only at the coding-block
+            // p-side QpY: the neighbor CU only at the coding-block
             // boundary edge; interior edges share the CU's QpY.
             let (boundary, qp_y_p) = match edge_type {
                 EdgeType::Vertical => (x_dk == 0, qp_y_p_left),
@@ -1581,7 +1581,7 @@ mod tests {
     /// The §8.7.2.4 vertical-edge x stride is 8, so a 16-wide CU samples
     /// xDi ∈ {0, 8}; the internal edge is at xDi=8.
     #[test]
-    fn intra_neighbour_gives_bs2() {
+    fn intra_neighbor_gives_bs2() {
         let mut field = MotionField::new(32, 32);
         // CU at (0,0), 16×16. q-side (right half) inter; p-side (left)
         // stays intra (background).
@@ -1953,7 +1953,7 @@ mod tests {
         assert_eq!(tc_prime(17), 0);
         assert_eq!(tc_prime(18), 1);
         assert_eq!(tc_prime(53), 24);
-        // Clip behaviour at the table edges.
+        // Clip behavior at the table edges.
         assert_eq!(beta_prime(-3), 0);
         assert_eq!(tc_prime(99), 24);
     }
@@ -2013,7 +2013,7 @@ mod tests {
     /// p0=98,q0=102,p1=q1=100 ⇒ δ=(9·4−3·0+8)>>4=2; |δ|<10·tC; clamp to
     /// [−tC,tC]=2 ⇒ p0'=100, q0'=100; nDp=nDq=1.
     #[test]
-    fn weak_filter_centres_small_step() {
+    fn weak_filter_centers_small_step() {
         let out = filter_luma_sample([98, 100, 100, 100], [102, 100, 100, 100], 1, 0, 0, 5, 8);
         assert_eq!(out.ndp, 1);
         assert_eq!(out.ndq, 1);
@@ -2100,7 +2100,7 @@ mod tests {
         assert_eq!(q0, 100);
     }
 
-    /// §8.7.2.5.8 chroma sample filter centres a small step and clips δ.
+    /// §8.7.2.5.8 chroma sample filter centers a small step and clips δ.
     /// p0=98,q0=102,p1=q1=100 ⇒ δ=((4·4)+0+4)>>3 = 20>>3 = 2 ⇒ clamp 2 ⇒
     /// p0'=100, q0'=100.
     #[test]

@@ -70,7 +70,7 @@ pub fn read_render_size(reader: &mut BitReader) -> Result<()> {
     Ok(())
 }
 
-/// The colour range a chunk's first frame signals: `Some(full_range)` when
+/// The color range a chunk's first frame signals: `Some(full_range)` when
 /// that frame is a profile 0 key frame, or an intra-only frame (which profile
 /// 0 makes studio range), and `None` for any other frame or for data that
 /// does not parse. A track's first sample is a key frame, so this is the

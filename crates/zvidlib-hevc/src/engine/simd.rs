@@ -1766,7 +1766,7 @@ pub(crate) mod in_loop {
     ///
     /// Kept as an in-crate shorthand for the public
     /// [`crate::simd::set_override`]`(Some(SimdIsa::Scalar))`, which the
-    /// dispatcher honours as well; it is no longer `#[cfg(test)]`-gated
+    /// dispatcher honors as well; it is no longer `#[cfg(test)]`-gated
     /// because the in-loop filter kernels have to be switchable from an
     /// external `benches/` target too.
     pub(crate) static FORCE_SCALAR: core::sync::atomic::AtomicBool =
@@ -2299,7 +2299,7 @@ pub(crate) mod in_loop {
     /// Scalar reference for one row run of SAO edge offset.
     ///
     /// `cur` is the pre-SAO run; `n0` / `n1` are the matching runs of the two
-    /// Table 8-13 neighbours (already offset by `hPos` / `vPos`), which the
+    /// Table 8-13 neighbors (already offset by `hPos` / `vPos`), which the
     /// caller has guaranteed to lie inside the picture.
     #[inline]
     fn sao_edge_row_scalar(
@@ -2425,7 +2425,7 @@ pub(crate) mod in_loop {
     }
 
     /// Apply SAO edge offset to one contiguous run of a plane row whose two
-    /// Table 8-13 neighbour runs (`n0` / `n1`) are entirely inside the
+    /// Table 8-13 neighbor runs (`n0` / `n1`) are entirely inside the
     /// picture and unmasked by slice / tile / PCM guards.
     pub(crate) fn sao_edge_row(
         cur: &[i32],
@@ -2900,7 +2900,7 @@ pub(crate) mod in_loop {
                 let max = (1i32 << bit_depth) - 1;
                 let off = offsets(&mut rng, 7 << (bit_depth - 8));
                 for len in 0..40usize {
-                    // Neighbours drawn from a tiny alphabet so all nine
+                    // Neighbors drawn from a tiny alphabet so all nine
                     // (sign, sign) combinations of equation 8-411 appear.
                     let src: Vec<i32> = (0..len).map(|_| (rng.next() % 3) as i32 + 1).collect();
                     let n0: Vec<i32> = (0..len).map(|_| (rng.next() % 3) as i32 + 1).collect();
@@ -3013,7 +3013,7 @@ pub(crate) mod in_loop {
         }
 
         /// A `SaoBoundaries` whose CTBs all share one slice and one tile, so
-        /// `neighbour_allowed` is always true. Passing it keeps
+        /// `neighbor_allowed` is always true. Passing it keeps
         /// `apply_sao_ctb_full` on its normative scalar loop with exactly the
         /// semantics of the `None` (vectorized) path.
         fn permissive_boundaries(pic: &Picture, ctb_log2: u32) -> SaoBoundaries {

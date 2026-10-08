@@ -278,7 +278,7 @@ pub struct DecodedVideoFrame {
 /// A cheap cloneable cancellation signal shared with a running codec operation.
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    canceled: Arc<AtomicBool>,
 }
 
 impl CancellationToken {
@@ -287,20 +287,17 @@ impl CancellationToken {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.canceled.store(true, Ordering::Release);
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+    pub fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
     }
 
     #[doc(hidden)]
     pub fn check(&self) -> Result<()> {
-        if self.is_cancelled() {
-            Err(Error::new(
-                ErrorKind::Cancelled,
-                "codec operation cancelled",
-            ))
+        if self.is_canceled() {
+            Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
         } else {
             Ok(())
         }
@@ -739,7 +736,7 @@ impl ExactFrameReader {
                 break;
             }
             // Nothing looks at a picture decoded on the way to the target, and skipping the
-            // colour conversion it would otherwise pay is most of what a long walk costs. Two
+            // color conversion it would otherwise pay is most of what a long walk costs. Two
             // kinds of frame are kept anyway, both because the request after this one is very
             // likely to be for them.
             //
@@ -891,7 +888,7 @@ impl ExactFrameReader {
             // whether a re-request can continue the open session or has to reset, and a decoder
             // that hands the frame back anyway makes that answer conservative rather than wrong.
             // Refusing it rejected the whole stream as `MalformedMedia` over a backend's
-            // behaviour, and rejected it for a picture the reader was about to cache and could
+            // behavior, and rejected it for a picture the reader was about to cache and could
             // have answered the very request from. The `WebCodecs` backend already re-caches
             // such a frame, so this is also what makes the two backends agree.
             self.published_since_reset.insert(output.presentation_index);
@@ -2081,11 +2078,11 @@ mod tests {
                 .kind(),
             ErrorKind::MalformedMedia
         );
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
+        let canceled = CancellationToken::new();
+        canceled.cancel();
         assert_eq!(
-            reader.get(FrameIndex(0), &cancelled).unwrap_err().kind(),
-            ErrorKind::Cancelled
+            reader.get(FrameIndex(0), &canceled).unwrap_err().kind(),
+            ErrorKind::Canceled
         );
     }
 

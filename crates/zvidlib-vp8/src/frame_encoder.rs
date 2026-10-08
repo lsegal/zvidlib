@@ -177,13 +177,13 @@ impl FrameEncoder {
         for mb_y in 0..self.mb_rows {
             for mb_x in 0..self.mb_cols {
                 let index = (mb_y + 1) * info_stride + mb_x + 1;
-                let neighbours = [
+                let neighbors = [
                     &info[index - info_stride],
                     &info[index - 1],
                     &info[index - info_stride - 1],
                 ];
                 let (macroblock, mut dequantized) = self.encode_macroblock(
-                    source, &mut frame, &context, &quantizer, neighbours, mb_x, mb_y,
+                    source, &mut frame, &context, &quantizer, neighbors, mb_x, mb_y,
                 );
                 reconstruct(
                     &self.references,
@@ -256,7 +256,7 @@ impl FrameEncoder {
         frame: &mut Frame,
         context: &FrameContext,
         quantizer: &Quantizer,
-        neighbours: [&MacroblockInfo; 3],
+        neighbors: [&MacroblockInfo; 3],
         mb_x: usize,
         mb_y: usize,
     ) -> (CodedMacroblock, Coefficients) {
@@ -271,7 +271,7 @@ impl FrameEncoder {
         // The best inter candidate, when this is an inter frame.
         let mut inter = None;
         if !context.key_frame {
-            let near = find_near_mvs(neighbours, LAST_FRAME, &context.sign_bias);
+            let near = find_near_mvs(neighbors, LAST_FRAME, &context.sign_bias);
             let bounds = MvBounds::new(mb_x, mb_y, self.mb_cols, self.mb_rows);
             macroblock.near_counts = near.counts;
             macroblock.best_mv = bounds.clamp(near.mvs[0]);
@@ -316,7 +316,7 @@ impl FrameEncoder {
                 quantizer,
                 context
                     .key_frame
-                    .then(|| (neighbours[0].b_modes, neighbours[1].b_modes)),
+                    .then(|| (neighbors[0].b_modes, neighbors[1].b_modes)),
                 mb_x,
                 mb_y,
                 &mut macroblock.levels,
@@ -558,7 +558,7 @@ impl FrameEncoder {
 
         let mut header = BoolEncoder::new();
         if key_frame {
-            // Colour space and clamping type.
+            // Color space and clamping type.
             header.write_literal(0, 2);
         }
         header.write_flag(false); // segmentation
@@ -1060,13 +1060,13 @@ fn motion_search(
             mv,
         )
     };
-    let mut centre = MotionVector::ZERO;
-    let mut centre_cost = full_cost(centre);
+    let mut center = MotionVector::ZERO;
+    let mut center_cost = full_cost(center);
     for start in starts.map(whole) {
         if valid(start) {
             let start_cost = full_cost(start);
-            if start_cost < centre_cost {
-                (centre, centre_cost) = (start, start_cost);
+            if start_cost < center_cost {
+                (center, center_cost) = (start, start_cost);
             }
         }
     }
@@ -1075,15 +1075,15 @@ fn motion_search(
             let mut moved = false;
             for (dx, dy) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
                 let candidate = MotionVector {
-                    x: centre.x + dx,
-                    y: centre.y + dy,
+                    x: center.x + dx,
+                    y: center.y + dy,
                 };
                 if !valid(candidate) {
                     continue;
                 }
                 let candidate_cost = full_cost(candidate);
-                if candidate_cost < centre_cost {
-                    (centre, centre_cost) = (candidate, candidate_cost);
+                if candidate_cost < center_cost {
+                    (center, center_cost) = (candidate, candidate_cost);
                     moved = true;
                 }
             }
@@ -1109,9 +1109,9 @@ fn motion_search(
         );
         cost(sad16(source, scratch, origin), mv)
     };
-    let mut centre_cost = sub_cost(centre, scratch);
+    let mut center_cost = sub_cost(center, scratch);
     for step in [4i16, 2] {
-        let start = centre;
+        let start = center;
         for dy in [-step, 0, step] {
             for dx in [-step, 0, step] {
                 if dx == 0 && dy == 0 {
@@ -1125,13 +1125,13 @@ fn motion_search(
                     continue;
                 }
                 let candidate_cost = sub_cost(candidate, scratch);
-                if candidate_cost < centre_cost {
-                    (centre, centre_cost) = (candidate, candidate_cost);
+                if candidate_cost < center_cost {
+                    (center, center_cost) = (candidate, candidate_cost);
                 }
             }
         }
     }
-    centre
+    center
 }
 
 /// The sum of absolute differences between the source macroblock at

@@ -3,11 +3,11 @@
 //!
 //! This wraps the crate's AV1 Main-profile decoder (`crate::av1_dec`), which
 //! implements the complete decoding process of the AV1 specification for
-//! 8-bit 4:2:0 colour and monochrome streams: every intra and inter
+//! 8-bit 4:2:0 color and monochrome streams: every intra and inter
 //! prediction tool, CDF adaptation, tiles, and the deblocking, CDEF,
 //! super-resolution, loop restoration and film grain stages.
 //!
-//! Decoded pictures are converted to `Rgba8` with [`convert_to_rgba8`]. Colour
+//! Decoded pictures are converted to `Rgba8` with [`convert_to_rgba8`]. Color
 //! pictures use the matrix their sequence header signals (BT.601 when it is
 //! unspecified or one the conversion does not implement); monochrome pictures
 //! carry neutral chroma, for which the matrix choice is a no-op on the
@@ -172,7 +172,7 @@ impl VideoDecoder for Av1Decoder {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("AV1 temporal unit exceeds the allocation limit"));
         }
@@ -195,7 +195,7 @@ impl VideoDecoder for Av1Decoder {
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         // Every temporal unit this decoder accepts makes its frame visible
         // immediately (`show_frame` or `show_existing_frame`); there is no
         // delayed/reordered output to release on drain.
@@ -277,12 +277,9 @@ fn picture_to_rgba(
     )
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
-        ))
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
+        Err(Error::new(ErrorKind::Canceled, "codec operation canceled"))
     } else {
         Ok(())
     }
@@ -364,7 +361,7 @@ mod tests {
             CodecSupport::InvalidConfiguration { .. }
         ));
 
-        // Colour 4:2:0 av1C: monochrome bit cleared, both subsampling bits set.
+        // Color 4:2:0 av1C: monochrome bit cleared, both subsampling bits set.
         candidate = config();
         candidate.configuration = av1c(&[0x81, 0x00, 0x0C, 0x00]);
         assert!(factory.capability(&candidate).is_supported());

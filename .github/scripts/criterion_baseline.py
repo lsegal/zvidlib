@@ -112,8 +112,8 @@ def collect(args: argparse.Namespace) -> int:
 def _benchmark_id_relative(directory: pathlib.Path, root: pathlib.Path) -> str:
     """The criterion id for a `.../new/` directory.
 
-    `benchmark.json` carries the unsanitised `full_id` (`av1_deblock/scalar`),
-    which is what a reader recognises; criterion sanitises the directory names
+    `benchmark.json` carries the unsanitized `full_id` (`av1_deblock/scalar`),
+    which is what a reader recognizes; criterion sanitizes the directory names
     themselves. Falling back to the path keeps a benchmark in the report if that
     file is ever missing rather than dropping it silently.
     """
@@ -285,7 +285,7 @@ def table(args: argparse.Namespace) -> int:
     # Scalar is the reference every other column is a ratio against, so it leads.
     # The rest are ordered narrowest-first where the width is known, so the
     # columns read as a progression, and alphabetically after that so an
-    # unrecognised instruction set still lands somewhere stable instead of
+    # unrecognized instruction set still lands somewhere stable instead of
     # moving between runs.
     width_order = ["sse4.1", "avx2", "avx512", "neon"]
 
@@ -796,7 +796,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
 
-    collector = subcommands.add_parser("collect", help="summarise a criterion run")
+    collector = subcommands.add_parser("collect", help="summarize a criterion run")
     collector.add_argument("--criterion-dir", default="target/criterion")
     collector.add_argument("--out", required=True)
     collector.add_argument("--commit", default=os.environ.get("GITHUB_SHA", ""))
