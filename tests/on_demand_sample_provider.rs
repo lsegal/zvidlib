@@ -1,4 +1,4 @@
-//! `ExactFrameReader` built from an on-demand [`Mp4SampleProvider`] decodes
+//! `ExactFrameReader` built from an on-demand [`TrackSampleProvider`] decodes
 //! the same frames, through the real native HEVC and VP9 decoders, that it
 //! does from an eagerly read `Vec<EncodedVideoSample>`, from an MP4 (issue
 //! #669) and a WebM (issue #685) alike.
@@ -11,14 +11,14 @@ use common::{WEBM_FRAMES, block_on, vp9_opus_webm};
 use zvidlib::io::{CachingByteSource, MemorySource};
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, ExactFrameReader, FrameIndex,
-    HardwarePreference, Limits, Mp4SampleProvider, Mp4Track, PixelFormat, TrackKind,
+    HardwarePreference, Limits, PixelFormat, Track, TrackKind, TrackSampleProvider,
     VideoDecoderConfig, VideoDecoderFactory, native_hevc_video_decoder_factory,
     native_vp9_video_decoder_factory,
 };
 
 /// The first video track of `bytes`, opened through the container-agnostic
 /// entry point on-demand playback uses.
-fn video_track(bytes: &[u8]) -> Mp4Track {
+fn video_track(bytes: &[u8]) -> Track {
     let source = MemorySource::new(bytes.to_vec());
     block_on(zvidlib::container::open_media(&source, &Limits::default()))
         .unwrap()
@@ -27,7 +27,7 @@ fn video_track(bytes: &[u8]) -> Mp4Track {
         .clone()
 }
 
-fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
+fn bundled_track_and_bytes() -> (Track, Vec<u8>) {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/media/BigBuckBunny.mp4"
@@ -36,7 +36,7 @@ fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
     (video_track(&bytes), bytes)
 }
 
-fn configuration(track: &Mp4Track, profile: CodecProfile) -> VideoDecoderConfig {
+fn configuration(track: &Track, profile: CodecProfile) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: track.codec,
         profile,
@@ -100,7 +100,7 @@ fn on_demand_reader_matches_the_eager_reader_over_a_webm() {
 /// built over an on-demand provider whose compressed bytes stay within a
 /// tenth of the track's, and requires the two to agree exactly.
 fn assert_on_demand_matches_eager(
-    track: Mp4Track,
+    track: Track,
     bytes: Vec<u8>,
     factory: &dyn VideoDecoderFactory,
     profile: CodecProfile,
@@ -129,7 +129,7 @@ fn assert_on_demand_matches_eager(
     assert!(budget > 0, "the sample is too small for this test");
     let source = MemorySource::new(bytes);
     let cache = CachingByteSource::new(source, 64 * 1024, budget).unwrap();
-    let provider = Mp4SampleProvider::new(track, cache).unwrap();
+    let provider = TrackSampleProvider::new(track, cache).unwrap();
     let mut on_demand_reader = ExactFrameReader::from_provider(
         factory,
         configuration_template,

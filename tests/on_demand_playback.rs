@@ -21,9 +21,9 @@ use zvidlib::{
     AudioBuffer, AudioDecoder, AudioOutputBackend, AudioPacketProvider, AudioSampleReader,
     AudioTrackTiming, CancellationToken, Codec, CodecProfile, ColorRange, EncodedAudioSample,
     ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, IndexedPresentationTimeline,
-    Limits, Mp4SampleLoader, Mp4SampleProvider, Mp4Track, NativeAudioOutput, OnDemandAudioSource,
-    OnDemandVideoSource, PixelFormat, PlaybackController, PlaybackOptions, Result, TrackKind,
-    VideoDecoderConfig, VideoDecoderFactory, VideoFrame, WebAudioOutput,
+    Limits, NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PixelFormat,
+    PlaybackController, PlaybackOptions, Result, Track, TrackKind, TrackSampleLoader,
+    TrackSampleProvider, VideoDecoderConfig, VideoDecoderFactory, VideoFrame, WebAudioOutput,
     native_hevc_video_decoder_factory, native_vp9_video_decoder_factory,
 };
 
@@ -134,8 +134,8 @@ impl AudioOutputBackend for Backend {
 /// An input's bytes and tracks, with what decoding its video takes.
 struct Bundled {
     bytes: Vec<u8>,
-    video: Mp4Track,
-    audio: Mp4Track,
+    video: Track,
+    audio: Track,
     /// The audio track's timing on the decoded sample clock, as its
     /// container gives it.
     timing: AudioTrackTiming,
@@ -218,7 +218,7 @@ impl Bundled {
     /// track's index alone.
     fn audio_packets<S: ByteSource + 'static>(
         &self,
-        loader: &Mp4SampleLoader<S>,
+        loader: &TrackSampleLoader<S>,
     ) -> Box<dyn AudioPacketProvider> {
         Box::new(match self.audio.codec {
             Codec::Aac => loader.aac_packet_provider().unwrap(),
@@ -274,7 +274,7 @@ impl Bundled {
     }
 
     fn timeline(&self) -> IndexedPresentationTimeline {
-        IndexedPresentationTimeline::from_mp4_track(
+        IndexedPresentationTimeline::from_track(
             &self.video,
             self.audio.audio_sample_rate().unwrap(),
             &Limits::default(),
@@ -338,7 +338,7 @@ fn plays_and_seeks_through_a_synchronous_on_demand_video_provider(bundled: &Bund
     let video = ExactFrameReader::from_provider(
         bundled.decoder.as_ref(),
         bundled.video_configuration(),
-        Box::new(Mp4SampleProvider::new(bundled.video.clone(), cache).unwrap()),
+        Box::new(TrackSampleProvider::new(bundled.video.clone(), cache).unwrap()),
         video_limits(),
     )
     .unwrap();
@@ -435,7 +435,7 @@ fn first_samples_bytes(bundled: &Bundled, count: usize) -> u64 {
 
 fn plays_and_seeks_through_on_demand_sources_over_a_suspending_source(bundled: &Bundled) {
     let video_budget = first_samples_bytes(bundled, 24);
-    let video_loader = Mp4SampleLoader::new(
+    let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         video_budget,
@@ -450,7 +450,7 @@ fn plays_and_seeks_through_on_demand_sources_over_a_suspending_source(bundled: &
     .unwrap();
     let video = OnDemandVideoSource::new(video_reader, video_loader, 16);
 
-    let audio_loader = Mp4SampleLoader::new(
+    let audio_loader = TrackSampleLoader::new(
         bundled.audio.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         256 * 1024,
@@ -536,7 +536,7 @@ fn prefetching_ahead_keeps_webm_playback_from_reporting_missing_samples() {
 }
 
 fn prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(bundled: &Bundled) {
-    let video_loader = Mp4SampleLoader::new(
+    let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         8 * 1024 * 1024,
@@ -549,7 +549,7 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(bundled: &
         video_limits(),
     )
     .unwrap();
-    let audio_loader = Mp4SampleLoader::new(
+    let audio_loader = TrackSampleLoader::new(
         bundled.audio.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         256 * 1024,

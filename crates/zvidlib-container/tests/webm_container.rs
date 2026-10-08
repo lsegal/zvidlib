@@ -12,7 +12,7 @@ use std::task::{Context, Poll, Waker};
 use zvidlib_av1_decoder::native_av1_video_decoder_factory;
 use zvidlib_container::mp4::{Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib_container::{
-    Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, WebmDemuxer, WebmDemuxerOptions, WebmMuxer,
+    Mp4Demuxer, Mp4DemuxerOptions, Track, WebmDemuxer, WebmDemuxerOptions, WebmMuxer,
     container_capabilities, probe_container,
 };
 use zvidlib_core::io::{MemorySink, MemorySource};
@@ -34,7 +34,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
     }
 }
 
-fn mp4_video_track() -> (MemorySource, Mp4Track) {
+fn mp4_video_track() -> (MemorySource, Track) {
     let source = MemorySource::new(AV1_MP4.to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
     let track = movie
@@ -91,7 +91,7 @@ fn demux(bytes: Vec<u8>) -> (MemorySource, WebmDemuxer) {
     (source, demuxer)
 }
 
-fn decoder_config(track: &Mp4Track) -> VideoDecoderConfig {
+fn decoder_config(track: &Track) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: Codec::Av1,
         profile: CodecProfile::Av1Main,

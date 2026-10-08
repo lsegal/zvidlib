@@ -2,15 +2,15 @@
 //! whose reads genuinely suspend, such as a browser `fetch` or HTTP range
 //! request (issue #672).
 //!
-//! [`Mp4SampleProvider`] reads through its source from inside
+//! [`TrackSampleProvider`] reads through its source from inside
 //! [`ExactFrameReader::get`], which is synchronous, so it can only drive a
 //! source that resolves on the first poll. This module splits the read in two
-//! instead. An [`Mp4SampleLoader`] owns the track's index and the source, and
+//! instead. A [`TrackSampleLoader`] owns the track's index and the source, and
 //! loads samples asynchronously into a byte-budgeted cache. The providers it
 //! hands out answer a reader's synchronous reads from that cache alone and
 //! report [`ErrorKind::WouldBlock`] for a sample that is not loaded yet rather
 //! than blocking. A provider remembers every sample it was asked for and did
-//! not have, so the caller awaits [`Mp4SampleLoader::load_missing`] and asks
+//! not have, so the caller awaits [`TrackSampleLoader::load_missing`] and asks
 //! again:
 //!
 //! ```ignore
@@ -30,9 +30,9 @@
 //! before making it turns those per-sample round trips into one batch:
 //! [`ExactFrameReader::decode_positions_for`] and
 //! [`AudioSampleReader::packets_for_range`] name it, and
-//! [`Mp4SampleLoader::load`] loads it together with a playback readahead.
+//! [`TrackSampleLoader::load`] loads it together with a playback readahead.
 //!
-//! [`Mp4SampleProvider`]: crate::mp4_demux::Mp4SampleProvider
+//! [`TrackSampleProvider`]: crate::track::TrackSampleProvider
 //! [`ExactFrameReader::get`]: crate::codec::ExactFrameReader::get
 //! [`ExactFrameReader::decode_positions_for`]: crate::codec::ExactFrameReader::decode_positions_for
 //! [`AudioSampleReader::packets_for_range`]: crate::audio::AudioSampleReader::packets_for_range
@@ -41,8 +41,8 @@ use crate::audio::AudioPacketProvider;
 use crate::codec::{SampleProvider, TrackKind};
 use crate::io::ByteSource;
 use crate::media::Codec;
-use crate::mp4_demux::{Mp4Track, read_exact};
 use crate::timeline::{FrameIndex, SampleRange};
+use crate::track::{Track, read_exact};
 use crate::{Error, ErrorKind, Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -80,16 +80,16 @@ const MAX_COALESCED_GAP_BYTES: u64 = 16 * 1024;
 ///
 /// [`ExactFrameReader::from_provider`]: crate::codec::ExactFrameReader::from_provider
 /// [`AudioSampleReader::from_provider`]: crate::audio::AudioSampleReader::from_provider
-pub struct Mp4SampleLoader<S> {
-    track: Mp4Track,
+pub struct TrackSampleLoader<S> {
+    track: Track,
     source: S,
     cache: SharedCache,
 }
 
-impl<S: ByteSource> Mp4SampleLoader<S> {
+impl<S: ByteSource> TrackSampleLoader<S> {
     /// Fails if `budget_bytes` cannot hold the track's largest sample, which
     /// could then never be loaded. Reads no sample data.
-    pub fn new(track: Mp4Track, source: S, budget_bytes: u64) -> Result<Self> {
+    pub fn new(track: Track, source: S, budget_bytes: u64) -> Result<Self> {
         let largest = track
             .samples
             .iter()
@@ -108,7 +108,7 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
         })
     }
 
-    pub fn track(&self) -> &Mp4Track {
+    pub fn track(&self) -> &Track {
         &self.track
     }
 
@@ -177,7 +177,7 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// time, as playback reaches each one: a packet whose table of contents
     /// disagrees with its duration is read as [`ErrorKind::MalformedMedia`],
     /// so a track whose intervals would differ from the ones
-    /// [`Mp4Track::to_encoded_audio_samples`] gives is refused rather than
+    /// [`Track::to_encoded_audio_samples`] gives is refused rather than
     /// played out of time. Fails if the track is not an Opus audio track.
     pub async fn opus_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
         if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Opus {
@@ -202,14 +202,14 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// loader's cache, with each packet's decoded interval taken from the
     /// track's sample durations.
     ///
-    /// The intervals are the ones [`Mp4AudioPacketProvider`] and
-    /// [`Mp4Track::to_encoded_audio_samples`] give the same track, and
+    /// The intervals are the ones [`TrackAudioPacketProvider`] and
+    /// [`Track::to_encoded_audio_samples`] give the same track, and
     /// building them reads no packet data. Fails if the track is not an AAC
     /// audio track: Opus tracks use [`Self::opus_packet_provider`], and Vorbis
     /// tracks [`Self::audio_packet_provider`] with intervals the caller
     /// supplies.
     ///
-    /// [`Mp4AudioPacketProvider`]: crate::mp4_demux::Mp4AudioPacketProvider
+    /// [`TrackAudioPacketProvider`]: crate::track::TrackAudioPacketProvider
     pub fn aac_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
         if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Aac {
             return Err(unsupported(
@@ -342,7 +342,7 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     }
 }
 
-/// A [`SampleProvider`] that answers from an [`Mp4SampleLoader`]'s cache and
+/// A [`SampleProvider`] that answers from a [`TrackSampleLoader`]'s cache and
 /// reports [`ErrorKind::WouldBlock`] for a sample that is not loaded yet.
 pub struct PrefetchedSampleProvider {
     presentation_index_by_decode: Vec<u64>,
@@ -365,13 +365,13 @@ impl SampleProvider for PrefetchedSampleProvider {
 
     fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>> {
         if decode_index >= self.len() {
-            return Err(invalid("MP4 sample index is out of range"));
+            return Err(invalid("sample index is out of range"));
         }
         self.cache.read(decode_index)
     }
 }
 
-/// An [`AudioPacketProvider`] that answers from an [`Mp4SampleLoader`]'s
+/// An [`AudioPacketProvider`] that answers from a [`TrackSampleLoader`]'s
 /// cache and reports [`ErrorKind::WouldBlock`] for a packet that is not
 /// loaded yet.
 pub struct PrefetchedAudioPacketProvider {
@@ -393,7 +393,7 @@ impl AudioPacketProvider for PrefetchedAudioPacketProvider {
 
     fn read(&self, index: usize) -> Result<Cow<'_, [u8]>> {
         if index >= self.len() {
-            return Err(invalid("MP4 sample index is out of range"));
+            return Err(invalid("sample index is out of range"));
         }
         let packet = self.cache.read(index)?;
         if self.check_opus_durations
@@ -409,7 +409,7 @@ impl AudioPacketProvider for PrefetchedAudioPacketProvider {
     }
 }
 
-/// The cache an [`Mp4SampleLoader`] fills and its providers read, shared
+/// The cache a [`TrackSampleLoader`] fills and its providers read, shared
 /// between them.
 #[derive(Clone)]
 struct SharedCache {
@@ -518,7 +518,7 @@ mod tests {
     use super::*;
     use crate::codec::SampleDependency;
     use crate::io::{IoFuture, MemorySource};
-    use crate::mp4_demux::Mp4Sample;
+    use crate::track::TrackSample;
     use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
@@ -574,19 +574,19 @@ mod tests {
     /// A video track of `sizes.len()` samples stored back to back from
     /// offset 0, every fourth a random-access point, each filled with its own
     /// decode index.
-    fn track_and_source(sizes: &[u32]) -> (Mp4Track, SuspendingSource) {
+    fn track_and_source(sizes: &[u32]) -> (Track, SuspendingSource) {
         let gaps = vec![0; sizes.len()];
         gapped_track_and_source(sizes, &gaps)
     }
 
     /// [`track_and_source`] with `gaps[index]` bytes of something else, such
     /// as a WebM block header, stored before each sample.
-    fn gapped_track_and_source(sizes: &[u32], gaps: &[usize]) -> (Mp4Track, SuspendingSource) {
+    fn gapped_track_and_source(sizes: &[u32], gaps: &[usize]) -> (Track, SuspendingSource) {
         let mut bytes = Vec::new();
         let mut samples = Vec::new();
         for (index, &size) in sizes.iter().enumerate() {
             bytes.extend(std::iter::repeat_n(0xff, gaps[index]));
-            samples.push(Mp4Sample {
+            samples.push(TrackSample {
                 offset: bytes.len() as u64,
                 size,
                 dts: index as u64,
@@ -597,7 +597,7 @@ mod tests {
             });
             bytes.extend(std::iter::repeat_n(index as u8, size as usize));
         }
-        let track = Mp4Track {
+        let track = Track {
             id: 1,
             kind: TrackKind::Video,
             codec: Codec::Hevc,
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn a_provider_reports_an_unloaded_sample_instead_of_blocking() {
         let (track, source) = track_and_source(&[10; 8]);
-        let loader = Mp4SampleLoader::new(track, source, 1_000).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
         let provider = loader.sample_provider().unwrap();
 
         let error = provider.read(3).unwrap_err();
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn loading_a_run_coalesces_contiguous_samples_and_adds_readahead() {
         let (track, source) = track_and_source(&[10; 16]);
-        let loader = Mp4SampleLoader::new(track, source, 1_000).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
         let provider = loader.sample_provider().unwrap();
 
         block_on(loader.load(4..7, 3)).unwrap();
@@ -665,7 +665,7 @@ mod tests {
         let mut gaps = vec![12; 8];
         gaps[6] = MAX_COALESCED_GAP_BYTES as usize + 1;
         let (track, source) = gapped_track_and_source(&[10; 8], &gaps);
-        let loader = Mp4SampleLoader::new(track, source, 1_000).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
         let provider = loader.sample_provider().unwrap();
 
         block_on(loader.load(0..6, 0)).unwrap();
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn the_cache_stays_within_its_budget_and_evicts_the_least_recently_used() {
         let (track, source) = track_and_source(&[10; 16]);
-        let loader = Mp4SampleLoader::new(track, source, 40).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 40).unwrap();
 
         block_on(loader.load(0..4, 0)).unwrap();
         assert_eq!(loader.resident_bytes(), 40);
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn a_budget_smaller_than_the_largest_sample_is_refused() {
         let (track, source) = track_and_source(&[10, 50, 10]);
-        let error = Mp4SampleLoader::new(track, source, 49)
+        let error = TrackSampleLoader::new(track, source, 49)
             .err()
             .expect("the budget cannot hold sample 1");
         assert_eq!(error.kind(), ErrorKind::ResourceLimit);
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn clearing_missing_samples_forgets_what_an_old_position_needed() {
         let (track, source) = track_and_source(&[10; 8]);
-        let loader = Mp4SampleLoader::new(track, source, 1_000).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
         let provider = loader.sample_provider().unwrap();
         provider.read(1).unwrap_err();
         loader.clear_missing();
@@ -730,7 +730,7 @@ mod tests {
     fn an_audio_provider_answers_from_the_same_cache() {
         let (mut track, source) = track_and_source(&[4; 4]);
         track.kind = TrackKind::Audio;
-        let loader = Mp4SampleLoader::new(track, source, 1_000).unwrap();
+        let loader = TrackSampleLoader::new(track, source, 1_000).unwrap();
         assert_eq!(
             loader.sample_provider().err().unwrap().kind(),
             ErrorKind::Unsupported

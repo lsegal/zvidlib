@@ -5,7 +5,8 @@ use crate::audio::AudioTrackTiming;
 use crate::codec::TrackKind;
 use crate::io::ByteSource;
 use crate::media::Container;
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, probe_mp4};
+use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, probe_mp4};
+use crate::track::Track;
 use crate::webm_demux::{WebmDemuxer, WebmDemuxerOptions, probe_webm};
 use crate::{Error, ErrorKind, Limits, Result};
 
@@ -53,7 +54,7 @@ enum Demuxer {
 
 impl MediaTracks {
     /// Every indexed track, in the order the container lists them.
-    pub fn tracks(&self) -> &[Mp4Track] {
+    pub fn tracks(&self) -> &[Track] {
         match &self.demuxer {
             Demuxer::Mp4(demuxer) => &demuxer.tracks,
             Demuxer::WebM(demuxer) => &demuxer.tracks,
@@ -61,7 +62,7 @@ impl MediaTracks {
     }
 
     /// Takes the indexed tracks, in the order the container lists them.
-    pub fn into_tracks(self) -> Vec<Mp4Track> {
+    pub fn into_tracks(self) -> Vec<Track> {
         match self.demuxer {
             Demuxer::Mp4(demuxer) => demuxer.tracks,
             Demuxer::WebM(demuxer) => demuxer.tracks,
@@ -69,14 +70,14 @@ impl MediaTracks {
     }
 
     /// The first track of `kind`, if the source has one.
-    pub fn first_track(&self, kind: TrackKind) -> Option<&Mp4Track> {
+    pub fn first_track(&self, kind: TrackKind) -> Option<&Track> {
         self.tracks().iter().find(|track| track.kind == kind)
     }
 
     /// `track`'s timing on the decoded sample clock: an MP4 track's edit
     /// list, or a WebM track's `CodecDelay` and `DiscardPadding`. `track` must
     /// be one of [`MediaTracks::tracks`].
-    pub fn audio_timing(&self, track: &Mp4Track) -> Result<AudioTrackTiming> {
+    pub fn audio_timing(&self, track: &Track) -> Result<AudioTrackTiming> {
         match &self.demuxer {
             Demuxer::Mp4(demuxer) => track.audio_timing(demuxer.movie_timescale),
             Demuxer::WebM(demuxer) => demuxer.audio_timing(track.id),
@@ -123,7 +124,7 @@ pub async fn open_media<S: ByteSource + ?Sized>(
 pub async fn open_tracks<S: ByteSource + ?Sized>(
     source: &S,
     limits: &Limits,
-) -> Result<Vec<Mp4Track>> {
+) -> Result<Vec<Track>> {
     Ok(open_media(source, limits).await?.into_tracks())
 }
 
@@ -135,7 +136,7 @@ pub async fn open_audio_track<S: ByteSource + ?Sized>(
     source: &S,
     index: usize,
     limits: &Limits,
-) -> Result<(Mp4Track, AudioTrackTiming)> {
+) -> Result<(Track, AudioTrackTiming)> {
     let media = open_media(source, limits).await?;
     let track = media
         .tracks()
