@@ -128,14 +128,13 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// loader's cache, with `decoded_ranges` giving each packet's decoded
     /// interval in decode order.
     ///
-    /// The intervals are the caller's because whether they can be known
-    /// without reading every packet depends on the codec, as
-    /// [`AudioPacketProvider`] explains. An Opus or Vorbis packet's depends
-    /// on packet bytes; an AAC track should use [`Self::aac_packet_provider`],
-    /// which derives them from the track's index, and an Opus track
-    /// [`Self::opus_packet_provider`]. Fails if the track is not
-    /// an audio track or `decoded_ranges` does not have one interval per
-    /// sample.
+    /// The intervals are the caller's because how they are known without
+    /// reading every packet depends on the codec, as [`AudioPacketProvider`]
+    /// explains. An AAC track should use [`Self::aac_packet_provider`], an
+    /// Opus track [`Self::opus_packet_provider`] and a Vorbis track
+    /// [`Self::vorbis_packet_provider`], which derive them for the codec.
+    /// Fails if the track is not an audio track or `decoded_ranges` does not
+    /// have one interval per sample.
     pub fn audio_packet_provider(
         &self,
         decoded_ranges: Vec<SampleRange>,
@@ -196,8 +195,7 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     /// [`Mp4Track::to_encoded_audio_samples`] give the same track, and
     /// building them reads no packet data. Fails if the track is not an AAC
     /// audio track: Opus tracks use [`Self::opus_packet_provider`], and Vorbis
-    /// tracks [`Self::audio_packet_provider`] with intervals the caller
-    /// supplies.
+    /// tracks [`Self::vorbis_packet_provider`].
     ///
     /// [`Mp4AudioPacketProvider`]: crate::mp4_demux::Mp4AudioPacketProvider
     pub fn aac_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
@@ -209,6 +207,27 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
         let decoded_ranges = self
             .track
             .aac_decoded_ranges(self.track.audio_sample_rate()?)?;
+        self.audio_packet_provider(decoded_ranges)
+    }
+
+    /// An [`AudioPacketProvider`] for a Vorbis track, answering from this
+    /// loader's cache, without reading any packet to learn its interval.
+    ///
+    /// A Vorbis packet decodes to a quarter of its block size plus a quarter
+    /// of the previous packet's, and its block size is named by the mode
+    /// number in its first byte. [`crate::WebmDemuxer`] reads that byte while
+    /// scanning each block's header and records it as
+    /// [`Mp4Track::vorbis_packet_heads`], so the intervals - the ones
+    /// [`Mp4Track::to_encoded_audio_samples`] gives - come from the index
+    /// alone, and a seek needs no earlier packet. Fails if the track is not a
+    /// Vorbis audio track, or does not record its packets' first bytes.
+    pub fn vorbis_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
+        if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Vorbis {
+            return Err(unsupported(
+                "a Vorbis audio packet provider requires a Vorbis audio track",
+            ));
+        }
+        let decoded_ranges = self.track.vorbis_decoded_ranges()?;
         self.audio_packet_provider(decoded_ranges)
     }
 
@@ -585,6 +604,7 @@ mod tests {
             edits: Vec::new(),
             presentation_order: (0..sizes.len()).collect(),
             samples,
+            vorbis_packet_heads: Vec::new(),
         };
         let source = SuspendingSource {
             inner: MemorySource::new(bytes),

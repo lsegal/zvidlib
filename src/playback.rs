@@ -1258,6 +1258,7 @@ mod tests {
                 edits: Vec::new(),
                 presentation_order: (0..samples.len()).collect(),
                 samples,
+                vorbis_packet_heads: Vec::new(),
             }
         }
 

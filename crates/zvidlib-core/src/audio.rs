@@ -49,15 +49,16 @@ pub use self::AudioDecoder as AacDecoder;
 ///
 /// `len` and `decoded_range` answer from the index alone and must not read
 /// packet data; only [`Self::read`] may do that, and only for the one packet
-/// it is asked for. A packet's decoded interval must be knowable without
-/// reading any packet's bytes: an AAC packet's comes from the track's sample
-/// durations, which this holds for. An Opus packet's own table of contents
-/// gives its interval, and a Vorbis packet's depends on the block size of the
-/// packet before it, so neither decides its boundary without the data a
-/// provider is meant not to hold. `zvidlib-container`'s
-/// `Mp4AudioPacketProvider` is the on-demand provider for AAC tracks;
-/// `Mp4Track::to_encoded_audio_samples` remains how Opus and Vorbis tracks
-/// are read.
+/// it is asked for. So a provider has to know every packet's decoded interval
+/// before it reads any packet, which depends on the codec. An AAC packet's
+/// comes from the track's sample durations. A Vorbis packet's depends on its
+/// own block size and the previous packet's, which the mode number in each
+/// packet's first byte names; the WebM demuxer records those bytes as it
+/// indexes the track. An Opus packet's own table of contents gives its
+/// interval, so an Opus provider takes it from the sample table and checks
+/// each packet as it reads it. `zvidlib-container`'s `Mp4AudioPacketProvider`
+/// is the on-demand provider for AAC and Vorbis tracks, and its
+/// `Mp4SampleLoader` builds non-blocking providers for all three codecs.
 ///
 /// Implementations used from a decode thread must be `Send`.
 pub trait AudioPacketProvider: Send {

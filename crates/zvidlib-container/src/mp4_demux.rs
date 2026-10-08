@@ -79,6 +79,12 @@ pub struct Mp4Track {
     /// frame stored as a WebM block of its own, is decoded on the way to the
     /// frames after it but is never presented, so it is not listed.
     pub presentation_order: Vec<usize>,
+    /// The first byte of every sample, in decode order, of a WebM Vorbis
+    /// track, which [`crate::WebmDemuxer`] reads anyway while scanning block
+    /// headers. A Vorbis packet's mode number is in it, so every packet's
+    /// decoded interval is known without reading the packets again; empty for
+    /// every other track.
+    pub vorbis_packet_heads: Vec<u8>,
 }
 
 impl Mp4Track {
@@ -346,6 +352,31 @@ impl Mp4Track {
         Ok(ranges)
     }
 
+    /// The decoded PCM interval of every Vorbis packet, the ones
+    /// [`Self::to_encoded_audio_samples`] gives, from the block size each
+    /// packet's first byte names. Reads no sample data: the first bytes are
+    /// [`Self::vorbis_packet_heads`], which [`crate::WebmDemuxer`] records.
+    /// Fails with [`ErrorKind::Unsupported`] for a track that does not record
+    /// them.
+    pub(crate) fn vorbis_decoded_ranges(&self) -> Result<Vec<crate::SampleRange>> {
+        let config = self.vorbis_config()?;
+        if self.samples.is_empty() {
+            return Err(malformed("audio track contains no samples"));
+        }
+        if self.vorbis_packet_heads.len() != self.samples.len() {
+            return Err(unsupported(
+                "a Vorbis track's packet intervals need the first byte of every packet, which \
+                 the WebM demuxer records",
+            ));
+        }
+        let block_sizes = self
+            .vorbis_packet_heads
+            .iter()
+            .map(|&head| config.packet_block_size(&[head]))
+            .collect::<Result<Vec<_>>>()?;
+        VorbisConfig::decoded_ranges(block_sizes)
+    }
+
     /// The decoded PCM interval of each of `samples`, the track's leading
     /// samples, from their sample-table durations.
     fn table_decoded_ranges(
@@ -535,8 +566,8 @@ impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
     }
 }
 
-/// An [`AudioPacketProvider`] that reads an AAC track's compressed packets
-/// from a [`ByteSource`] on demand, holding only `track`'s index (and
+/// An [`AudioPacketProvider`] that reads an AAC or Vorbis track's compressed
+/// packets from a [`ByteSource`] on demand, holding only `track`'s index (and
 /// whatever `S` itself caches) rather than every packet's bytes.
 ///
 /// The audio counterpart of [`Mp4SampleProvider`], with the same requirement
@@ -544,12 +575,12 @@ impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
 /// that suspends makes [`Self::read`] report [`ErrorKind::Unsupported`]
 /// rather than block.
 ///
-/// Only AAC is supported. An AAC packet's decoded interval comes from the
-/// track's sample durations, so [`Self::new`] builds the whole index without
-/// reading any packet. An Opus packet's interval is in its own
-/// table-of-contents byte, and a Vorbis packet's depends on the block size of
-/// the packet before it, so an index for either needs every packet's bytes -
-/// the very data this provider exists not to hold. Those tracks keep using
+/// [`Self::new`] builds the whole index without reading any packet. An AAC
+/// packet's decoded interval comes from the track's sample durations, and a
+/// Vorbis packet's from the block sizes of it and the packet before it, which
+/// [`Mp4Track::vorbis_packet_heads`] names. An Opus packet's interval is in
+/// its own table-of-contents byte, which only the packet has, so Opus tracks
+/// use [`crate::Mp4SampleLoader::opus_packet_provider`] or
 /// [`Mp4Track::to_encoded_audio_samples`]; [`Self::new`] rejects them.
 pub struct Mp4AudioPacketProvider<S> {
     track: Mp4Track,
@@ -558,17 +589,22 @@ pub struct Mp4AudioPacketProvider<S> {
 }
 
 impl<S: ByteSource + Send> Mp4AudioPacketProvider<S> {
-    /// Fails if `track` is not an AAC audio track; reads no packet data.
+    /// Fails if `track` is not an AAC or Vorbis audio track; reads no packet
+    /// data.
     pub fn new(track: Mp4Track, source: S) -> Result<Self> {
-        if track.kind != TrackKind::Audio || track.codec != Codec::Aac {
+        if track.kind != TrackKind::Audio || !matches!(track.codec, Codec::Aac | Codec::Vorbis) {
             return Err(unsupported(
-                "an on-demand audio packet provider requires an AAC audio track",
+                "an on-demand audio packet provider requires an AAC or Vorbis audio track",
             ));
         }
         if track.samples.is_empty() {
             return Err(malformed("audio track contains no samples"));
         }
-        let decoded_ranges = track.aac_decoded_ranges(track.audio_sample_rate()?)?;
+        let decoded_ranges = if track.codec == Codec::Vorbis {
+            track.vorbis_decoded_ranges()?
+        } else {
+            track.aac_decoded_ranges(track.audio_sample_rate()?)?
+        };
         Ok(Self {
             track,
             source,
@@ -1515,6 +1551,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
         edits: b.edits,
         samples: b.samples,
         presentation_order: Vec::new(),
+        vorbis_packet_heads: Vec::new(),
     })
 }
 
@@ -2752,6 +2789,7 @@ mod tests {
             edits: Vec::new(),
             presentation_order: (0..packets.len()).collect(),
             samples,
+            vorbis_packet_heads: Vec::new(),
         };
         (track, bytes)
     }

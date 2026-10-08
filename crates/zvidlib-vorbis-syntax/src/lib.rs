@@ -171,22 +171,45 @@ impl VorbisConfig {
     /// samples it produces: none for the first, and for every later one a
     /// quarter of its block size plus a quarter of the previous packet's.
     pub fn encoded_samples(&self, packets: Vec<Vec<u8>>) -> Result<Vec<EncodedAudioSample>> {
-        let mut previous = None;
-        let mut end = 0_u64;
+        let block_sizes = packets
+            .iter()
+            .map(|data| self.packet_block_size(data))
+            .collect::<Result<Vec<_>>>()?;
         packets
             .into_iter()
-            .map(|data| {
-                let block = self.packet_block_size(&data)?;
+            .zip(Self::decoded_ranges(block_sizes)?)
+            .map(|(data, decoded_range)| {
+                Ok(EncodedAudioSample {
+                    decoded_range,
+                    data,
+                })
+            })
+            .collect()
+    }
+
+    /// The interval of decoded samples each audio packet produces, in stream
+    /// order, from the packets' block sizes alone, as
+    /// [`Self::encoded_samples`] assigns them.
+    ///
+    /// A packet's mode number, and so its block size, is in its first byte:
+    /// the packet type bit and at most six bits of mode. So the intervals of a
+    /// whole stream need only the first byte of each packet, which is how an
+    /// on-demand reader indexes a Vorbis track without reading its packets.
+    pub fn decoded_ranges(
+        block_sizes: impl IntoIterator<Item = u16>,
+    ) -> Result<Vec<SampleRange>> {
+        let mut previous = None;
+        let mut end = 0_u64;
+        block_sizes
+            .into_iter()
+            .map(|block| {
                 let length = previous.map_or(0, |previous: u16| {
                     (u64::from(previous) + u64::from(block)) / 4
                 });
                 previous = Some(block);
                 let start = end;
                 end += length;
-                Ok(EncodedAudioSample {
-                    decoded_range: SampleRange::new(start, end)?,
-                    data,
-                })
+                SampleRange::new(start, end)
             })
             .collect()
     }
