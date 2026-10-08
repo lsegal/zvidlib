@@ -250,6 +250,12 @@ export async function readRangeSource(source, offset, length) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// The page's clock, in seconds: what times `OnDemandPlayback` of a video with
+// no audio track when it is given no `AudioContext`.
+export function clockSeconds() {
+  return performance.now() / 1000;
+}
+
 // Test-only: a range reader over `bytes` whose every read suspends until a
 // later event-loop turn, as a network read does.
 export function makeSuspendingReader(bytes) {
