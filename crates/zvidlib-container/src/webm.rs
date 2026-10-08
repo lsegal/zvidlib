@@ -611,37 +611,37 @@ fn codec_private(config: &Mp4TrackConfig) -> Result<(&'static str, Vec<u8>)> {
     }
 }
 
-/// The `Colour` element for a VP9 track: the range and colour description its
+/// The `Color` element for a VP9 track: the range and color description its
 /// `vpcC` declares, which the WebM `CodecPrivate` has no field for.
 ///
-/// Chrome takes a WebM VP9 track's colour space from this element rather than
+/// Chrome takes a WebM VP9 track's color space from this element rather than
 /// from the bitstream, and without it rejects a full-range stream such as its
 /// own `WebCodecs` encoder writes from RGBA canvas frames with a decode error
 /// on the first frame after the key frame (issue #655). The descriptions the
 /// `vpcC` leaves unspecified are left out.
-fn vp9_colour(config: &Mp4TrackConfig) -> Result<Vec<u8>> {
+fn vp9_color(config: &Mp4TrackConfig) -> Result<Vec<u8>> {
     let vpcc = Vp9CodecConfig::parse_vpcc(&config.encoder.decoder_config)
         .map_err(|_| invalid("VP9 codec configuration must be a complete vpcC box"))?;
-    let mut colour = Vec::new();
+    let mut color = Vec::new();
     for (id, value) in [
         (ebml::MATRIX_COEFFICIENTS, vpcc.matrix_coefficients),
         (
             ebml::TRANSFER_CHARACTERISTICS,
             vpcc.transfer_characteristics,
         ),
-        (ebml::PRIMARIES, vpcc.colour_primaries),
+        (ebml::PRIMARIES, vpcc.color_primaries),
     ] {
         if value != 2 {
-            write_uint(&mut colour, id, u64::from(value));
+            write_uint(&mut color, id, u64::from(value));
         }
     }
     // Matroska's Range is 1 for broadcast range and 2 for full range.
     write_uint(
-        &mut colour,
+        &mut color,
         ebml::RANGE,
         1 + u64::from(vpcc.video_full_range),
     );
-    Ok(colour)
+    Ok(color)
 }
 
 fn to_ticks(pts: u64, timescale: u32) -> Result<u64> {
@@ -725,7 +725,7 @@ fn tracks_element(configs: &[Mp4TrackConfig]) -> Result<Vec<u8>> {
                 write_uint(&mut video, ebml::PIXEL_WIDTH, u64::from(dimensions.width));
                 write_uint(&mut video, ebml::PIXEL_HEIGHT, u64::from(dimensions.height));
                 if config.encoder.codec == Codec::Vp9 {
-                    write_element(&mut video, ebml::COLOUR, &vp9_colour(config)?);
+                    write_element(&mut video, ebml::COLOR, &vp9_color(config)?);
                 }
                 write_element(&mut entry, ebml::VIDEO, &video);
             }

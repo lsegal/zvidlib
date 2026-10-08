@@ -21,8 +21,8 @@ commit, pull-request, and changelog text. Write `color`, `neighbor`,
 `cancellation` is already the American spelling.
 
 This applies to names taken from the codec specifications as well: the
-ITU-T and AOM documents spell syntax elements such as `colour_primaries` and
-`separate_colour_plane_flag` the British way, and the code still names them
+ITU-T and AOM documents spell syntax elements such as `color_primaries` and
+`separate_color_plane_flag` the British way, and the code still names them
 `color_primaries` and `separate_color_plane_flag`. Keep a British spelling only
 where it is not ours to change: verbatim third-party license and notice text,
 and the names of external APIs and web standards (such as the HTML

@@ -287,18 +287,18 @@ fn samples_must_arrive_in_presentation_order_across_tracks() {
     });
 }
 
-/// Issue #655: a VP9 track's range and colour description travel in the WebM
-/// `Colour` element, which Chrome reads instead of the bitstream: a full-range
+/// Issue #655: a VP9 track's range and color description travel in the WebM
+/// `Color` element, which Chrome reads instead of the bitstream: a full-range
 /// stream written without one plays its key frame and then fails to decode.
 /// They come back out of the demuxer as the `vpcC` the track was written from.
 #[test]
-fn a_vp9_track_keeps_its_vpcc_colour_description() {
+fn a_vp9_track_keeps_its_vpcc_color_description() {
     let limits = Limits::default();
     let written = Vp9CodecConfig {
         level: 21,
         chroma_subsampling: 1,
         video_full_range: true,
-        colour_primaries: 1,
+        color_primaries: 1,
         transfer_characteristics: 1,
         matrix_coefficients: 1,
         ..Vp9CodecConfig::default()

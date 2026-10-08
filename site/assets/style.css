@@ -180,7 +180,7 @@ td { color: #c9cdea; line-height: 1.9; }
   background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(34, 211, 238, 0.08)), var(--panel);
   border: 1px solid var(--line);
 }
-/* zvid's own mark, in zvid's brand colour. */
+/* zvid's own mark, in zvid's brand color. */
 .showcase-mark { width: 4.5rem; height: 4.5rem; display: grid; place-items: center; }
 .showcase-mark svg { width: 100%; height: auto; display: block; }
 .showcase-mark path { fill: rgb(178, 130, 255); }
