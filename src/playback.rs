@@ -1254,6 +1254,7 @@ mod tests {
                 dimensions: None,
                 channels: Some(1),
                 sample_rate: Some(SAMPLE_RATE),
+                language: None,
                 decoder_config: Vec::new(),
                 edits: Vec::new(),
                 presentation_order: (0..samples.len()).collect(),
