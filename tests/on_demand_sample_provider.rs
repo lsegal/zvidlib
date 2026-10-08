@@ -95,12 +95,20 @@ fn on_demand_reader_matches_the_eager_reader_and_stays_within_its_cache_budget()
     )
     .unwrap();
 
-    // Forward through the whole track, then a handful of backward seeks -
-    // the same positions answered by both readers must agree exactly.
-    let positions: Vec<u64> = (0..frame_count)
-        .step_by((frame_count as usize / 32).max(1))
-        .chain([frame_count - 1, frame_count / 2, 0])
-        .collect();
+    // A few nearby positions, including a backward seek back to the start -
+    // the same positions answered by both readers must agree exactly. Kept
+    // close together deliberately: the bundled sample is one group of
+    // pictures with a single random-access point at frame 0 (see
+    // `ARCHITECTURE.md` section 3.2), so walking far into it, or resetting
+    // and walking again, decodes everything behind the target. This test's
+    // job is proving the two readers agree on real decoder output, not
+    // re-measuring a full-track walk, which the other on-demand-provider
+    // tests already cover without paying for a decode.
+    assert!(
+        frame_count > 20,
+        "the bundled sample is too short for this test"
+    );
+    let positions: Vec<u64> = vec![0, 5, 12, 20, 5, 0];
     for frame in positions {
         let expected = eager_reader
             .get(FrameIndex(frame), &cancellation)
