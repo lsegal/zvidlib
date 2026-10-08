@@ -132,11 +132,16 @@ async function startScrubber() {
   let audioRun = 0;
 
   let shown = -1;
+  let previewShown = false;
   let wanted = 0;
+  let seekVersion = 0;
   let decoding = false;
   let playing = false;
   let playStartedAt = 0;
   let playStartFrame = 0;
+  let tickRequest = 0;
+  let dragging = false;
+  let resumeAfterDrag = false;
 
   function show(kind, frame, detail) {
     badge.className = `badge ${kind}`;
@@ -151,16 +156,21 @@ async function startScrubber() {
     if (decoding) return;
     decoding = true;
     try {
-      while (shown !== wanted) {
+      while (shown !== wanted || previewShown) {
         const target = wanted;
+        const version = seekVersion;
         const began = performance.now();
         const frame = await video.get(BigInt(target));
+        if (version !== seekVersion) {
+          frame.free();
+          continue;
+        }
         const elapsed = performance.now() - began;
         paint(canvas, frame);
         frame.free();
         shown = target;
+        previewShown = false;
         show("exact", target, playing ? null : `decoded in ${elapsed.toFixed(1)} ms`);
-        if (!playing) timeline.value = String(target);
       }
     } catch (error) {
       status.textContent = `video.get() rejected: ${errorText(zvid, error)}`;
@@ -198,11 +208,14 @@ async function startScrubber() {
 
   function seek(frame) {
     wanted = Math.max(0, Math.min(last, frame));
-    if (previews && wanted !== shown) {
+    seekVersion++;
+    timeline.value = String(wanted);
+    if (previews && (wanted !== shown || previewShown)) {
       const preview = previews.nearest(BigInt(wanted));
       if (preview) {
         const picture = preview.picture;
         paint(canvas, picture);
+        previewShown = true;
         show("preview", Number(preview.frame), `exact frame ${wanted} decoding…`);
         picture.free();
         preview.free();
@@ -289,7 +302,7 @@ async function startScrubber() {
       timeline.value = String(frame);
       pump();
     }
-    requestAnimationFrame(tick);
+    tickRequest = requestAnimationFrame(tick);
   }
 
   function setPlaying(next) {
@@ -304,10 +317,12 @@ async function startScrubber() {
         audioGain.connect(audioContext.destination);
       }
       audioContext?.resume();
-      beginPlayback(shown < 0 || shown >= last ? 0 : shown, performance.now());
-      requestAnimationFrame(tick);
-    } else if (sound) {
-      stopSound();
+      beginPlayback(wanted >= last ? 0 : wanted, performance.now());
+      cancelAnimationFrame(tickRequest);
+      tickRequest = requestAnimationFrame(tick);
+    } else {
+      cancelAnimationFrame(tickRequest);
+      if (sound) stopSound();
     }
   }
 
@@ -327,7 +342,27 @@ async function startScrubber() {
   $("#scrub-prev").addEventListener("click", () => (setPlaying(false), seek(shown - 1)));
   $("#scrub-next").addEventListener("click", () => (setPlaying(false), seek(shown + 1)));
   $("#scrub-random").addEventListener("click", () => (setPlaying(false), seek(Math.floor(Math.random() * frameCount))));
-  timeline.addEventListener("input", () => (setPlaying(false), seek(Number(timeline.value))));
+  timeline.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    dragging = true;
+    resumeAfterDrag ||= playing;
+    if (playing) setPlaying(false);
+  });
+  const endDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    if (resumeAfterDrag) {
+      resumeAfterDrag = false;
+      setPlaying(true);
+    }
+  };
+  addEventListener("pointerup", endDrag);
+  addEventListener("pointercancel", endDrag);
+  addEventListener("blur", endDrag);
+  timeline.addEventListener("input", () => {
+    seek(Number(timeline.value));
+    if (playing) beginPlayback(wanted, performance.now());
+  });
   canvas.addEventListener("keydown", (event) => {
     if (event.key === "ArrowLeft") seek(shown - 1);
     if (event.key === "ArrowRight") seek(shown + 1);
