@@ -501,11 +501,17 @@ pub(crate) mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    /// A second of 48 kHz stereo encoded by the native Opus encoder, muxed
-    /// into an MP4 with its pre-skip and end trim, and the PCM it was made
-    /// from.
-    pub(crate) async fn opus_mp4() -> (Vec<u8>, Vec<f32>) {
-        let frames = 48_000;
+    /// `frames` samples of 48 kHz stereo encoded by the native Opus encoder:
+    /// the MP4 track that holds them, its packets and gapless trim, and the PCM
+    /// they were made from.
+    pub(crate) async fn opus_packets(
+        frames: u64,
+    ) -> (
+        Mp4TrackConfig,
+        Vec<crate::EncodedSample>,
+        crate::AudioGapless,
+        Vec<f32>,
+    ) {
         let input: Vec<f32> = (0..frames)
             .flat_map(|i| {
                 let t = i as f32 / 48_000.0;
@@ -540,20 +546,25 @@ pub(crate) mod tests {
         let mut samples = encoder.encode(FrameIndex(0), buffer).await.unwrap();
         let drain = encoder.finish().await.unwrap();
         samples.extend(drain.samples);
-        let mut muxer = Mp4Muxer::new(
-            MemorySink::new(),
-            vec![Mp4TrackConfig {
-                encoder: encoder.config().clone(),
-                format: Mp4TrackFormat::Audio { channels: 2 },
-            }],
-            100_000,
-        )
-        .await
-        .unwrap();
+        let track = Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Audio { channels: 2 },
+        };
+        (track, samples, drain.gapless, input)
+    }
+
+    /// A second of 48 kHz stereo encoded by the native Opus encoder, muxed
+    /// into an MP4 with its pre-skip and end trim, and the PCM it was made
+    /// from.
+    pub(crate) async fn opus_mp4() -> (Vec<u8>, Vec<f32>) {
+        let (track, samples, gapless, input) = opus_packets(48_000).await;
+        let mut muxer = Mp4Muxer::new(MemorySink::new(), vec![track], 100_000)
+            .await
+            .unwrap();
         for sample in samples {
             muxer.write_sample(0, sample).await.unwrap();
         }
-        muxer.set_audio_gapless(0, drain.gapless).unwrap();
+        muxer.set_audio_gapless(0, gapless).unwrap();
         (muxer.finish().await.unwrap().into_inner(), input)
     }
 
