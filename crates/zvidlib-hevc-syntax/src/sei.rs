@@ -146,19 +146,19 @@ pub struct ActiveParameterSets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentLightLevelInfo {
     /// `max_content_light_level` (`u(16)`), in candelas per square
-    /// metre (0 ⇒ unknown).
+    /// meter (0 ⇒ unknown).
     pub max_content_light_level: u16,
     /// `max_pic_average_light_level` (`u(16)`), in candelas per square
-    /// metre (0 ⇒ unknown).
+    /// meter (0 ⇒ unknown).
     pub max_pic_average_light_level: u16,
 }
 
-/// The §D.2 `mastering_display_colour_volume` SEI message
+/// The §D.2 `mastering_display_color_volume` SEI message
 /// (`payloadType == 137`): HDR mastering-display metadata (SMPTE
 /// ST 2086 carriage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MasteringDisplayColourVolume {
-    /// `display_primaries_x[ c ]` for the three colour primaries in the
+pub struct MasteringDisplayColorVolume {
+    /// `display_primaries_x[ c ]` for the three color primaries in the
     /// G, B, R order in which they appear on the wire (`u(16)` each).
     pub display_primaries_x: [u16; 3],
     /// `display_primaries_y[ c ]` (`u(16)` each).
@@ -189,7 +189,7 @@ pub struct AlternativeTransferCharacteristics {
 pub struct DecodedPictureHash {
     /// `hash_type` (`u(8)`): 0 ⇒ MD5, 1 ⇒ CRC, 2 ⇒ checksum.
     pub hash_type: u8,
-    /// The per-component hash payload, one entry per colour component
+    /// The per-component hash payload, one entry per color component
     /// in the order they appear on the wire. The interpretation
     /// depends on `hash_type`.
     pub component_hashes: Vec<PictureHash>,
@@ -245,7 +245,7 @@ pub enum SeiPayload {
     /// `payloadType == 132` (suffix SEI).
     DecodedPictureHash(DecodedPictureHash),
     /// `payloadType == 137`.
-    MasteringDisplayColourVolume(MasteringDisplayColourVolume),
+    MasteringDisplayColorVolume(MasteringDisplayColorVolume),
     /// `payloadType == 144`.
     ContentLightLevelInfo(ContentLightLevelInfo),
     /// `payloadType == 147`.
@@ -346,8 +346,8 @@ fn decode_payload(
         (SeiNalType::Suffix, 132) => Ok(SeiPayload::DecodedPictureHash(
             decode_decoded_picture_hash(body)?,
         )),
-        (SeiNalType::Prefix, 137) => Ok(SeiPayload::MasteringDisplayColourVolume(
-            decode_mastering_display_colour_volume(body)?,
+        (SeiNalType::Prefix, 137) => Ok(SeiPayload::MasteringDisplayColorVolume(
+            decode_mastering_display_color_volume(body)?,
         )),
         (SeiNalType::Prefix, 144) => Ok(SeiPayload::ContentLightLevelInfo(
             decode_content_light_level_info(body)?,
@@ -419,9 +419,9 @@ fn decode_content_light_level_info(body: &[u8]) -> Result<ContentLightLevelInfo,
     })
 }
 
-fn decode_mastering_display_colour_volume(
+fn decode_mastering_display_color_volume(
     body: &[u8],
-) -> Result<MasteringDisplayColourVolume, SeiError> {
+) -> Result<MasteringDisplayColorVolume, SeiError> {
     // 3 * (u16 + u16) + u16 + u16 + u32 + u32 = 24 bytes.
     if body.len() < 24 {
         return Err(SeiError::TruncatedPayload { payload_type: 137 });
@@ -442,7 +442,7 @@ fn decode_mastering_display_colour_volume(
     off += 4;
     let min_display_mastering_luminance =
         u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
-    Ok(MasteringDisplayColourVolume {
+    Ok(MasteringDisplayColorVolume {
         display_primaries_x,
         display_primaries_y,
         white_point_x,
@@ -561,7 +561,7 @@ fn decode_user_data_registered(body: &[u8]) -> UserDataRegisteredItuTT35 {
 /// from the NAL header's `nal_unit_type`.
 ///
 /// Per §7.3.5 every message is byte-length-prefixed, so the trailer is
-/// recognised positionally: parsing stops once the only bytes that
+/// recognized positionally: parsing stops once the only bytes that
 /// remain are the `rbsp_trailing_bits()` (a single `0x80` byte, or a
 /// `0x80` followed by zero padding). A buffer of all-zero / empty tail
 /// is also treated as the end of messages.

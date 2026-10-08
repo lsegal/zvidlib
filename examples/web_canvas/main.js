@@ -387,7 +387,7 @@ async function main() {
   // its decode loop, so the decoder is freed part-way through rather than after.
   //
   // Which request it may abort is the first half of tracking the pointer (issue #363). A decode
-  // still on the way to the newest position is work that position needs: cancelling it throws
+  // still on the way to the newest position is work that position needs: canceling it throws
   // the decoder's place away and sends the walk back to a random-access point, so only a step
   // the pointer has already moved *behind* is aborted.
   //
@@ -409,7 +409,7 @@ async function main() {
   let scrubAbort = null;
   // The frame the in-flight decode is for, so a newer target can tell whether it has passed it.
   let scrubStep = null;
-  // Where the last drawn frame left the decoder, or null when a cancelled step left it between
+  // Where the last drawn frame left the decoder, or null when a canceled step left it between
   // frames and the next walk has to start over at a random-access point.
   let scrubPosition = null;
 
@@ -456,7 +456,7 @@ async function main() {
           // An aborted step is the newest position taking over, not a failure, but it stopped the
           // decoder between frames, so the next walk starts from a random-access point rather
           // than from nowhere. Anything else leaves the picture where it is and ends the scrub.
-          if (errorCode(error) !== "CANCELLED") {
+          if (errorCode(error) !== "CANCELED") {
             scrubTarget = null;
             break;
           }

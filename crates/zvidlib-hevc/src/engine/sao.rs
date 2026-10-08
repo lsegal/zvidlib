@@ -9,7 +9,7 @@
 //!   into 32 equal bands; four consecutive bands (starting at
 //!   `sao_band_position`) each get a signed offset added.
 //! * **Edge offset** (`SaoTypeIdx == 2`): each sample is classified by the
-//!   sign pattern of its two neighbours along one of four 1-D directions
+//!   sign pattern of its two neighbors along one of four 1-D directions
 //!   (Table 8-13 `hPos` / `vPos`), giving an `edgeIdx` in 0..=4 that
 //!   selects one of the five offsets.
 //!
@@ -21,12 +21,12 @@
 //!   inheritance of all five SAO arrays from the left / above CTB.
 //! * §8.7.3.1 — the picture-level CTB-grid driver
 //!   ([`apply_sao_picture`]) that visits every CTB and dispatches the
-//!   per-component modification, honouring `slice_sao_luma_flag` /
+//!   per-component modification, honoring `slice_sao_luma_flag` /
 //!   `slice_sao_chroma_flag`.
 //! * §8.7.3.2 — the per-CTB modification process
 //!   ([`apply_sao_ctb`]), both the edge (equations 8-409..8-413) and band
 //!   (equations 8-414..8-415) paths, with the picture-boundary edge
-//!   guard (an out-of-picture neighbour forces `edgeIdx = 0`, i.e. no
+//!   guard (an out-of-picture neighbor forces `edgeIdx = 0`, i.e. no
 //!   offset).
 //!
 //! The cross-slice / cross-tile edge guards of §8.7.3.2 (the
@@ -68,7 +68,7 @@ pub fn eo_pos(eo_class: u8) -> (i32, i32, i32, i32) {
     }
 }
 
-/// One CTB's resolved SAO parameters for a single colour component, after
+/// One CTB's resolved SAO parameters for a single color component, after
 /// merge inheritance and the §7.4.9.3 `SaoOffsetVal` derivation.
 ///
 /// `offset_val[0..5]` is `SaoOffsetVal[cIdx][rx][ry][0..4]` (equation
@@ -147,10 +147,10 @@ impl ResolvedSao {
     }
 
     /// Resolve one CTB's decoded [`SaoCtbParams`] into the applied form,
-    /// inheriting the left / above neighbour's resolved parameters when
+    /// inheriting the left / above neighbor's resolved parameters when
     /// `sao_merge_left_flag` / `sao_merge_up_flag` is set (§7.4.9.3). The
     /// merge sources are the already-resolved CTBs; pass `None` when the
-    /// neighbour is unavailable.
+    /// neighbor is unavailable.
     #[must_use]
     pub fn resolve(
         params: &SaoCtbParams,
@@ -182,17 +182,17 @@ impl ResolvedSao {
     }
 }
 
-/// §8.7.3.2 — apply the SAO CTB modification process for one colour
+/// §8.7.3.2 — apply the SAO CTB modification process for one color
 /// component of one CTB, reading from `rec` and writing into `sao_out`.
 ///
 /// `(x_ctb, y_ctb)` is the component-plane top-left of the CTB; `n_w` /
 /// `n_h` are the CTB width / height in component samples. Out-of-picture
-/// edge-offset neighbours force `edgeIdx = 0` (no modification) per the
+/// edge-offset neighbors force `edgeIdx = 0` (no modification) per the
 /// §8.7.3.2 picture-boundary guard.
 ///
 /// `rec` and `sao_out` may be the same picture when SAO is applied in
 /// place; the edge classification reads `rec` (the pre-SAO array) so an
-/// in-place application is exact only when the neighbour samples have not
+/// in-place application is exact only when the neighbor samples have not
 /// yet been overwritten. For correctness across the whole CTB grid the
 /// driver [`apply_sao_picture`] snapshots the pre-SAO planes.
 #[allow(clippy::too_many_arguments)]
@@ -211,7 +211,7 @@ pub fn apply_sao_ctb(
 
 /// §8.7.3.1 in-loop-filter boundary constraints: the per-CTB slice /
 /// tile identity grids and the across-boundary enable flags the
-/// §8.7.3.2 edge-offset neighbour test consults (a neighbouring sample
+/// §8.7.3.2 edge-offset neighbor test consults (a neighboring sample
 /// in a different slice / tile with filtering-across disabled forces
 /// `edgeIdx = 0`).
 #[derive(Debug, Clone)]
@@ -231,7 +231,7 @@ pub struct SaoBoundaries {
     pub across_tiles: bool,
     /// Per-CTB (raster order) `slice_loop_filter_across_slices_enabled_
     /// flag` of the slice owning each CTB. When present, the §8.7.3.2
-    /// cross-slice rule is evaluated per slice pair: the neighbour read
+    /// cross-slice rule is evaluated per slice pair: the neighbor read
     /// is denied when the LATER slice (decode order) of the two has its
     /// flag equal to 0.
     pub filter_across_of_ctb: Option<Vec<bool>>,
@@ -244,9 +244,9 @@ pub struct SaoBoundaries {
 
 impl SaoBoundaries {
     /// Whether the §8.7.3.2 edge-offset classification may read the
-    /// neighbour at luma position `(x_nb, y_nb)` from the sample at
+    /// neighbor at luma position `(x_nb, y_nb)` from the sample at
     /// luma position `(x, y)`.
-    fn neighbour_allowed(&self, x: usize, y: usize, x_nb: usize, y_nb: usize) -> bool {
+    fn neighbor_allowed(&self, x: usize, y: usize, x_nb: usize, y_nb: usize) -> bool {
         let idx = |xx: usize, yy: usize| {
             (yy >> self.ctb_log2_size_y) * self.pic_w_ctbs + (xx >> self.ctb_log2_size_y)
         };
@@ -280,16 +280,16 @@ impl SaoBoundaries {
         true
     }
 
-    /// Whether every §8.7.3.2 neighbour read from inside the CTB containing
+    /// Whether every §8.7.3.2 neighbor read from inside the CTB containing
     /// luma position `(x_luma, y_luma)` is permitted — that is, the CTB and
-    /// each of its eight neighbours are mutually filterable.
+    /// each of its eight neighbors are mutually filterable.
     ///
     /// The edge-offset classifier reads at most one sample away, so a CTB whose
-    /// whole neighbourhood answers `true` here has no sample the per-sample
-    /// [`Self::neighbour_allowed`] test could deny, and the branch-free
-    /// vector path is bit-exact with the scalar one over it. Neighbours
+    /// whole neighborhood answers `true` here has no sample the per-sample
+    /// [`Self::neighbor_allowed`] test could deny, and the branch-free
+    /// vector path is bit-exact with the scalar one over it. Neighbors
     /// outside the picture are skipped: the §8.7.3.2 picture-boundary guard
-    /// already forces `edgeIdx = 0` there, and both paths honour it.
+    /// already forces `edgeIdx = 0` there, and both paths honor it.
     ///
     /// This is what makes the constraint pay for itself rather than for the
     /// picture. The decoder builds a `SaoBoundaries` unconditionally — it
@@ -297,7 +297,7 @@ impl SaoBoundaries {
     /// — so gating the vector path on `boundaries.is_none()` sent every real
     /// decode down the per-sample scalar path (issue #310).
     #[must_use]
-    pub fn ctb_neighbourhood_unconstrained(&self, x_luma: usize, y_luma: usize) -> bool {
+    pub fn ctb_neighborhood_unconstrained(&self, x_luma: usize, y_luma: usize) -> bool {
         let size = 1usize << self.ctb_log2_size_y;
         let rx = (x_luma >> self.ctb_log2_size_y) as i64;
         let ry = (y_luma >> self.ctb_log2_size_y) as i64;
@@ -312,7 +312,7 @@ impl SaoBoundaries {
                 if nx < 0 || ny < 0 || nx >= w || ny * w + nx >= n_ctbs {
                     continue; // outside the picture: the boundary guard covers it
                 }
-                if !self.neighbour_allowed(
+                if !self.neighbor_allowed(
                     rx as usize * size,
                     ry as usize * size,
                     nx as usize * size,
@@ -327,7 +327,7 @@ impl SaoBoundaries {
 }
 
 /// [`apply_sao_ctb`] with the optional §8.7.3.2 slice / tile boundary
-/// constraints (edge-offset neighbours across a disallowed boundary
+/// constraints (edge-offset neighbors across a disallowed boundary
 /// force `edgeIdx = 0`, i.e. the sample is left unmodified).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_sao_ctb_with_boundaries(
@@ -396,17 +396,17 @@ pub fn apply_sao_ctb_full(
         m.any_in_luma_rect(x_ctb * nf_sw, y_ctb * nf_sh, n_w * nf_sw, n_h * nf_sh)
     });
     // Band offset classifies each sample by its own value alone (equation
-    // 8-414), so it reads no neighbour and no boundary constraint can apply
-    // to it; only edge offset consults the CTB neighbourhood.
+    // 8-414), so it reads no neighbor and no boundary constraint can apply
+    // to it; only edge offset consults the CTB neighborhood.
     let boundary_here = comp.sao_type_idx == 2
         && boundaries
-            .is_some_and(|b| !b.ctb_neighbourhood_unconstrained(x_ctb * nf_sw, y_ctb * nf_sh));
+            .is_some_and(|b| !b.ctb_neighborhood_unconstrained(x_ctb * nf_sw, y_ctb * nf_sh));
     let vectorizable = !boundary_here && !suppression_here && w > 0 && h > 0;
 
     if vectorizable && comp.sao_type_idx == 2 {
         let (h0, v0, h1, v1) = eo_pos(comp.eo_class);
-        // A neighbour outside the picture forces edgeIdx = 0, so only the
-        // x range where both Table 8-13 neighbours are in-picture is
+        // A neighbor outside the picture forces edgeIdx = 0, so only the
+        // x range where both Table 8-13 neighbors are in-picture is
         // modified at all; the margins keep their reconstructed values,
         // which `sao_out` already holds.
         let left_margin = (-(h0.min(h1))).max(0) as usize;
@@ -422,7 +422,7 @@ pub fn apply_sao_ctb_full(
                 let y = (y_ctb + j) as i32;
                 let (y0, y1) = (y + v0, y + v1);
                 if y0 < 0 || y1 < 0 || y0 as usize >= ph || y1 as usize >= ph {
-                    continue; // whole row's neighbours are out of picture
+                    continue; // whole row's neighbors are out of picture
                 }
                 let cur = y as usize * pw + x_lo;
                 let o0 = y0 as usize * pw + (x_lo as i32 + h0) as usize;
@@ -472,14 +472,14 @@ pub fn apply_sao_ctb_full(
                 let n0y = ysj + v0;
                 let n1x = xsi + h1;
                 let n1y = ysj + v1;
-                // §8.7.3.2: a neighbour outside the picture forces
+                // §8.7.3.2: a neighbor outside the picture forces
                 // edgeIdx = 0 (no offset).
                 let in_pic =
                     |x: i32, y: i32| x >= 0 && y >= 0 && (x as usize) < pw && (y as usize) < ph;
                 if !in_pic(n0x, n0y) || !in_pic(n1x, n1y) {
                     continue;
                 }
-                // §8.7.3.2: a neighbour in a different slice / tile with
+                // §8.7.3.2: a neighbor in a different slice / tile with
                 // loop filtering across that boundary disabled also
                 // forces edgeIdx = 0. Positions map to luma space for
                 // the CTB-grid lookup.
@@ -489,8 +489,8 @@ pub fn apply_sao_ctb_full(
                         _ => crate::engine::picture::sub_wh_c(rec.chroma_array_type()),
                     };
                     let (lx, ly) = (xsi as usize * sw, ysj as usize * sh);
-                    if !b.neighbour_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
-                        || !b.neighbour_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
+                    if !b.neighbor_allowed(lx, ly, n0x as usize * sw, n0y as usize * sh)
+                        || !b.neighbor_allowed(lx, ly, n1x as usize * sw, n1y as usize * sh)
                     {
                         continue;
                     }
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn edge_offset_local_minimum_gets_category_1() {
-        // horizontal EO. A sample lower than both horizontal neighbours is a
+        // horizontal EO. A sample lower than both horizontal neighbors is a
         // local minimum: edgeIdx = 2 + Sign(cur-left) + Sign(cur-right)
         // = 2 + (−1) + (−1) = 0 → remapped to category 1, offset_val[1].
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -824,14 +824,14 @@ mod tests {
         apply_sao_ctb(&pic, &mut out, Plane::Luma, &comp, 0, 0, 16, 16);
         // offset_val[1] = +3 (category 1, inferred positive).
         assert_eq!(out.sample(Plane::Luma, 5, 5), 53);
-        // a flat-region sample (cur == both neighbours) ⇒ edgeIdx 2 → 0,
+        // a flat-region sample (cur == both neighbors) ⇒ edgeIdx 2 → 0,
         // offset_val[0] = 0 ⇒ unchanged.
         assert_eq!(out.sample(Plane::Luma, 0, 5), 100);
     }
 
     #[test]
-    fn edge_offset_picture_boundary_neighbour_skips() {
-        // The left column has no left neighbour for horizontal EO ⇒ the
+    fn edge_offset_picture_boundary_neighbor_skips() {
+        // The left column has no left neighbor for horizontal EO ⇒ the
         // §8.7.3.2 boundary guard leaves it unmodified even if it would
         // otherwise classify.
         let mut pic = Picture::new(16, 16, 1, 8, 8);
@@ -844,7 +844,7 @@ mod tests {
         let comp = ResolvedSaoComponent::from_decoded(&edge_component(0, [3, 0, 0, 0]), 0);
         let mut out = pic.clone();
         apply_sao_ctb(&pic, &mut out, Plane::Luma, &comp, 0, 0, 16, 16);
-        // (0,5) has no left neighbour ⇒ unchanged.
+        // (0,5) has no left neighbor ⇒ unchanged.
         assert_eq!(out.sample(Plane::Luma, 0, 5), 50);
     }
 
@@ -890,7 +890,7 @@ mod tests {
     #[test]
     fn edge_offset_classification_reads_presao_snapshot() {
         // A diagonal gradient: SAO must classify each sample against the
-        // PRE-SAO neighbours, not the partially-modified output. Build a
+        // PRE-SAO neighbors, not the partially-modified output. Build a
         // horizontal ramp so each interior sample is monotonic (edgeIdx 0
         // → category 0 → no offset), proving no double-application.
         let mut pic = Picture::new(16, 16, 1, 8, 8);

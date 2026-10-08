@@ -150,7 +150,7 @@ fn snr_db(decoded: &[f32], reference: &[f32]) -> f32 {
 }
 
 /// Holds `decoded` to [`MIN_SNR_DB`] against `reference`, and to agreeing with
-/// it [`MIN_ALIGNMENT_MARGIN_DB`] better than either neighbouring alignment
+/// it [`MIN_ALIGNMENT_MARGIN_DB`] better than either neighboring alignment
 /// does, which is what pins the window boundaries to the sample.
 fn assert_matches_reference(fixture: &Fixture, start: u64, decoded: &[f32], reference: &[f32]) {
     assert_eq!(

@@ -11,7 +11,7 @@ export function makeError(code, message) {
 }
 
 function cancellationError() {
-  return makeError("CANCELLED", "the browser operation was cancelled");
+  return makeError("CANCELED", "the browser operation was canceled");
 }
 
 async function abortable(promise, signal, onAbort) {

@@ -10,7 +10,7 @@
 //!
 //! 1. §8.5.3.2.1 — resolve every prediction unit's motion vectors,
 //!    reference indices and `predFlagLX` from the parsed syntax, gathering
-//!    the spatial merge / MVP neighbours from the *current* picture's
+//!    the spatial merge / MVP neighbors from the *current* picture's
 //!    motion field (built up by the earlier CUs) and the temporal `Col`
 //!    candidate from the collocated picture's motion field
 //!    ([`crate::engine::pu_mv::resolve_cu_motion`]).
@@ -22,7 +22,7 @@
 //!
 //! Intra coding units inside a P / B slice are reconstructed by the §8.4
 //! intra path; the motion field records them as intra so a later inter CU's
-//! §6.4.2 prediction-block availability denies them as motion neighbours.
+//! §6.4.2 prediction-block availability denies them as motion neighbors.
 
 use crate::engine::dpb::{DpbEntry, RefPicLists};
 use crate::engine::inter_pred::{PuWeights, WpListWeights};
@@ -354,7 +354,7 @@ pub fn resolve_and_reconstruct_inter_cu(
         part_mode: cu.part_mode.into(),
     };
     // Issue #189 stage attribution: §8.5.3.2 candidate-list construction is
-    // pointer-chasing over the neighbour motion field rather than arithmetic
+    // pointer-chasing over the neighbor motion field rather than arithmetic
     // over sample arrays, so it is its own stage and not part of `inter_pred`.
     let motions = {
         let _profile = prof_scope(ProfStage::MotionDerive);
@@ -939,7 +939,7 @@ fn reconstruct_inter_leaf_cu(
         cu_delta,
     );
     if slice.deblock_enabled {
-        // Deblocking p-side QPs from the already-stamped neighbour map
+        // Deblocking p-side QPs from the already-stamped neighbor map
         // (§8.7.2.5.3 QpP); the picture boundary rows fall back to the
         // CU's own QP (those edges are not filtered).
         let x0 = cu.x0 as usize;
@@ -1002,8 +1002,8 @@ fn reconstruct_inter_leaf_cu(
             },
         );
         // §8.7.2.4 — mark the intra CU's coded transform blocks (intra
-        // neighbours give bS = 2 regardless, but the cbf flag is read for
-        // an inter-side q neighbour at the shared edge).
+        // neighbors give bS = 2 regardless, but the cbf flag is read for
+        // an inter-side q neighbor at the shared edge).
         if let Some(tree) = cu.transform_tree.as_ref() {
             mark_nonzero_luma(field, tree, cu.x0 as usize, cu.y0 as usize, cu.log2_cb_size);
         }
@@ -1033,7 +1033,7 @@ fn reconstruct_inter_leaf_cu(
             // CuPredMode == MODE_INTER by definition; the z-scan /
             // sameCb steps already guard decode order, so only the
             // earlier-partition region of this CU is ever consulted
-            // (e.g. the §8.5.3.2.7 AMVP neighbours of a 2NxN / Nx2N
+            // (e.g. the §8.5.3.2.7 AMVP neighbors of a 2NxN / Nx2N
             // second partition read the first partition's motion). The
             // pre-CU snapshot below would otherwise report the
             // motion-field background (intra) there.
@@ -1403,7 +1403,7 @@ mod tests {
         }
     }
 
-    /// A merge PU with no spatial / temporal neighbours falls through to the
+    /// A merge PU with no spatial / temporal neighbors falls through to the
     /// §8.5.3.2.5 zero-MV candidate (mvL0 = 0, refIdxL0 = 0), so the PU
     /// reconstructs to the reference picture's co-located samples.
     #[test]
@@ -1429,7 +1429,7 @@ mod tests {
         let cu = inter_cu_16(merge_pu(0), None);
         let mut field = MotionField::new(32, 32);
         let mut pic = Picture::new(32, 32, 1, 8, 8);
-        // No neighbours available (single isolated CU at picture origin).
+        // No neighbors available (single isolated CU at picture origin).
         let available = |_x: i32, _y: i32| false;
         resolve_and_reconstruct_inter_cu(
             &mut pic,
@@ -1714,7 +1714,7 @@ mod tests {
         };
 
         // CTU split into four 16×16 quadrants: the two left quadrants intra
-        // (DC ⇒ mid-grey 128, no neighbours), the two right inter (copy 200).
+        // (DC ⇒ mid-gray 128, no neighbors), the two right inter (copy 200).
         let intra = |x0: u32, y0: u32| CodingUnit {
             x0,
             y0,

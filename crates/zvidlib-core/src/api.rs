@@ -15,7 +15,7 @@ pub enum ErrorKind {
     Io,
     Codec,
     Graphics,
-    Cancelled,
+    Canceled,
     InvalidState,
     Internal,
     /// The operation could not be satisfied without waiting, and the caller asked not to wait.

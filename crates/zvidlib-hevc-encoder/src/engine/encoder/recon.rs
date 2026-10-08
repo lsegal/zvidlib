@@ -63,7 +63,7 @@ const CTB: usize = 1 << CTB_LOG2;
 const CHROMA_ARRAY_TYPE: u8 = 1;
 /// `BitDepthY` / `BitDepthC`.
 const BIT_DEPTH: u8 = 8;
-/// The prediction value of an intra block with no reconstructed neighbours
+/// The prediction value of an intra block with no reconstructed neighbors
 /// available, matching the RDO search's own neutral reference.
 const NEUTRAL_LUMA: i32 = 128;
 
@@ -414,7 +414,7 @@ fn gather_block_prediction(
     }
 }
 
-/// [`reconstruct_block`] for one colour component, over the square `size` x
+/// [`reconstruct_block`] for one color component, over the square `size` x
 /// `size` coding block whose prediction the caller has already gathered.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_component(
@@ -609,7 +609,7 @@ fn deblock_descriptors(width: usize, height: usize, qp: i32) -> Vec<DeblockCuDes
 ///
 /// The residual writer in [`crate::engine::encoder::lossy`] builds its
 /// reconstruction block by block as it codes, because §8.4.4.2.2 intra
-/// prediction reads the neighbouring samples *prior to* the in-loop filter
+/// prediction reads the neighboring samples *prior to* the in-loop filter
 /// process. Deblocking is therefore a whole-picture pass run once the last
 /// coding unit of the picture is coded — the §8.7.1 ordering the decoder
 /// itself uses — and not something interleaved into coding order.
@@ -655,7 +655,7 @@ pub(crate) const SAO_OFFSET_MAX: i32 = 7;
 /// filter, and run after it: §8.7.1 orders SAO behind deblocking, and the
 /// parameter search is only meaningful against the samples SAO will actually
 /// see. Like deblocking it is a whole-picture pass, because §8.4.4.2.2 intra
-/// prediction reads the *unfiltered* neighbours — the grid returned here
+/// prediction reads the *unfiltered* neighbors — the grid returned here
 /// describes the picture's output, never this picture's own prediction input.
 ///
 /// `lambda_q8` is passed through to [`estimate_sao`], which is what makes the
@@ -715,7 +715,7 @@ fn as_picture(recon: &ReconstructedPicture) -> Picture {
 ///   the signalable range with the §7.4.9.3 inferred signs (categories 1 and
 ///   2 positive, 3 and 4 negative);
 /// * the 32 **band-offset** positions, whose four consecutive bands take their
-///   own per-band mean errors, clamped to the same magnitude but signalled
+///   own per-band mean errors, clamped to the same magnitude but signaled
 ///   with a `sao_offset_sign` each, so an offset may point either way.
 ///
 /// Both are the least-squares choice for their type, which is the reason this
@@ -789,7 +789,7 @@ fn estimate_sao(
             // "Off" first and the two merges before the structure, so that a
             // tie is broken towards the cell that codes the least. A merge
             // scoring exactly what the standalone structure scores is the
-            // same trade for this CTB and a cheaper neighbour for the next
+            // same trade for this CTB and a cheaper neighbor for the next
             // one, which is a preference the score itself cannot express
             // because it only sees this CTB.
             let mut best = ResolvedSao::off();
@@ -828,7 +828,7 @@ fn offset_abs_bins(offsets: &[i32; 5]) -> u64 {
         .sum()
 }
 /// The `D + lambda * R` score of one SAO candidate: the SSE reduction it buys
-/// less the §7.3.8.3 syntax it has to be signalled with, in the same units
+/// less the §7.3.8.3 syntax it has to be signaled with, in the same units
 /// the mode decision uses.
 ///
 /// Every bin is priced at the one closed-form multiplier, because `bins` is
@@ -911,19 +911,19 @@ pub(crate) fn cell_bins(cell: &ResolvedSao) -> (u64, u64) {
 }
 
 /// What the writer will really spend on `cell` at this position, given what
-/// its left and above neighbours resolved to: the §7.3.8.3 merge flags
+/// its left and above neighbors resolved to: the §7.3.8.3 merge flags
 /// `code_sao` codes for it, and the structure it codes only when neither
 /// merge fires.
 /// This is the quantity the per-CTB search is scored on, and what a fitted
 /// band-syntax charge used to stand in for. `code_sao` merges on exact
-/// equality of all three components, so a cell equal to a decided neighbour
+/// equality of all three components, so a cell equal to a decided neighbor
 /// costs one flag in place of its whole structure. Edge offset picks one of
-/// four classes and lets §7.4.9.3 infer its signs, so two neighbouring CTBs
+/// four classes and lets §7.4.9.3 infer its signs, so two neighboring CTBs
 /// of one kind of content land on identical parameters routinely; band offset
 /// picks one of 32 positions and four signed offsets per component, so two
-/// neighbours essentially never do. A band component therefore costs its own
+/// neighbors essentially never do. A band component therefore costs its own
 /// syntax *and* the merge it forfeits — for itself, and for whichever
-/// neighbours would have merged with it — and none of that is a bin it codes.
+/// neighbors would have merged with it — and none of that is a bin it codes.
 ///
 /// This is the quantity the per-CTB search is scored on:
 /// [`estimate_sao`] walks the grid in the raster order `code_sao` writes it
@@ -1029,7 +1029,7 @@ fn band_offsets(sums: &[i64; 32], counts: &[i64; 32], band_position: u8) -> (i64
 ///
 /// Gathered whole, rather than alongside the winner as the search finds it,
 /// because the search now scores candidates it did not generate. The two
-/// §7.3.8.3 merges take whatever the left or above neighbour resolved to —
+/// §7.3.8.3 merges take whatever the left or above neighbor resolved to —
 /// any class, any band position, and offsets chosen for a different CTB's
 /// error — so a search that kept only its own candidates' statistics could
 /// not say what a merge buys here.
@@ -1081,7 +1081,7 @@ impl PlaneStats {
                     offset_gain(sums[band], counts[band], component.offset_val[k + 1])
                 })
                 .sum(),
-            // Edge offset: one §8.7.3.2 category per signalled offset, under
+            // Edge offset: one §8.7.3.2 category per signaled offset, under
             // the class the component carries.
             2 => {
                 let (sums, counts) = &self.edge[usize::from(component.eo_class)];
@@ -1291,9 +1291,9 @@ fn edge_stats(
     let samples = pic.plane(plane);
     let (h0, v0, h1, v1) = crate::engine::sao::eo_pos(eo_class);
     // Per §8.7.3.2 category (1..4), the summed and counted error. The
-    // neighbour bounds test is hoisted out of the sample loop and turned into
+    // neighbor bounds test is hoisted out of the sample loop and turned into
     // a row range: a sample is classifiable exactly when both of its
-    // neighbours are inside the plane, and for a fixed class that is a
+    // neighbors are inside the plane, and for a fixed class that is a
     // whole-row condition vertically and a contiguous run horizontally.
     // Everything left in the run is a straight-line accumulation the vector
     // kernel can take whole.
@@ -1466,7 +1466,7 @@ mod tests {
             luma.sao_type_idx
         );
         // Band 12 is where sample 100 lives at 8-bit depth (100 >> 3), and the
-        // four signalled bands wrap the 32-band range from `band_position`.
+        // four signaled bands wrap the 32-band range from `band_position`.
         let position = usize::from(luma.band_position);
         let k = (12 + 32 - position) % 32;
         assert!(
@@ -1844,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_equal_to_a_neighbour_costs_one_merge_flag_instead_of_its_structure() {
+    fn a_cell_equal_to_a_neighbor_costs_one_merge_flag_instead_of_its_structure() {
         // §7.3.8.3's merge, which is the whole of what `coding_bins` exists
         // to price: `code_sao` codes `sao_merge_left_flag` and returns,
         // whatever the structure would have been.
@@ -1855,22 +1855,22 @@ mod tests {
             "a band cell's own structure is not the many bins the merge elides"
         );
 
-        // First CTB of the picture: no neighbour exists, so no flag is coded
+        // First CTB of the picture: no neighbor exists, so no flag is coded
         // and the structure is unavoidable.
         assert_eq!(
             coding_bins(&cell, None, None),
             (structure_mode, structure_band)
         );
-        // Equal to the left neighbour: one flag, and nothing else at all.
+        // Equal to the left neighbor: one flag, and nothing else at all.
         assert_eq!(coding_bins(&cell, Some(cell), None), (1, 0));
-        // Equal to the above neighbour but not the left one: the left flag is
+        // Equal to the above neighbor but not the left one: the left flag is
         // coded as 0 first, then the up flag as 1.
         let other = edge_cell(1, [0, 1, 1, -1, -1]);
         assert_eq!(coding_bins(&cell, Some(other), Some(cell)), (2, 0));
     }
 
     #[test]
-    fn a_cell_that_matches_neither_neighbour_pays_the_flags_it_declines() {
+    fn a_cell_that_matches_neither_neighbor_pays_the_flags_it_declines() {
         // The other side of the same decision, and the one the search was
         // charging nothing for: a cell that cannot merge pays two declined
         // flags on top of its whole structure.

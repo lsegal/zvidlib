@@ -4,7 +4,7 @@
 //! (`vp9_adjust_mask`), then applied a superblock at a time, vertical
 //! edges before horizontal ones and luma before chroma
 //! (`vp9_filter_block_plane_ss00`/`_ss11`). The order matters because
-//! neighbouring edges' filters overlap, so it is kept exactly.
+//! neighboring edges' filters overlap, so it is kept exactly.
 
 use super::tables::UV_TXSIZE_LOOKUP;
 use crate::vp9_simd::{self, SimdIsa, loopfilter::Taps};

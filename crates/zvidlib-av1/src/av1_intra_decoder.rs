@@ -581,9 +581,9 @@ impl<'a> LosslessTileDecoder<'a> {
         Ok(())
     }
 
-    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbors already carry a
     /// transform at least as large as this block's `Max_Tx_Size_Rect`. Every block this decoder
-    /// reconstructs is an unskipped intra block, so the neighbour value is its transform extent.
+    /// reconstructs is an unskipped intra block, so the neighbor value is its transform extent.
     fn tx_depth_context(&self, row: usize, column: usize, max_tx: usize) -> usize {
         let above = row > 0 && usize::from(self.above_tx_width[column]) >= max_tx;
         let left = column > 0 && usize::from(self.left_tx_height[row]) >= max_tx;
@@ -833,7 +833,7 @@ impl<'a> LosslessTileDecoder<'a> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
         // §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero` and before
         // `eob_pt`, so the read happens inside the coefficient loop rather than after it. It is
-        // only signalled for a transform block that actually has nonzero coefficients; a fully
+        // only signaled for a transform block that actually has nonzero coefficients; a fully
         // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
         // inverse transform of an all-zero input is zero for every type.
         let (coefficients, _skipped, tx_type) =
@@ -1024,12 +1024,12 @@ impl<'a> LosslessTileDecoder<'a> {
     }
 
     /// `getTXBSkipCtx` (spec §8.3.2), whose `top`/`left` are the maxima of
-    /// the neighbouring level contexts across the transform block's own
+    /// the neighboring level contexts across the transform block's own
     /// width and height in 4x4 units.
     ///
     /// The specification's first case returns context 0 outright when the
     /// transform covers the whole coding block, without consulting a
-    /// neighbour at all. Every coding block this decoder codes is square,
+    /// neighbor at all. Every coding block this decoder codes is square,
     /// so that is exactly `tx_width == block_width`. It cannot fire on a
     /// lossless stream, whose transforms are all 4x4 while `decode_partition`
     /// never splits below an 8x8 coding block, but it fires constantly once
@@ -1362,7 +1362,7 @@ mod tests {
     ///
     /// Each 8x8 block holds a single 8x8 transform, so the transform covers
     /// the whole coding block and `getTXBSkipCtx` (spec §8.3.2) returns
-    /// context 0 for every one of them without consulting a neighbour - the
+    /// context 0 for every one of them without consulting a neighbor - the
     /// `above_level`/`left_level` recurrence never gets a say.
     fn non_lossless_key_frame_tile(
         base_q_idx: u8,
@@ -1431,13 +1431,13 @@ mod tests {
     /// this crate has a kernel for must reach that kernel from a bitstream.
     ///
     /// The fixture's block (0,0) is the frame's first 8x8 block: `DC_PRED`
-    /// with no neighbours predicts a flat 128, and the tile codes a single
+    /// with no neighbors predicts a flat 128, and the tile codes a single
     /// DC coefficient at level -14, so the block's reconstruction is
     /// exactly `128 + inverse_transform(..., tx_type, ...)` for whichever
-    /// type was signalled. Every loop filter level is 0 so `deblock_frame`
+    /// type was signaled. Every loop filter level is 0 so `deblock_frame`
     /// leaves the raw reconstruction alone.
     #[test]
-    fn every_signalled_intra_transform_type_reconstructs_through_its_kernel() {
+    fn every_signaled_intra_transform_type_reconstructs_through_its_kernel() {
         let limits = Limits::default();
         let mut coefficients = vec![0i32; 64];
         coefficients[0] = -14;
@@ -1495,7 +1495,7 @@ mod tests {
         }
         // Every distinct kernel must produce a distinct block, or the
         // assertions above would pass on a decoder that ignored `tx_type`
-        // entirely - while the same type signalled out of either set must
+        // entirely - while the same type signaled out of either set must
         // reconstruct identically.
         for (index, (tx_type, block)) in seen.iter().enumerate() {
             for (other, earlier) in &seen[..index] {
@@ -1782,7 +1782,7 @@ mod tests {
         // follow the same `set_coefficient_context` recurrence the decoder
         // walks: the coded transform leaves its clamped cumulative level
         // (4) on 4x4 columns/rows 0..8, so the transforms to its right and
-        // below each see exactly one nonzero, greater-than-3 neighbour
+        // below each see exactly one nonzero, greater-than-3 neighbor
         // (context 3), and the last one sees neither (context 1).
         encode_dc_only_transform_block(&mut e, 1, 32, 4);
         for context in [3, 3, 1] {
@@ -1847,7 +1847,7 @@ mod tests {
     }
 
     /// Spec §5.9.17 reads `delta_q_present` for every frame with
-    /// `base_q_idx > 0`, whatever segmentation signalled. Leaving it out
+    /// `base_q_idx > 0`, whatever segmentation signaled. Leaving it out
     /// left every non-lossless header one bit short from `delta_q_params`
     /// onward, which ffmpeg 7.1's dav1d rejects outright
     /// (`zero_bit out of range`) rather than mis-decoding.
@@ -1934,8 +1934,8 @@ mod coefficient_level_tests {
     fn decodes_a_golomb_extended_negative_dc_coefficient() {
         let mut e = SymbolEncoder::new();
         // A 16x16 coding block holding an 8x8 transform, so the transform
-        // does not cover the block and the neighbour-derived skip context 1
-        // (no nonzero neighbour yet) applies.
+        // does not cover the block and the neighbor-derived skip context 1
+        // (no nonzero neighbor yet) applies.
         let qctx = cdf::coeff_qctx(40);
         let tx_ctx = cdf::coeff_tx_size_ctx(8);
         e.symbol(cdf::txb_skip_cdf(qctx, tx_ctx, 1), 0); // not skipped
@@ -1960,7 +1960,7 @@ mod coefficient_level_tests {
 
     /// Spec §8.3.2's `getTXBSkipCtx` returns context 0 outright when the
     /// transform covers the whole coding block, without consulting a
-    /// neighbour. The two calls below decode the same coefficients from
+    /// neighbor. The two calls below decode the same coefficients from
     /// bitstreams that differ only in which `Txb_Skip_Cdf` context coded
     /// the `all_zero` symbol, and each only decodes under the context its
     /// own block geometry selects.
@@ -1991,7 +1991,7 @@ mod coefficient_level_tests {
         assert_eq!(levels[0], 1);
 
         // The same 8x8 transform inside a 16x16 coding block is not
-        // whole-block, so the neighbour-derived context 1 applies instead.
+        // whole-block, so the neighbor-derived context 1 applies instead.
         let bytes = encode(1);
         let mut decoder =
             LosslessTileDecoder::new(&bytes, 16, 16, 4, 4, 40, false, true, &limits).unwrap();

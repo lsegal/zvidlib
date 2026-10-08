@@ -199,7 +199,7 @@ impl VideoDecoder for Vp9Decoder {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("VP9 sample exceeds the allocation limit"));
         }
@@ -253,7 +253,7 @@ impl VideoDecoder for Vp9Decoder {
                 picture
             }
         };
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if !self.output_wanted {
             return Ok(Vec::new());
         }
@@ -277,7 +277,7 @@ impl VideoDecoder for Vp9Decoder {
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         // Every sample is waited for as it is submitted; nothing is held back.
         Ok(Vec::new())
     }
@@ -409,7 +409,7 @@ fn vpcc_atom(configuration: &[u8]) -> Result<Vec<u8>> {
         record.profile,
         record.level,
         (record.bit_depth << 4) | (record.chroma_subsampling << 1),
-        record.colour_primaries,
+        record.color_primaries,
         record.transfer_characteristics,
         record.matrix_coefficients,
         0,
@@ -570,11 +570,11 @@ fn read_picture(decoded: videotoolbox::DecodedFrame, limits: &Limits) -> Result<
     })
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
         Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
+            ErrorKind::Canceled,
+            "codec operation canceled",
         ))
     } else {
         Ok(())

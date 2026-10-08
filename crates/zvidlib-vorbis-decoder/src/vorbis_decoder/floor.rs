@@ -427,7 +427,7 @@ struct Floor1Setup {
     floor1_x_list: Vec<u32>,
     // Precomputed x-list sort order.
     floor1_x_list_sort_order: Vec<u8>,
-    // Precomputed x-list neighbours.
+    // Precomputed x-list neighbors.
     floor1_x_list_neighbors: Vec<(usize, usize)>,
 }
 
@@ -579,7 +579,7 @@ impl Floor1 {
         self.floor_final_y[1] = self.floor_y[1] as i32;
 
         for i in 2..self.setup.floor1_x_list.len() {
-            // Find the neighbours.
+            // Find the neighbors.
             let (low_neighbor_offset, high_neighbor_offset) = self.setup.floor1_x_list_neighbors[i];
 
             let predicted = render_point(

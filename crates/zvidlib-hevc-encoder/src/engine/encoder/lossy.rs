@@ -25,11 +25,11 @@
 //! Every coding unit carries the intra luma mode
 //! `crate::engine::encoder::rdo::decide_intra_luma_mode` picked for it
 //! out of all 35 Table 8-1 directions, searched against the same reference
-//! samples the block is then coded from, and signalled per §7.3.8.5: a
+//! samples the block is then coded from, and signaled per §7.3.8.5: a
 //! `prev_intra_luma_pred_flag == 1` plus `mpm_idx` when the mode is in the
 //! §8.4.2 candidate list, and `rem_intra_luma_pred_mode` otherwise. The
 //! candidate list is derived from the left coding unit's mode, since the above
-//! neighbour of a CU that fills its CTB always lies in the CTB row above and
+//! neighbor of a CU that fills its CTB always lies in the CTB row above and
 //! §8.4.2 reduces it to `INTRA_DC`. Chroma stays at
 //! `intra_chroma_pred_mode == 4`, so it is predicted with the luma mode too.
 //!
@@ -41,7 +41,7 @@
 //! `write_idr_residual_slice` returns is still exactly what a decoder holds.
 //! It runs as a whole-picture pass after the last coding unit is coded rather
 //! than interleaved into coding order, because §8.4.4.2.2 intra prediction
-//! reads its neighbouring samples *prior to* the in-loop filter process — the
+//! reads its neighboring samples *prior to* the in-loop filter process — the
 //! filtered samples are the picture's output and the next picture's reference,
 //! never this picture's own prediction input. See
 //! `crate::engine::encoder::recon::deblock_reconstruction`.
@@ -63,10 +63,10 @@
 //!
 //! ## Why SAO is on, and when the writer turns it off again
 //!
-//! SAO is not free the way deblocking is: deblocking is signalled once in the
+//! SAO is not free the way deblocking is: deblocking is signaled once in the
 //! PPS, while SAO costs a `sao( )` structure on *every* CTB, including every
 //! CTB it does nothing to. So the decision is taken twice. Per CTB, a class
-//! is signalled only when the squared error it removes clears the §9.3.3 bins
+//! is signaled only when the squared error it removes clears the §9.3.3 bins
 //! it would be coded with, under the same `D + lambda * R` and the same
 //! closed-form `rdo::lambda_q8` the mode search uses — inside a picture
 //! already committed to the syntax, that is a choice between two codings of
@@ -121,18 +121,18 @@
 //! Those band-only bins carry no charge of their own any more. The per-CTB
 //! search is given `coding_bins` itself, so
 //! every candidate is scored at what `code_sao` will really write for it —
-//! one §7.3.8.3 merge flag when the cell equals a decided neighbour, and the
+//! one §7.3.8.3 merge flag when the cell equals a decided neighbor, and the
 //! declined flags plus the whole structure when it does not — and the two
 //! merges are candidates of the search in their own right rather than
 //! something it discovers by accident.
 //! What the fitted 2.5x used to stand in for was exactly that merge: edge
 //! offset picks one of four classes with §7.4.9.3 inferring its signs, so
-//! neighbours agree often, while band offset picks one of 32 positions and
+//! neighbors agree often, while band offset picks one of 32 positions and
 //! four signed offsets per component, so they essentially never do and taking
 //! one costs whole structures at CTBs that were about to cost a flag.
 //! Counting the merge is strictly better than a constant priced in its place,
 //! because how much merge a band component destroys is a property of how much
-//! its neighbours agreed with each other, which is content and not rate — the
+//! its neighbors agreed with each other, which is content and not rate — the
 //! per-QP ratio the constant averaged ran 0.50x to 4.00x.
 //!
 //! Pricing SAO correctly makes it cheaper, and #400 is where the slice-level
@@ -204,7 +204,7 @@ const BIT_DEPTH: u8 = 8;
 /// `ChromaArrayType` — 4:2:0, the only format this writer emits.
 const CHROMA_ARRAY_TYPE: u8 = 1;
 /// `INTRA_DC` (Table 8-1 mode 1) — the §8.4.2 substitute for an unavailable
-/// neighbour's mode.
+/// neighbor's mode.
 const INTRA_DC: u8 = 1;
 /// How many of the rough-mode-decision's ranked modes are re-scored on their
 /// actual quantized reconstruction. Four covers the planar / DC / horizontal /
@@ -223,14 +223,14 @@ const QP_RANGE: core::ops::RangeInclusive<i32> = 0..=51;
 enum ModeSearch {
     /// The fixed-QP operating point: [`shortlist_intra_luma_modes`] over all
     /// 35 luma modes, re-scored on the quantized reconstruction against the
-    /// mode's own signalling only, and the §8.4.3 chroma mode picked the same
+    /// mode's own signaling only, and the §8.4.3 chroma mode picked the same
     /// way. With no bitrate to hit, the writer's job at a given QP is the
     /// closest picture, so the residual's own rate is left out of the cost.
     Rdo,
     /// The rate-constrained operating point: the same search, with the
     /// residual's estimated rate ([`residual_rate_bits`]) added to each
     /// candidate's rate term, so the decision minimizes the full
-    /// `D + lambda * R` rather than distortion against signalling alone.
+    /// `D + lambda * R` rather than distortion against signaling alone.
     ///
     /// This is what a rate-controlled encoder needs, and what the public
     /// factory's target-bitrate operating point codes at: with a bitrate to
@@ -238,7 +238,7 @@ enum ModeSearch {
     /// spend somewhere they buy more.
     RateDistortion,
     /// Every coding unit pinned to `INTRA_DC` with chroma derived from it —
-    /// the writer's behaviour before the mode search, kept as the baseline the
+    /// the writer's behavior before the mode search, kept as the baseline the
     /// search is measured against.
     #[cfg(test)]
     DcOnly,
@@ -246,7 +246,7 @@ enum ModeSearch {
 
 impl ModeSearch {
     /// Whether the second-pass cost charges each candidate for the bins its
-    /// own residual would code, on top of the mode signalling.
+    /// own residual would code, on top of the mode signaling.
     fn charges_residual_rate(self) -> bool {
         self == ModeSearch::RateDistortion
     }
@@ -283,7 +283,7 @@ impl LoopFilter {
     }
 }
 
-/// One colour component's geometry inside the picture being coded.
+/// One color component's geometry inside the picture being coded.
 #[derive(Clone, Copy)]
 struct Plane<'a> {
     source: &'a [u8],
@@ -402,7 +402,7 @@ fn encode_idr_residual_au_at(
 struct CtbRecord {
     /// `IntraPredModeY`.
     mode: u8,
-    /// The §8.4.2 `candModeList` the mode is signalled against.
+    /// The §8.4.2 `candModeList` the mode is signaled against.
     candidates: [u8; 3],
     /// `intra_chroma_pred_mode`, a Table 9-46 value.
     chroma_mode: u8,
@@ -414,7 +414,7 @@ struct CtbRecord {
 /// the committed decisions with the unfiltered reconstruction they built.
 ///
 /// Split out of [`write_idr_residual_slice`] because it is also what a curve
-/// point costs: [`curve_point`] runs it at a neighbouring QP to measure the
+/// point costs: [`curve_point`] runs it at a neighboring QP to measure the
 /// slope the SAO decision is taken against, and the bitstream pass and the
 /// in-loop filters are no part of that measurement.
 fn run_decision_pass(
@@ -446,7 +446,7 @@ fn run_decision_pass(
 
     // ---- the decision pass: search every coding unit and reconstruct it ----
     // `IntraPredModeY` of the coding unit coded immediately before this one,
-    // which is the left neighbour whenever there is one.
+    // which is the left neighbor whenever there is one.
     let mut left_mode = INTRA_DC;
     let mut records: Vec<CtbRecord> = Vec::with_capacity(total);
     for addr in 0..total {
@@ -454,13 +454,13 @@ fn run_decision_pass(
         let y0 = (addr / ctbs_x) * CTB;
 
         // §8.4.2 step 2: candIntraPredModeB is INTRA_DC for every coding unit
-        // here, because one CU fills the CTB and so the above neighbour always
+        // here, because one CU fills the CTB and so the above neighbor always
         // lies in the CTB row above. candIntraPredModeA is the left CU's mode,
         // reduced to INTRA_DC at the left picture edge where it is unavailable.
         let cand_a = if x0 > 0 { left_mode } else { INTRA_DC };
         let candidates = intra_luma_cand_mode_list(cand_a, INTRA_DC);
 
-        // The mode search reads the same partially reconstructed neighbours
+        // The mode search reads the same partially reconstructed neighbors
         // the block is then coded from, so the winning mode's prediction is
         // exactly the one the reconstruction below is built on.
         let luma_plane = Plane {
@@ -699,16 +699,16 @@ impl SaoWriter<'_> {
 /// §8.7.3 pass filtered the reconstruction with.
 ///
 /// A CTB whose resolved parameters are exactly its left (or above)
-/// neighbour's codes one merge flag in place of the whole structure. Merging
+/// neighbor's codes one merge flag in place of the whole structure. Merging
 /// is taken only on exact equality of all three components, so what a decoder
 /// resolves out of the bitstream is the grid the encoder filtered with, CTB
-/// for CTB — and that covers the common case of two neighbouring CTBs which
+/// for CTB — and that covers the common case of two neighboring CTBs which
 /// both left SAO off, which is the whole of what an unfiltered CTB pays.
 fn code_sao(sink: &mut SaoWriter<'_>, grid: &[ResolvedSao], addr: usize, ctbs_x: usize) {
     let (rx, ry) = (addr % ctbs_x, addr / ctbs_x);
     let here = grid[addr];
     // The §7.3.8.3 presence conditions: one slice and one tile fill the
-    // picture, so a neighbour inside the picture is always a legal merge
+    // picture, so a neighbor inside the picture is always a legal merge
     // source.
     let left = (rx > 0).then(|| grid[addr - 1]);
     let above = (ry > 0).then(|| grid[addr - ctbs_x]);
@@ -1028,7 +1028,7 @@ fn keeps_sao(
 /// one CTB at one QP, where the picture cancels out of the comparison, and
 /// that is what choosing an edge class or a band position is. It is the wrong
 /// one for §7.3.8.3's merge, which is not a choice between two codings of a
-/// CTB at all: taking a neighbour's parameters gives up distortion to spend
+/// CTB at all: taking a neighbor's parameters gives up distortion to spend
 /// fewer bits on the *slice*, which is the same trade [`keeps_sao`] makes and
 /// the one #287 measured the closed form wrong for by 0.4x to 2.5x. Priced at
 /// the closed form the search takes merges that cost #274's operating points
@@ -1220,7 +1220,7 @@ fn reachable_sse(fine: CurvePoint, coarse: CurvePoint, qp: i32, sao_bits: u64) -
 /// Only the first is measured. `measure_sao_acceptance_precision` quantifies
 /// the second by holding a rung of the ladder
 /// [`super::tests::sao_curve_offsets`] interpolates out and predicting it from
-/// its neighbours, and the answer is that the extrapolation is wrong by tens
+/// its neighbors, and the answer is that the extrapolation is wrong by tens
 /// of percent of the distortion it predicts: worst 50% on noise 128x96, 20%
 /// on both smooth pictures, and 196% on noise 64x48, where one quantizer step
 /// is only tens of bits wide and byte rounding is most of the step. In the
@@ -1381,7 +1381,7 @@ fn picture_sse(recon: &ReconstructedPicture, y: &[u8], cb: &[u8], cr: &[u8]) -> 
 /// re-scored on what each mode actually costs after quantization: the
 /// reconstruction's squared error against the source, traded against the rate
 /// the operating point charges. At [`ModeSearch::Rdo`] that rate is the mode's
-/// own §7.3.8.5 signalling only — this writer has no bitrate target, so its
+/// own §7.3.8.5 signaling only — this writer has no bitrate target, so its
 /// job at a given QP is the closest picture, and a better prediction shrinks
 /// the residual on its own. At [`ModeSearch::RateDistortion`] the residual's
 /// own estimated bins join it, which is the cost a rate-controlled encoder
@@ -1450,7 +1450,7 @@ fn decide_luma_mode(
 ///
 /// One syntax element covers both chroma blocks, so the five Table 9-46 values
 /// are scored on the pair's joint squared error, against the same rate term
-/// [`decide_luma_mode`] uses at this operating point — the mode signalling
+/// [`decide_luma_mode`] uses at this operating point — the mode signaling
 /// alone, or that plus both blocks' residual bins. Value 4 (`IntraPredModeC == IntraPredModeY`) is one of them, so this
 /// can only improve on deriving chroma from luma unconditionally — which
 /// matters here because the luma mode is chosen on luma alone and the chroma
@@ -1471,8 +1471,8 @@ fn decide_chroma_mode(
         .iter()
         .map(|plane| reference_samples(plane, planes[0].0.width, planes[0].0.height, cx, cy, n_tbs))
         .collect();
-    let code = |signalled: u8| {
-        let mode = derive_intra_pred_mode_c(signalled, luma_mode, false);
+    let code = |signaled: u8| {
+        let mode = derive_intra_pred_mode_c(signaled, luma_mode, false);
         let coded: Vec<CodedBlock> = planes
             .iter()
             .zip(&refs)
@@ -1499,9 +1499,9 @@ fn decide_chroma_mode(
 
     let lambda = u64::from(lambda_q8(qp));
     let mut best: Option<(u64, u8, [CodedBlock; 2])> = None;
-    for signalled in 0..=CHROMA_MODE_DERIVED {
-        let coded = code(signalled);
-        let bits = u64::from(chroma_mode_bit_cost(signalled))
+    for signaled in 0..=CHROMA_MODE_DERIVED {
+        let coded = code(signaled);
+        let bits = u64::from(chroma_mode_bit_cost(signaled))
             + coded
                 .iter()
                 .map(|block| residual_rate(search, &block.levels, CTB_LOG2 - 1, true))
@@ -1516,17 +1516,17 @@ fn decide_chroma_mode(
             .as_ref()
             .is_none_or(|(best_cost, ..)| cost < *best_cost)
         {
-            best = Some((cost, signalled, coded));
+            best = Some((cost, signaled, coded));
         }
     }
-    let (_, signalled, coded) = best.expect("value 4 is always evaluated");
-    (signalled, coded)
+    let (_, signaled, coded) = best.expect("value 4 is always evaluated");
+    (signaled, coded)
 }
 
 /// §9.3.3.8 bin count for one `intra_chroma_pred_mode`: the single bin for
 /// value 4, or that bin plus the two FL bypass bins for 0..=3.
-fn chroma_mode_bit_cost(signalled: u8) -> u32 {
-    if signalled == CHROMA_MODE_DERIVED {
+fn chroma_mode_bit_cost(signaled: u8) -> u32 {
+    if signaled == CHROMA_MODE_DERIVED {
         1
     } else {
         3
@@ -1913,12 +1913,12 @@ mod tests {
         assert_eq!(dy, recon.y);
         assert_eq!(dcb, recon.cb);
         assert_eq!(dcr, recon.cr);
-        // The first block has no neighbours, so it predicts 128 and codes the
-        // difference; every later block predicts its neighbour exactly.
+        // The first block has no neighbors, so it predicts 128 and codes the
+        // difference; every later block predicts its neighbor exactly.
         assert!(recon.y[width * height - 1].abs_diff(120) <= 1);
     }
 
-    /// The writer's pre-RDO behaviour: the same coding loop with every mode
+    /// The writer's pre-RDO behavior: the same coding loop with every mode
     /// pinned to `INTRA_DC` and chroma derived from it.
     fn dc_only(
         y: &[u8],
@@ -2788,7 +2788,7 @@ mod tests {
         // distortion it predicts than any margin the rule decides on, so
         // nothing is gained by putting a tolerance around the comparison.
         //
-        // Predicting a held-out rung from its neighbours is the model doing
+        // Predicting a held-out rung from its neighbors is the model doing
         // its own job with a known answer, and it is an easier job than the
         // shipped one on both counts - a chord over two quantizer steps read
         // one step from its anchor, where the writer's is over one step read a

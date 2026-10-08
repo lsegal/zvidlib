@@ -1,13 +1,13 @@
 //! Picture Parameter Set (PPS) parser per ITU-T Rec. H.265 §7.3.2.3.1.
 //!
 //! Round-5 scope: parse the general `pic_parameter_set_rbsp()` body
-//! through `pps_extension_present_flag`, materialising every field of
+//! through `pps_extension_present_flag`, materializing every field of
 //! the §7.3.2.3.1 syntax table including the tiles block
 //! (`num_tile_columns_minus1` / `num_tile_rows_minus1` /
 //! `uniform_spacing_flag` and, when `uniform_spacing_flag == 0`, the
 //! `column_width_minus1[]` / `row_height_minus1[]` arrays) and the
 //! deblocking-filter-control block. The §7.4.3.3.1 inference rules for
-//! the conditionally-signalled fields are applied so the parsed struct
+//! the conditionally-signaled fields are applied so the parsed struct
 //! always carries the effective value.
 //!
 //! One body is parsed via the shared `scaling_list` module; one is
@@ -253,7 +253,7 @@ pub struct PpsExtensionFlags {
     /// `pps_extension_data_flag` while-loop it gates, so the parser
     /// surfaces the value verbatim. The trailing
     /// `while( more_rbsp_data() ) pps_extension_data_flag` block (only
-    /// signalled when this field is non-zero) is surfaced inside the
+    /// signaled when this field is non-zero) is surfaced inside the
     /// opaque tail.
     pub pps_extension_4bits: u8,
 }
@@ -273,7 +273,7 @@ impl PpsExtensionFlags {
     }
 
     /// True when the `pps_scc_extension()` body can be decoded in
-    /// place — it is signalled and no still-opaque body
+    /// place — it is signaled and no still-opaque body
     /// (`pps_multilayer_extension()` / `pps_3d_extension()`) precedes it
     /// in the bit stream. When a multilayer / 3D body precedes it, the
     /// SCC body stays inside the opaque tail.
@@ -423,27 +423,27 @@ pub struct PpsSccExtension {
     /// the PPS may appear in one of its own slices' reference picture
     /// lists (intra block copy at the picture level).
     pub pps_curr_pic_ref_enabled_flag: bool,
-    /// `residual_adaptive_colour_transform_enabled_flag` — when 1, the
-    /// adaptive colour transform may be applied to residuals.
-    pub residual_adaptive_colour_transform_enabled_flag: bool,
+    /// `residual_adaptive_color_transform_enabled_flag` — when 1, the
+    /// adaptive color transform may be applied to residuals.
+    pub residual_adaptive_color_transform_enabled_flag: bool,
     /// `pps_slice_act_qp_offsets_present_flag` — present only when
-    /// `residual_adaptive_colour_transform_enabled_flag`; when 1, the
+    /// `residual_adaptive_color_transform_enabled_flag`; when 1, the
     /// `slice_act_*_qp_offset` fields are present in slice headers.
     pub pps_slice_act_qp_offsets_present_flag: bool,
     /// `pps_act_y_qp_offset_plus5` (`se(v)`), present only when
-    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `residual_adaptive_color_transform_enabled_flag`.
     /// `PpsActQpOffsetY = value − 5` (eq. 7-39).
     pub pps_act_y_qp_offset_plus5: i32,
     /// `pps_act_cb_qp_offset_plus5` (`se(v)`), present only when
-    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `residual_adaptive_color_transform_enabled_flag`.
     /// `PpsActQpOffsetCb = value − 5` (eq. 7-40).
     pub pps_act_cb_qp_offset_plus5: i32,
     /// `pps_act_cr_qp_offset_plus3` (`se(v)`), present only when
-    /// `residual_adaptive_colour_transform_enabled_flag`.
+    /// `residual_adaptive_color_transform_enabled_flag`.
     /// `PpsActQpOffsetCr = value − 3` (eq. 7-41).
     pub pps_act_cr_qp_offset_plus3: i32,
     /// `pps_palette_predictor_initializers_present_flag` — when 1, the
-    /// picture palette predictor is initialised from
+    /// picture palette predictor is initialized from
     /// [`Self::pps_palette_predictor_initializer`].
     pub pps_palette_predictor_initializers_present_flag: bool,
     /// `pps_num_palette_predictor_initializers` (`ue(v)`), present only
@@ -462,7 +462,7 @@ pub struct PpsSccExtension {
     pub chroma_bit_depth_entry_minus8: u32,
     /// `pps_palette_predictor_initializer[comp][i]` (§7.3.2.3.3),
     /// indexed `[comp][i]`. `comp` runs over `numComps`. Empty when no
-    /// initializers are signalled.
+    /// initializers are signaled.
     pub pps_palette_predictor_initializer: Vec<Vec<u32>>,
 }
 
@@ -473,12 +473,12 @@ impl PpsSccExtension {
     /// `chroma_bit_depth_entry_minus8`, so no SPS context is needed.
     fn parse(br: &mut BitReader) -> Result<Self, PpsError> {
         let pps_curr_pic_ref_enabled_flag = br.u1()? != 0;
-        let residual_adaptive_colour_transform_enabled_flag = br.u1()? != 0;
+        let residual_adaptive_color_transform_enabled_flag = br.u1()? != 0;
         let mut pps_slice_act_qp_offsets_present_flag = false;
         let mut pps_act_y_qp_offset_plus5 = 0i32;
         let mut pps_act_cb_qp_offset_plus5 = 0i32;
         let mut pps_act_cr_qp_offset_plus3 = 0i32;
-        if residual_adaptive_colour_transform_enabled_flag {
+        if residual_adaptive_color_transform_enabled_flag {
             pps_slice_act_qp_offsets_present_flag = br.u1()? != 0;
             pps_act_y_qp_offset_plus5 = br.se()?;
             pps_act_cb_qp_offset_plus5 = br.se()?;
@@ -569,7 +569,7 @@ impl PpsSccExtension {
         }
         Ok(Self {
             pps_curr_pic_ref_enabled_flag,
-            residual_adaptive_colour_transform_enabled_flag,
+            residual_adaptive_color_transform_enabled_flag,
             pps_slice_act_qp_offsets_present_flag,
             pps_act_y_qp_offset_plus5,
             pps_act_cb_qp_offset_plus5,
@@ -631,7 +631,7 @@ pub struct PicParameterSet {
     /// `transform_skip_enabled_flag`.
     pub transform_skip_enabled_flag: bool,
     /// `cu_qp_delta_enabled_flag`. When set, [`Self::diff_cu_qp_delta_depth`]
-    /// is signalled; otherwise it is inferred to 0.
+    /// is signaled; otherwise it is inferred to 0.
     pub cu_qp_delta_enabled_flag: bool,
     /// `diff_cu_qp_delta_depth` (`ue(v)`). Inferred to 0 when
     /// `cu_qp_delta_enabled_flag` is false (§7.4.3.3.1).
@@ -649,7 +649,7 @@ pub struct PicParameterSet {
     /// `transquant_bypass_enabled_flag`.
     pub transquant_bypass_enabled_flag: bool,
     /// `tiles_enabled_flag`. When set, [`Self::tiles`] carries the
-    /// signalled values; otherwise it carries the §7.4.3.3.1 inferred
+    /// signaled values; otherwise it carries the §7.4.3.3.1 inferred
     /// single-tile values.
     pub tiles_enabled_flag: bool,
     /// `entropy_coding_sync_enabled_flag`.
@@ -707,12 +707,12 @@ pub struct PicParameterSet {
     /// `pps_extension_present_flag == 1` **and**
     /// [`PpsExtensionFlags::has_body`] is true on the decoded flags
     /// — the bit position recorded inside the tail is the start of
-    /// the first signalled extension body (`pps_range_extension()`
+    /// the first signaled extension body (`pps_range_extension()`
     /// if `pps_range_extension_flag`, otherwise the next set flag's
     /// body, otherwise the `pps_extension_data_flag` while-loop). The
     /// individual extension-body syntax structures are not yet
     /// decoded. `None` when the PPS ended cleanly after the flag
-    /// block (no extension body is signalled and only
+    /// block (no extension body is signaled and only
     /// `rbsp_trailing_bits()` remains; consumed implicitly) or when
     /// `pps_extension_present_flag == 0`.
     pub opaque_tail: Option<OpaqueTail>,
@@ -940,7 +940,7 @@ impl PicParameterSet {
                     pps_scc_extension_flag,
                     pps_extension_4bits,
                 };
-                // §7.3.2.3.1: the range extension (if signalled) is the
+                // §7.3.2.3.1: the range extension (if signaled) is the
                 // first body to follow the eight typed flag bits, so decode
                 // it in full. Its leading
                 // log2_max_transform_skip_block_size_minus2 is present only
@@ -1383,7 +1383,7 @@ mod tests {
 
     /// `pps_scc_extension()` (§7.3.2.3.3) with no preceding
     /// range/multilayer/3D body: the body is decoded in place with no
-    /// opaque tail. Adaptive colour transform off, palette initializers
+    /// opaque tail. Adaptive color transform off, palette initializers
     /// absent — only the leading flag and the two trailing flags.
     #[test]
     fn decodes_pps_scc_extension_minimal() {
@@ -1396,7 +1396,7 @@ mod tests {
         bits += "0000"; // pps_extension_4bits = 0
         // pps_scc_extension():
         bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
-        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // residual_adaptive_color_transform_enabled_flag = 0
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
         while bits.len() % 8 != 0 {
@@ -1409,13 +1409,13 @@ mod tests {
         assert!(pps.opaque_tail.is_none());
         let scc = pps.pps_scc_extension.expect("scc extension body");
         assert!(scc.pps_curr_pic_ref_enabled_flag);
-        assert!(!scc.residual_adaptive_colour_transform_enabled_flag);
+        assert!(!scc.residual_adaptive_color_transform_enabled_flag);
         assert!(!scc.pps_palette_predictor_initializers_present_flag);
         assert!(scc.pps_palette_predictor_initializer.is_empty());
     }
 
     /// `pps_scc_extension()` with
-    /// `residual_adaptive_colour_transform_enabled_flag == 1` decodes the
+    /// `residual_adaptive_color_transform_enabled_flag == 1` decodes the
     /// `pps_slice_act_qp_offsets_present_flag` and the three
     /// `pps_act_*_qp_offset_*` se(v) fields (§7.3.2.3.3).
     #[test]
@@ -1426,7 +1426,7 @@ mod tests {
         bits += "0000"; // pps_extension_4bits = 0
         // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
-        bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
+        bits += "1"; // residual_adaptive_color_transform_enabled_flag = 1
         bits += "1"; // pps_slice_act_qp_offsets_present_flag = 1
         bits += "010"; // pps_act_y_qp_offset_plus5 = +1 (se '010')
         bits += "011"; // pps_act_cb_qp_offset_plus5 = -1 (se '011')
@@ -1441,7 +1441,7 @@ mod tests {
         assert!(pps.opaque_tail.is_none());
         let scc = pps.pps_scc_extension.expect("scc extension body");
         assert!(!scc.pps_curr_pic_ref_enabled_flag);
-        assert!(scc.residual_adaptive_colour_transform_enabled_flag);
+        assert!(scc.residual_adaptive_color_transform_enabled_flag);
         assert!(scc.pps_slice_act_qp_offsets_present_flag);
         assert_eq!(scc.pps_act_y_qp_offset_plus5, 1);
         assert_eq!(scc.pps_act_cb_qp_offset_plus5, -1);
@@ -1463,7 +1463,7 @@ mod tests {
         bits += "0000"; // pps_extension_4bits = 0
         // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
-        bits += "1"; // residual_adaptive_colour_transform_enabled_flag = 1
+        bits += "1"; // residual_adaptive_color_transform_enabled_flag = 1
         bits += "0"; // pps_slice_act_qp_offsets_present_flag = 0
         // pps_act_y_qp_offset_plus5 = +30 (se → codeNum 59,
         // ue '00000111100') → PpsActQpOffsetY = 25 > 12,
@@ -1500,7 +1500,7 @@ mod tests {
         bits += "0000"; // pps_extension_4bits = 0
         // pps_scc_extension():
         bits += "0"; // pps_curr_pic_ref_enabled_flag = 0
-        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // residual_adaptive_color_transform_enabled_flag = 0
         bits += "1"; // pps_palette_predictor_initializers_present_flag = 1
         bits += "011"; // pps_num_palette_predictor_initializers = 2 (ue)
         bits += "0"; // monochrome_palette_flag = 0 → numComps = 3
@@ -1553,7 +1553,7 @@ mod tests {
         bits += "1"; // log2_sao_offset_scale_chroma = 0 (ue)
         // pps_scc_extension():
         bits += "1"; // pps_curr_pic_ref_enabled_flag = 1
-        bits += "0"; // residual_adaptive_colour_transform_enabled_flag = 0
+        bits += "0"; // residual_adaptive_color_transform_enabled_flag = 0
         bits += "0"; // pps_palette_predictor_initializers_present_flag = 0
         bits += "1"; // rbsp_trailing_bits stop bit
         while bits.len() % 8 != 0 {
@@ -1864,7 +1864,7 @@ mod tests {
         bits += "1"; // init_qp_minus26 = 0 (se '1')
         bits += "0"; // constrained_intra_pred_flag
         bits += "0"; // transform_skip_enabled_flag
-        bits += "0"; // cu_qp_delta_enabled_flag = 0 (depth not signalled)
+        bits += "0"; // cu_qp_delta_enabled_flag = 0 (depth not signaled)
         bits += "1"; // pps_cb_qp_offset = 0 (se '1')
         bits += "1"; // pps_cr_qp_offset = 0 (se '1')
         bits += "0"; // pps_slice_chroma_qp_offsets_present_flag

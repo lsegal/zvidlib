@@ -109,8 +109,8 @@ impl AudioDecoder for NativeOpusDecoder {
         sample: &EncodedAudioSample,
         cancellation: &CancellationToken,
     ) -> Result<AudioBuffer> {
-        if cancellation.is_cancelled() {
-            return Err(Error::new(ErrorKind::Cancelled, "Opus decode cancelled"));
+        if cancellation.is_canceled() {
+            return Err(Error::new(ErrorKind::Canceled, "Opus decode canceled"));
         }
         let decoded = match &mut self.backend {
             DecoderBackend::Single(decoder) => {

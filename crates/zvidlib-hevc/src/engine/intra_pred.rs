@@ -1,7 +1,7 @@
 //! §8.4.4.2 — intra sample prediction (reference-sample substitution,
-//! neighbour-sample filtering, and the planar / DC / angular predictors).
+//! neighbor-sample filtering, and the planar / DC / angular predictors).
 //!
-//! This module turns the `nTbS * 4 + 1` neighbouring samples
+//! This module turns the `nTbS * 4 + 1` neighboring samples
 //! `p[ x ][ y ]` (with `x = −1, y = −1..nTbS * 2 − 1` and
 //! `x = 0..nTbS * 2 − 1, y = −1`) of one transform block — the
 //! constructed samples *prior to* the deblocking filter, together with
@@ -13,11 +13,11 @@
 //!
 //! * §8.4.4.2.2 **reference sample substitution**
 //!   ([`substitute_reference_samples`]) — fills every sample marked "not
-//!   available for intra prediction" from its neighbours (the
+//!   available for intra prediction" from its neighbors (the
 //!   bottom-left-to-top-right sweep of the ordered steps), substituting
-//!   the mid-level `1 << ( bitDepth − 1 )` only when *every* neighbour is
+//!   the mid-level `1 << ( bitDepth − 1 )` only when *every* neighbor is
 //!   unavailable.
-//! * §8.4.4.2.3 **filtering of neighbouring samples**
+//! * §8.4.4.2.3 **filtering of neighboring samples**
 //!   ([`filter_reference_samples`]) — the `[1 2 1] >> 2` smoothing of
 //!   equations 8-41..8-45, gated by `filterFlag` (Table 8-4) and, for the
 //!   `nTbS == 32` luma case, the bi-linear `biIntFlag` interpolation of
@@ -59,7 +59,7 @@ pub const INTRA_ANGULAR_HOR: u8 = 10;
 /// the §8.4.4.2.6 step-2c boundary-filter special case.
 pub const INTRA_ANGULAR_VER: u8 = 26;
 
-/// §8.4.4.2.1 colour-component selector (`cIdx`). Only the bit-depth and
+/// §8.4.4.2.1 color-component selector (`cIdx`). Only the bit-depth and
 /// the luma-only boundary-filter / strong-smoothing gates branch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Component {
@@ -87,7 +87,7 @@ pub enum IntraPredError {
     /// `nTbS` (the `1 << log2TrafoSize` block side) was not one of the
     /// four legal transform-block sizes (4, 8, 16, 32).
     InvalidBlockSize(usize),
-    /// A neighbour-sample array did not hold exactly `4 * nTbS + 1`
+    /// A neighbor-sample array did not hold exactly `4 * nTbS + 1`
     /// elements (the count the spec dimensions `p[ ][ ]` for).
     LengthMismatch {
         /// The `4 * nTbS + 1` count the block requires.
@@ -112,7 +112,7 @@ impl core::fmt::Display for IntraPredError {
                 )
             }
             Self::LengthMismatch { expected, got } => {
-                write!(f, "neighbour array length {got} != 4*nTbS+1 = {expected}")
+                write!(f, "neighbor array length {got} != 4*nTbS+1 = {expected}")
             }
             Self::InvalidMode(m) => {
                 write!(f, "invalid predModeIntra {m} (expected 0..=34)")
@@ -136,7 +136,7 @@ fn log2_tbs(n_tbs: usize) -> u32 {
     n_tbs.trailing_zeros()
 }
 
-/// The `nTbS * 4 + 1` neighbouring reference samples `p[ x ][ y ]` of one
+/// The `nTbS * 4 + 1` neighboring reference samples `p[ x ][ y ]` of one
 /// transform block, addressed by the spec coordinates `x = −1,
 /// y = −1..nTbS * 2 − 1` (the left column, including the `(−1,−1)`
 /// corner) and `x = 0..nTbS * 2 − 1, y = −1` (the top row).
@@ -169,7 +169,7 @@ impl ReferenceSamples {
     /// elements; `n_tbs` must be 4 / 8 / 16 / 32.
     ///
     /// This constructor takes samples that are already substituted (all
-    /// available); use [`MarkedReferenceSamples`] when some neighbours
+    /// available); use [`MarkedReferenceSamples`] when some neighbors
     /// are unavailable.
     pub fn new(
         n_tbs: usize,
@@ -308,12 +308,12 @@ impl MarkedReferenceSamples {
 /// Returns a fully-available [`ReferenceSamples`] derived from the
 /// availability-marked `marked` input. `bit_depth` is `BitDepthY` for
 /// luma or `BitDepthC` for chroma; it supplies the mid-level fallback
-/// `1 << ( bitDepth − 1 )` used when no neighbour is available.
+/// `1 << ( bitDepth − 1 )` used when no neighbor is available.
 ///
 /// The substitution sweep visits the samples in the spec's reverse
 /// raster order — `p[ −1 ][ 2*nTbS−1 ]` down to `p[ −1 ][ −1 ]`, then
 /// `p[ 0 ][ −1 ]` to `p[ 2*nTbS−1 ][ −1 ]` — filling each unavailable
-/// sample from the previously-visited neighbour.
+/// sample from the previously-visited neighbor.
 pub fn substitute_reference_samples(
     marked: &MarkedReferenceSamples,
     bit_depth: u8,
@@ -352,7 +352,7 @@ pub fn substitute_reference_samples(
     }
 
     if avail.iter().all(|&a| !a) {
-        // All neighbours unavailable: substitute the mid-level value.
+        // All neighbors unavailable: substitute the mid-level value.
         let mid = 1i32 << (bit_depth - 1);
         val.iter_mut().for_each(|v| *v = mid);
     } else {
@@ -408,7 +408,7 @@ fn intra_hor_ver_dist_thres(n_tbs: usize) -> Option<i32> {
 
 /// §8.4.4.2.3 `filterFlag` derivation (without applying the filter).
 ///
-/// `true` when the `[1 2 1]` / bi-linear neighbour smoothing must run for
+/// `true` when the `[1 2 1]` / bi-linear neighbor smoothing must run for
 /// the given mode and block size; `false` for `INTRA_DC`, `nTbS == 4`, or
 /// when `minDistVerHor` does not exceed `intraHorVerDistThres[ nTbS ]`.
 #[must_use]
@@ -425,7 +425,7 @@ pub fn reference_filter_flag(pred_mode_intra: u8, n_tbs: usize) -> bool {
     min_dist_ver_hor > thres
 }
 
-/// §8.4.4.2.3 — filtering process of neighbouring samples.
+/// §8.4.4.2.3 — filtering process of neighboring samples.
 ///
 /// Returns the filtered reference array `pF`. The caller is responsible
 /// for the §8.4.4.2.1 step-1 gate (`intra_smoothing_disabled_flag == 0`
@@ -866,7 +866,7 @@ impl ReferenceSamples {
 pub struct IntraPredParams {
     /// `predModeIntra` — the Table 8-1 mode index (0..=34).
     pub pred_mode_intra: u8,
-    /// `cIdx` — the colour component.
+    /// `cIdx` — the color component.
     pub cidx: Component,
     /// `BitDepthY` (luma) or `BitDepthC` (chroma) of the component.
     pub bit_depth: u8,
@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn substitution_all_unavailable_yields_midlevel() {
-        // Every neighbour marked not-available -> 1 << (bitDepth − 1).
+        // Every neighbor marked not-available -> 1 << (bitDepth − 1).
         let n = 4;
         let m = MarkedReferenceSamples::new(
             n,
@@ -1112,8 +1112,8 @@ mod tests {
     // ---- §8.4.4.2.4 planar ----
 
     #[test]
-    fn planar_constant_neighbours() {
-        // All neighbours = 50 -> every predicted sample = 50.
+    fn planar_constant_neighbors() {
+        // All neighbors = 50 -> every predicted sample = 50.
         let n = 8;
         let p = const_ref(n, 50);
         let pred = predict_planar(&p);
@@ -1141,8 +1141,8 @@ mod tests {
     // ---- §8.4.4.2.5 DC ----
 
     #[test]
-    fn dc_constant_neighbours_luma_boundary() {
-        // All neighbours 100; dcVal = 100; boundary filter keeps 100.
+    fn dc_constant_neighbors_luma_boundary() {
+        // All neighbors 100; dcVal = 100; boundary filter keeps 100.
         let n = 8;
         let p = const_ref(n, 100);
         let pred = predict_dc(&p, Component::Luma, false);
@@ -1280,7 +1280,7 @@ mod tests {
             disable_boundary_filter: false,
         };
         let pred = intra_predict(&p, &params).unwrap();
-        // Constant neighbours -> planar yields the constant; filtering of
+        // Constant neighbors -> planar yields the constant; filtering of
         // a constant is idempotent so the value is unchanged.
         assert!(pred.iter().all(|&v| v == 130));
     }
@@ -1305,7 +1305,7 @@ mod tests {
             chroma_array_type_3: false,
             disable_boundary_filter: false,
         };
-        // All neighbours unavailable -> substituted to 128; DC of 128 is
+        // All neighbors unavailable -> substituted to 128; DC of 128 is
         // 128; boundary filter of constant keeps 128.
         let pred = intra_predict_with_substitution(&m, &params).unwrap();
         assert!(pred.iter().all(|&v| v == 128));

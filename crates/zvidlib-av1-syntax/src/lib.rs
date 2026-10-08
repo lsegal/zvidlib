@@ -1278,7 +1278,7 @@ mod tests {
     #[test]
     fn av1c_accepts_every_chroma_sample_position() {
         for pos in 0..4u8 {
-            // seq_tier_0 = 0, 8-bit, colour, 4:2:0 subsampling, and `pos` in the
+            // seq_tier_0 = 0, 8-bit, color, 4:2:0 subsampling, and `pos` in the
             // low two bits that used to be refused as reserved.
             let byte2 = 0x0c | pos;
 

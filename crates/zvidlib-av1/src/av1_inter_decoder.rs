@@ -482,7 +482,7 @@ fn parse_inter_frame_header(
         bits.read(1, "error_resilient_mode")? != 0
     };
     require_bit(bits, true, "disable_cdf_update")?;
-    // allow_screen_content_tools is only signalled per-frame when the
+    // allow_screen_content_tools is only signaled per-frame when the
     // sequence header selects SELECT_SCREEN_CONTENT_TOOLS (2); otherwise it
     // is implied by the sequence header with no bit read (AV1 §5.9.2).
     let allow_screen_content_tools = match seq.seq_force_screen_content_tools {
@@ -1016,7 +1016,7 @@ impl<'a> InterTileDecoder<'a> {
             }
         }
         let tx_width = self.read_tx_size(row, column, block_width)?;
-        // §9.3 reads an inter neighbour's *block* extent rather than its transform extent, so an
+        // §9.3 reads an inter neighbor's *block* extent rather than its transform extent, so an
         // inter block leaves its block width here and an intra block leaves its transform width.
         let extent = if prediction.is_some() {
             block_width
@@ -1301,8 +1301,8 @@ impl<'a> InterTileDecoder<'a> {
         Ok(())
     }
 
-    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
-    /// transform (or, for an inter neighbour, a block) at least as large as this block's
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbors already carry a
+    /// transform (or, for an inter neighbor, a block) at least as large as this block's
     /// `Max_Tx_Size_Rect`. See [`crate::av1_intra_decoder`]'s identically shaped implementation.
     fn tx_depth_context(&self, row: usize, column: usize, max_tx: usize) -> usize {
         let above = row > 0 && usize::from(self.above_tx_width[column]) >= max_tx;
@@ -1578,7 +1578,7 @@ impl<'a> InterTileDecoder<'a> {
         let scan = cdf::up_right_diagonal_scan(tx_width.min(MAX_CODED_TX_WIDTH));
         // §5.11.39 `coeffs` reads `transform_type()` immediately after `all_zero` and before
         // `eob_pt`, so the read happens inside the coefficient loop rather than after it. It is
-        // only signalled for a transform block that actually has nonzero coefficients; a fully
+        // only signaled for a transform block that actually has nonzero coefficients; a fully
         // skipped block is implicitly DCT_DCT, and its value is irrelevant anyway because the
         // inverse transform of an all-zero input is zero for every type.
         let (coefficients, _skipped, tx_type) = self.decode_coefficient_levels(
@@ -1775,12 +1775,12 @@ impl<'a> InterTileDecoder<'a> {
     }
 
     /// `getTXBSkipCtx` (spec §8.3.2), whose `top`/`left` are the maxima of
-    /// the neighbouring level contexts across the transform block's own
+    /// the neighboring level contexts across the transform block's own
     /// width and height in 4x4 units.
     ///
     /// The specification's first case returns context 0 outright when the
     /// transform covers the whole coding block, without consulting a
-    /// neighbour at all. Every coding block this decoder codes is square,
+    /// neighbor at all. Every coding block this decoder codes is square,
     /// so that is exactly `tx_width == block_width`. It cannot fire on a
     /// lossless stream, whose transforms are all 4x4 while `decode_partition`
     /// never splits below an 8x8 coding block, but it fires constantly once
@@ -2473,7 +2473,7 @@ mod tests {
             for (t, &context) in contexts.iter().enumerate() {
                 // A lossless frame lands on qctx 0 and, with TX_4X4
                 // transforms inside 8x8 coding blocks, txSzCtx 0 and the
-                // neighbour-derived skip contexts above.
+                // neighbor-derived skip contexts above.
                 if block == 0 && t == 0 {
                     e.symbol(cdf::txb_skip_cdf(0, 0, context), 0); // not skipped
                     e.symbol(cdf::eob_pt_cdf(0, 4, 0), 0); // eob_point = 1 -> eob = 1
@@ -2955,7 +2955,7 @@ mod tests {
         tx_type_symbol: usize,
     ) -> Vec<u8> {
         // Each 8x8 transform covers its whole 8x8 coding block, so
-        // `getTXBSkipCtx` returns 0 without consulting a neighbour.
+        // `getTXBSkipCtx` returns 0 without consulting a neighbor.
         const CONTEXTS: [usize; 4] = [0, 0, 0, 0];
         let qctx = cdf::coeff_qctx(base_q_idx);
         let tx_ctx = cdf::coeff_tx_size_ctx(8);
@@ -3030,7 +3030,7 @@ mod tests {
     /// Identity global motion makes the prediction a straight copy of the
     /// co-located reference samples and every loop filter level is 0, so
     /// the reconstruction is exactly the reference plane plus the
-    /// signalled transform's residual.
+    /// signaled transform's residual.
     fn non_lossless_inter_temporal_unit(
         reduced_tx_set: bool,
         tx_set: cdf::Av1TxSet,
@@ -3101,7 +3101,7 @@ mod tests {
     /// and this crate has a kernel for must reach that kernel from an
     /// inter-predicted bitstream block, including the flipped-ADST types.
     #[test]
-    fn every_signalled_inter_transform_type_reconstructs_through_its_kernel() {
+    fn every_signaled_inter_transform_type_reconstructs_through_its_kernel() {
         let reference = non_lossless_reference_luma();
         let mut coefficients = vec![0i32; 16 * 16];
         coefficients[0] = 4;
@@ -3209,7 +3209,7 @@ mod tests {
         e.symbol(&cdf::ZERO_MV, 0); // GLOBALMV
         e.symbol(cdf::tx_depth_cdf(16, 0).0, 1); // TX_16X16 >> 1 = TX_8X8
         // Four 8x8 transforms inside a 16x16 coding block, so no transform
-        // covers the whole block and the neighbour-derived context 1
+        // covers the whole block and the neighbor-derived context 1
         // applies to all four.
         let qctx = cdf::coeff_qctx(40);
         let tx_ctx = cdf::coeff_tx_size_ctx(8);
@@ -3251,7 +3251,7 @@ mod tests {
     /// one carrying the half-identity ADST types. Every one of its sixteen
     /// entries must reach its kernel from an 8x8 inter transform block.
     #[test]
-    fn every_signalled_inter_1_transform_type_reconstructs_through_its_kernel() {
+    fn every_signaled_inter_1_transform_type_reconstructs_through_its_kernel() {
         let reference = non_lossless_reference_luma();
         let mut coefficients = vec![0i32; 8 * 8];
         coefficients[0] = 4;

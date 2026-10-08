@@ -37,7 +37,7 @@ fn native_hevc_decoder_matches_an_independent_decode_of_the_bundled_sample() {
     // `verify_video_decoder_conformance`'s reverse and alternating patterns
     // would re-decode it from the start for nearly every frame - close to
     // 300,000 1080p pictures, which never finished on a CI runner once this
-    // file was run (#599). As the AV1 colour sample below does, every frame is
+    // file was run (#599). As the AV1 color sample below does, every frame is
     // checked in order instead, followed by backward and forward seeks. The
     // three patterns still run for HEVC Main on the 32-frame groups of
     // `bbb_hevc_512x288_gop32.mp4`, in `crates/zvidlib-hevc-decoder/src/lib.rs`.

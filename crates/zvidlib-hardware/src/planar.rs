@@ -1,4 +1,4 @@
-//! What the hardware VP8 and VP9 backends (NVDEC and Media Foundation) share: recognising a VP8
+//! What the hardware VP8 and VP9 backends (NVDEC and Media Foundation) share: recognizing a VP8
 //! frame's shape from its tag, and turning the NV12 surface a decoder writes into the three 4:2:0
 //! planes the software decoder produces, so both go through the same RGBA conversion.
 
@@ -91,7 +91,7 @@ pub fn vp9_dimensions(shape: FrameShape, limits: &Limits) -> Result<VideoDimensi
     VideoDimensions::new(shape.width as u32, shape.height as u32, limits)
 }
 
-/// Converts a VP9 picture, cropped to [`vp9_dimensions`], with the colour its header named, as
+/// Converts a VP9 picture, cropped to [`vp9_dimensions`], with the color its header named, as
 /// the software decoder converts its own pictures.
 pub fn vp9_frame(planes: [Vec<u8>; 3], shape: FrameShape, limits: &Limits) -> Result<VideoFrame> {
     let picture = DecodedPicture {
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_vp8_frame_is_recognised_from_its_tag() {
+    fn a_hidden_vp8_frame_is_recognized_from_its_tag() {
         assert!(vp8_frame_is_shown(&[0x10, 0, 0]));
         assert!(!vp8_frame_is_shown(&[0x00, 0, 0]));
         assert!(!vp8_frame_is_shown(&[]));

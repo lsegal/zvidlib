@@ -21,7 +21,7 @@
 //!   helpers.
 //! * [`SliceContexts`] — the whole per-slice context array, one bank
 //!   per syntax element (or per Table 9-4 shared-variable group),
-//!   initialised for a given `initType` and `SliceQpY` through the
+//!   initialized for a given `initType` and `SliceQpY` through the
 //!   §9.3.2.2 process ([`ContextModel::init`], equations 9-4..9-6).
 //!   [`SliceContexts::for_slice`] additionally applies the
 //!   equation 9-7 `initType` derivation from `slice_type` and
@@ -54,13 +54,13 @@
 //! `abs_mvd_greater0_flag`/`greater1_flag`, `explicit_rdpcm_flag` and
 //! `explicit_rdpcm_dir_flag`) — no initialization is specified
 //! because a conforming I slice never decodes them. [`SliceContexts`]
-//! still materialises those banks so the array shape is
+//! still materializes those banks so the array shape is
 //! `initType`-independent; at `initType == 0` they are populated with
 //! the §9.3.2.2 NOTE 2 non-adapting state
 //! ([`ContextModel::terminate_state`], `pStateIdx = 63`,
 //! `valMps = 0`), which no table-derived context can take
 //! (equations 9-4..9-6 bound `pStateIdx` to 0..=62), making an
-//! accidental read recognisable. The same placeholder fills the
+//! accidental read recognizable. The same placeholder fills the
 //! `part_mode` slots 1..=3 at `initType == 0` (Table 9-4 gives
 //! `part_mode` only ctxIdx 0 there: the I-slice §9.3.4.2 binarization
 //! uses a single context-coded bin).

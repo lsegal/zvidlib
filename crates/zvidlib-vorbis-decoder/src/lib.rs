@@ -81,8 +81,8 @@ impl AudioDecoder for NativeVorbisDecoder {
         sample: &EncodedAudioSample,
         cancellation: &CancellationToken,
     ) -> Result<AudioBuffer> {
-        if cancellation.is_cancelled() {
-            return Err(Error::new(ErrorKind::Cancelled, "Vorbis decode cancelled"));
+        if cancellation.is_canceled() {
+            return Err(Error::new(ErrorKind::Canceled, "Vorbis decode canceled"));
         }
         let cold = std::mem::replace(&mut self.cold, false);
         let channels = usize::from(self.channels);

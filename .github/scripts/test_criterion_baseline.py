@@ -230,7 +230,7 @@ class RenderTable(unittest.TestCase):
         self.assertNotIn("sse4.1", rendered)
         self.assertIn("5.00x `neon`", rendered)
 
-    def test_unrecognised_instruction_set_is_not_dropped(self):
+    def test_unrecognized_instruction_set_is_not_dropped(self):
         """A new ISA gets a column without this script being edited first."""
         path = _isa_baseline(
             self.root / "future.json",

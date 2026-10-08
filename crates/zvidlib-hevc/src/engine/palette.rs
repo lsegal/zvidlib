@@ -4,8 +4,8 @@
 //! Content Coding extensions.
 //!
 //! A palette coding unit replaces prediction + transform coding
-//! entirely: the CU signals a small colour table (composed of entries
-//! REUSED from a rolling predictor palette plus explicitly signalled
+//! entirely: the CU signals a small color table (composed of entries
+//! REUSED from a rolling predictor palette plus explicitly signaled
 //! new entries, eq. 7-82), an index map covering the block in the
 //! §6.5.6 traverse scan (run-length coded, with per-run "copy the
 //! index from the row above" escapes), and optional escape samples
@@ -265,13 +265,13 @@ pub fn decode_palette_coding(
         idx += 1;
     }
 
-    // ---- num_signalled_palette_entries (EG0) + new entries ----
-    let num_signalled = if num_predicted < max_size {
+    // ---- num_signaled_palette_entries (EG0) + new entries ----
+    let num_signaled = if num_predicted < max_size {
         decode_eg_k(engine, 0)? as usize
     } else {
         0
     };
-    if num_predicted + num_signalled > max_size {
+    if num_predicted + num_signaled > max_size {
         return Err(PaletteError::Malformed(
             "CurrentPaletteSize past palette_max_size",
         ));
@@ -283,7 +283,7 @@ pub fn decode_palette_coding(
         } else {
             params.bit_depth_chroma
         };
-        for _ in 0..num_signalled {
+        for _ in 0..num_signaled {
             let mut v = 0u32;
             for _ in 0..bd {
                 v = (v << 1) | u32::from(engine.decode_bypass()?);
@@ -439,7 +439,7 @@ pub fn decode_palette_coding(
             if !copy_flag {
                 if remaining == 0 {
                     return Err(PaletteError::Malformed(
-                        "palette runs exhaust the signalled index count",
+                        "palette runs exhaust the signaled index count",
                     ));
                 }
                 remaining -= 1;
@@ -519,7 +519,7 @@ pub fn decode_palette_coding(
     }
     if max_palette_index > 0 && remaining != 0 {
         return Err(PaletteError::Malformed(
-            "palette runs left signalled indices unconsumed",
+            "palette runs left signaled indices unconsumed",
         ));
     }
 
@@ -593,10 +593,10 @@ pub fn decode_palette_coding(
     Ok(cu)
 }
 
-/// §8.4.4.2.7 — reconstruct one colour component of a palette CU into
+/// §8.4.4.2.7 — reconstruct one color component of a palette CU into
 /// the caller's sample writer.
 ///
-/// * `c_idx` — colour component (0 luma, 1 Cb, 2 Cr).
+/// * `c_idx` — color component (0 luma, 1 Cb, 2 Cr).
 /// * `(sub_w, sub_h)` — `(nSubWidth, nSubHeight)` for the component
 ///   (1/1 for luma; `SubWidthC`/`SubHeightC` for chroma).
 /// * `qp` — the §8.6.1-derived `Qp′` for the component (the escape
@@ -709,7 +709,7 @@ mod tests {
         }
     }
 
-    /// Round-trip a hand-built 8x8 palette CU: three signalled
+    /// Round-trip a hand-built 8x8 palette CU: three signaled
     /// entries, no escapes, an explicit-index run, a copy-above run
     /// and the final run.
     #[test]
@@ -720,7 +720,7 @@ mod tests {
         let mut ectx = SliceContexts::init(init_type(2, false), 26);
 
         // Empty predictor ⇒ no palette_predictor_run loop bins.
-        // num_signalled_palette_entries = 3.
+        // num_signaled_palette_entries = 3.
         encode_eg0(&mut cabac, &mut w, 3);
         // new_palette_entries: comp0 {10, 20, 30}, comp1 {60, 70, 80},
         // comp2 {110, 120, 130} — FL(8) each.
@@ -767,7 +767,7 @@ mod tests {
         //         + suffix TB (PrefixOffset 8, 16>30? no ⇒ cMax_tb
         //         = 7, suffix 7).
         //  pos 48: prev is copy-above ⇒ no copy flag read; explicit
-        //         index (idc 0 adjusted vs left neighbour...) run to
+        //         index (idc 0 adjusted vs left neighbor...) run to
         //         end (remaining becomes 0, copy_flag(0) ==
         //         final_run_flag(0) ⇒ RunToEnd).
         {
@@ -817,7 +817,7 @@ mod tests {
         // index 0. Positions 32..47 copy row above (rows 4..5 copy
         // row 3 = index 0)... every sample ends up index 0 except the
         // final run: idc[1] = 0 adjusts (eq. 7-84) against the
-        // neighbour index 0 ⇒ index 1 for positions 48..63 (rows
+        // neighbor index 0 ⇒ index 1 for positions 48..63 (rows
         // 6..7).
         for pos in 0..48usize {
             let p = traverse(n)[pos];
@@ -879,7 +879,7 @@ mod tests {
         encode_eg0(&mut cabac, &mut w, 0);
         encode_eg0(&mut cabac, &mut w, 2);
         encode_eg0(&mut cabac, &mut w, 1);
-        // num_signalled = 0.
+        // num_signaled = 0.
         encode_eg0(&mut cabac, &mut w, 0);
         // escape_present = 0 (CurrentPaletteSize = 2).
         cabac.encode_bypass(&mut w, 0);

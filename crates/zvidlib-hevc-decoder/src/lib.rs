@@ -332,7 +332,7 @@ fn validate_sps(
 ) -> Result<()> {
     let max_bit_depth_minus8 = max_bit_depth_minus8(configuration.profile);
     if sps.chroma_format_idc != 1
-        || sps.separate_colour_plane_flag
+        || sps.separate_color_plane_flag
         || sps.bit_depth_luma_minus8 > max_bit_depth_minus8
         || sps.bit_depth_chroma_minus8 > max_bit_depth_minus8
     {
@@ -470,7 +470,7 @@ impl HevcDecoder {
     }
 
     /// The output pictures ready at this point, in presentation order, before
-    /// colour conversion.
+    /// color conversion.
     ///
     /// Issue #220: this is the decoder's own product. [`collect`] converts each
     /// one to RGBA, which is the round trip an application pays but is not
@@ -519,7 +519,7 @@ impl HevcDecoder {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         if sample.data.len() as u64 > self.limits.max_allocation_bytes {
             return Err(limit("HEVC access unit exceeds the allocation limit"));
         }
@@ -582,7 +582,7 @@ impl VideoDecoder for HevcDecoder {
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         match catch_unwind(AssertUnwindSafe(|| self.sequence.flush())) {
             Ok(Ok(())) => self.collect(true),
             Ok(Err(error)) => Err(sequence_error(error)),
@@ -601,7 +601,7 @@ impl VideoDecoder for HevcDecoder {
     }
 }
 
-/// Issue #189 stage attribution: colour conversion is not decoding, but it is
+/// Issue #189 stage attribution: color conversion is not decoding, but it is
 /// on the path every whole-frame measurement takes, so it is reported as its
 /// own stage rather than left in the unattributed remainder.
 fn picture_to_rgba(
@@ -677,11 +677,11 @@ fn picture_to_rgba(
     )
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
         Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
+            ErrorKind::Canceled,
+            "codec operation canceled",
         ))
     } else {
         Ok(())

@@ -62,7 +62,7 @@ pub struct PcmAuOptions {
     pub sao_luma_band: bool,
     /// Enable luma vertical-class edge-offset SAO (`sao_type_idx_luma
     /// == 2`, `sao_eo_class_luma == 1`): the classification reads
-    /// above / below neighbours, exercising the §8.7.3.2 cross-slice
+    /// above / below neighbors, exercising the §8.7.3.2 cross-slice
     /// availability at horizontal slice boundaries. Mutually exclusive
     /// with [`Self::sao_luma_band`].
     pub sao_luma_eo_vertical: bool,
@@ -519,7 +519,7 @@ fn write_idr_slice_segments(
                         cabac.encode_bypass(&mut w, 0);
                     }
                     // sao_eo_class_luma: FL(2) = 1 (vertical — reads
-                    // the above / below neighbours).
+                    // the above / below neighbors).
                     cabac.encode_bypass_bits(&mut w, 1, 2);
                 }
             }

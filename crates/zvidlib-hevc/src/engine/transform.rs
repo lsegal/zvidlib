@@ -58,7 +58,7 @@ use crate::engine::transform_simd::{self, Backend};
 /// `qP % 6` (the list is `{ 40, 45, 51, 57, 64, 72 }`).
 pub const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
 
-/// Colour component of the current transform block, naming the
+/// Color component of the current transform block, naming the
 /// `cIdx` value (0 = luma, 1 = Cb, 2 = Cr) the three subclauses branch
 /// on for bit depth and `coeffMin` / `coeffMax`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +718,7 @@ pub struct BlockParams {
     pub n_tbs: usize,
     /// `qP` — the §8.6.1-derived quantization parameter for this block.
     pub q_p: u32,
-    /// The colour component `cIdx`.
+    /// The color component `cIdx`.
     pub component: Component,
     /// `CuPredMode[ xTbY ][ yTbY ]`.
     pub pred_mode: PredMode,
@@ -900,7 +900,7 @@ pub fn rdpcm_accumulate(r: &mut [i32], n_tbs: usize, vertical: bool) {
     }
 }
 
-/// §8.6.8.2 — adaptive colour transformation process (inverse), applied
+/// §8.6.8.2 — adaptive color transformation process (inverse), applied
 /// to the three co-located residual arrays of one 4:4:4 transform block
 /// whose `tu_residual_act_flag` is 1.
 ///

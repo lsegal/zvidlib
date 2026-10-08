@@ -523,7 +523,7 @@ fn oversized_frames_are_refused_before_allocation() {
 }
 
 #[test]
-fn the_colour_range_of_a_key_frame_is_read_without_decoding_it() {
+fn the_color_range_of_a_key_frame_is_read_without_decoding_it() {
     let samples = mp4_samples(BBB_256X144);
     assert_eq!(chunk_full_range(&samples[0].data), Some(false));
     // An inter frame, a superframe that starts with one, and junk say nothing.

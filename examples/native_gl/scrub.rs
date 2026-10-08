@@ -144,11 +144,11 @@ struct Queue {
 }
 
 impl Queue {
-    /// Points the worker at `frame`, cancelling a decode that is no longer on the way there.
+    /// Points the worker at `frame`, canceling a decode that is no longer on the way there.
     ///
     /// Returns whether this changed the target: repeating one must not disturb the decode that is
     /// already serving it. Neither must moving the target further ahead - the frame being decoded
-    /// lies between the reader and the new target, so cancelling it would throw away reference
+    /// lies between the reader and the new target, so canceling it would throw away reference
     /// decoding the new target needs and send the reader back to a random-access point. Only a
     /// target the current decode has already passed cancels it.
     fn retarget(&mut self, frame: u64) -> bool {
@@ -344,7 +344,7 @@ fn decode_frames(queue: &Arc<(Mutex<Queue>, Condvar)>, mut reader: ExactFrameRea
                 }
                 // Superseded part-way through: the reader stopped between frames and reaches the
                 // next target from a random-access point of its own accord.
-                Err(error) if error.kind() == ErrorKind::Cancelled => {}
+                Err(error) if error.kind() == ErrorKind::Canceled => {}
                 Err(error) => {
                     // Handed to whichever caller asks next; this request cannot make progress.
                     state.failure = Some(error);
@@ -367,7 +367,7 @@ fn decode_frames(queue: &Arc<(Mutex<Queue>, Condvar)>, mut reader: ExactFrameRea
                 state.in_flight = None;
                 break;
             }
-            if cancellation.is_cancelled() {
+            if cancellation.is_canceled() {
                 cancellation = CancellationToken::new();
                 state.in_flight = Some(cancellation.clone());
             }

@@ -277,7 +277,7 @@ fn readback_decode(
     panic!("the bundled sample yields at least {frames} frames past the first");
 }
 
-/// Registers the readback group: the surface copy and the colour conversion
+/// Registers the readback group: the surface copy and the color conversion
 /// the hardware arm pays inside its decode number.
 fn bench_readback(criterion: &mut Criterion, configuration: &VideoDecoderConfig, frames: u64) {
     let factory = native_hevc_video_decoder_factory();
@@ -293,7 +293,7 @@ fn bench_readback(criterion: &mut Criterion, configuration: &VideoDecoderConfig,
     // The share is what the issue asks for: how much of a hardware decode is
     // the host round trip rather than the fixed-function block.
     println!(
-        "# hardware readback over {frames} frame(s): surface copy {:.2} ms/frame, colour convert \
+        "# hardware readback over {frames} frame(s): surface copy {:.2} ms/frame, color convert \
          {:.2} ms/frame, {:.2} ms/frame total = {:.1}% of the {:.2} ms/frame decode",
         report.surface_copy.as_secs_f64() * 1e3 / frames as f64,
         report.color_convert.as_secs_f64() * 1e3 / frames as f64,

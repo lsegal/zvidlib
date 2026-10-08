@@ -44,9 +44,9 @@ permissions:
 
 # The same arrangement `ci.yml` carries, and for the same reason: an
 # expression in `cancel-in-progress` renders to a truthy string on a `push`, so
-# this cancelled `main` runs too (#451). Only a `pull_request` shares a group;
+# this canceled `main` runs too (#451). Only a `pull_request` shares a group;
 # a `push` or a `workflow_dispatch` keys on its own run and stands alone. A
-# cancelled report here is a silent one, which is the failure mode #449 moved
+# canceled report here is a silent one, which is the failure mode #449 moved
 # this workflow out of `ci.yml` to close.
 concurrency:
   group: staleness-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}

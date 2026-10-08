@@ -1101,7 +1101,7 @@ mod nonlossless_tests {
             );
         }
         // Which *pair* the rate-distortion search picks is a property of the test pattern, not of
-        // the encoder, so the assertion is that nothing outside the signallable set is ever
+        // the encoder, so the assertion is that nothing outside the signalable set is ever
         // written and that every size and every type the set names is exercised by some block.
         let emittable = emittable();
         assert!(
@@ -1130,7 +1130,7 @@ mod nonlossless_tests {
         assert_eq!(
             sizes(&covered),
             sizes(&emittable),
-            "the shipped search did not select every signallable transform size"
+            "the shipped search did not select every signalable transform size"
         );
         let exhaustively_covered: std::collections::BTreeSet<(usize, String)> =
             [1_u8, 8, 32, 80, 160, 200]
@@ -2369,7 +2369,7 @@ mod nonlossless_tests {
     /// Neither locality nor a steadier probe moves the residual `scene_edge` penalty at 192x160,
     /// and the frame's flipped decisions are one-directional - the sampled estimator codes the
     /// frame in smaller transforms than the unsampled one. That is what an over-large correction
-    /// looks like: it scales with the trial's block count, so inflating it favours the size with
+    /// looks like: it scales with the trial's block count, so inflating it favors the size with
     /// more blocks. This prints the penalty against the unsampled estimator as the remembered
     /// correction is shrunk from full (`16`) to none (`0`).
     ///
@@ -2625,7 +2625,7 @@ mod nonlossless_tests {
 
     /// What the recency weighting costs in encode time.
     ///
-    /// The correction exists to be cheap, so this is the check that ageing the accumulator did
+    /// The correction exists to be cheap, so this is the check that aging the accumulator did
     /// not make it expensive. Interleaved rounds with the minimum taken per arm: a single pass
     /// would attribute this host's own load to whichever arm happened to run under it.
     #[test]
@@ -3318,7 +3318,7 @@ mod nonlossless_tests {
     /// never empty - and `measure_type_gain_phase_aliasing` prices the only guarantee that removes
     /// the dependence at 28-70% more transform-type candidates for up to +12.4% worse
     /// rate-distortion. So the sampler is left alone and this widens what the property rests on.
-    /// #329 retired that assertion outright in favour of
+    /// #329 retired that assertion outright in favor of
     /// `the_type_gain_sampling_intervals_upper_bound_is_what_a_longer_one_buys`, so this is now
     /// the only thing holding the smallest transform against the sampling interval at all.
     ///

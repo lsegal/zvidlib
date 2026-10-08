@@ -568,7 +568,7 @@ pub(super) fn predict_tm_scalar(
 /// to 8 bits before the vertical pass. The taps of each filter sum to 128.
 ///
 /// A pass with the identity kernel, a whole-sample component, copies its
-/// centre sample exactly, so it is skipped: the other pass reads the window
+/// center sample exactly, so it is skipped: the other pass reads the window
 /// directly, and only `h` rows are filtered horizontally.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn convolve8(
@@ -2401,7 +2401,7 @@ mod neon {
 
     /// One 8-tap pass over eight samples in 16-bit lanes, as libvpx's NEON
     /// convolutions compute it: the outer taps sum without overflow, and the
-    /// two centre taps, which are never negative, are added saturating. A
+    /// two center taps, which are never negative, are added saturating. A
     /// saturated sum is past `255 << 7`, where the result clamps anyway, so
     /// this is `clamp((sum + 64) >> 7)` exactly.
     #[target_feature(enable = "neon")]
@@ -2425,7 +2425,7 @@ mod neon {
         vcombine_u8(filter8(low, taps), filter8(high, taps))
     }
 
-    /// The taps of a filter for [`filter8`], which needs its two centre taps
+    /// The taps of a filter for [`filter8`], which needs its two center taps
     /// non-negative and its outer ones small enough to sum in 16 bits, as
     /// every VP9 sub-sample filter's are.
     fn narrow_taps(filter: &[i32]) -> [i16; 8] {

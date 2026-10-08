@@ -4,7 +4,7 @@
 //! reordering off so decode order is presentation order and every sample's DTS equals its PTS.
 //! Frames are copied into BGRA pixel buffers from the session's own pool - a straight row copy for
 //! `Bgra8` input and a byte swizzle for `Rgba8` - and VideoToolbox does the conversion to YCbCr on
-//! the media engine, so no CPU colour conversion runs.
+//! the media engine, so no CPU color conversion runs.
 //!
 //! # The `hvcC` has to exist before the first frame
 //!
@@ -17,7 +17,7 @@
 //! later sample that references a parameter set the `hvcC` does not declare is an error rather
 //! than a stream that would not decode.
 //!
-//! A VP9 stream's `vpcC` is built the same way, from the colour space and range the priming key
+//! A VP9 stream's `vpcC` is built the same way, from the color space and range the priming key
 //! frame signals, and every later key frame has to signal the same. VP9 is rate controlled by
 //! quality rather than to a bitrate, and its samples are already one chunk each.
 //!
@@ -336,7 +336,7 @@ struct Shared {
 enum Declared {
     /// The parameter sets the `hvcC` carries.
     Hevc(ParameterSets),
-    /// The `vpcC`, and the level it names, as the priming key frame signalled them.
+    /// The `vpcC`, and the level it names, as the priming key frame signaled them.
     Vp9 { vpcc: Vec<u8>, level: u8 },
 }
 
@@ -452,7 +452,7 @@ impl VideoToolboxEncoder {
             let quality = settings.quality.map(number_f64);
             // The BGRA-to-YCbCr conversion VideoToolbox runs on the way in takes its matrix from
             // here, not from `YCbCrMatrix`, and defaults to BT.709. The crate's decoders convert
-            // back with BT.601, so anything else shifts colour on a round trip.
+            // back with BT.601, so anything else shifts color on a round trip.
             let transfer = dictionary(&[(
                 kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
                 kCVImageBufferYCbCrMatrix_ITU_R_601_4,
@@ -476,10 +476,10 @@ impl VideoToolboxEncoder {
                 (
                     kVTCompressionPropertyKey_PixelTransferProperties,
                     transfer.0,
-                    "BT.601 colour conversion",
+                    "BT.601 color conversion",
                 ),
             ];
-            // Hints the encoder may decline. The matrix signalled in the stream matches the one
+            // Hints the encoder may decline. The matrix signaled in the stream matches the one
             // the conversion above used.
             let mut hints = vec![
                 (kVTCompressionPropertyKey_ExpectedFrameRate, rate.0),
@@ -542,8 +542,8 @@ impl VideoToolboxEncoder {
         Ok(())
     }
 
-    /// Encodes the black priming frame and declares the parameter sets, or for VP9 the colour
-    /// signalling, it came out with.
+    /// Encodes the black priming frame and declares the parameter sets, or for VP9 the color
+    /// signaling, it came out with.
     fn prime(&mut self) -> Result<()> {
         let dimensions = self.configuration.coded_dimensions;
         let black = VideoFrame::new(
@@ -782,7 +782,7 @@ impl VideoToolboxEncoder {
                     let key = zvidlib_vp9_syntax::key_frame_vpcc(&picture.data, *level);
                     if key.as_ref().is_some_and(|key| key != vpcc) {
                         return Err(codec(
-                            "VideoToolbox changed its VP9 colour signalling after the stream was declared",
+                            "VideoToolbox changed its VP9 color signaling after the stream was declared",
                         ));
                     }
                     (picture.data, key.is_some())

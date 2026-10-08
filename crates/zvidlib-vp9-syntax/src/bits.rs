@@ -179,7 +179,7 @@ impl<'a> BoolDecoder<'a> {
     }
 }
 
-/// `vpx_norm`: the left shift that renormalises a range back to 128..255.
+/// `vpx_norm`: the left shift that renormalizes a range back to 128..255.
 static NORM: [u8; 256] = {
     let mut table = [0u8; 256];
     let mut index = 1;

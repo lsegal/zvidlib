@@ -54,7 +54,7 @@
 //! for the same reason `crate::hevc::decode_profile` leaves its scopes on the
 //! ordinary path: a gated profiler measures a build nobody ships. It costs two
 //! `Instant::now()` reads and one relaxed `fetch_add` per phase per *frame*,
-//! tens of nanoseconds against a whole-frame surface copy and colour
+//! tens of nanoseconds against a whole-frame surface copy and color
 //! conversion, which is why the phases are placed per frame and never per row
 //! or per sample.
 
@@ -107,7 +107,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// The whole readback: surface copy plus colour conversion.
+    /// The whole readback: surface copy plus color conversion.
     #[must_use]
     pub fn total(self) -> Duration {
         self.surface_copy.saturating_add(self.color_convert)
@@ -174,7 +174,7 @@ impl Timer {
 
 /// Counts one delivered frame.
 ///
-/// Called once per frame from the colour-conversion site, which every backend
+/// Called once per frame from the color-conversion site, which every backend
 /// runs exactly once per delivered frame; see [`Timer`] for the `dead_code`
 /// allowance.
 #[allow(dead_code)]

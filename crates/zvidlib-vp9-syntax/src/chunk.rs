@@ -1,5 +1,5 @@
 //! What a hardware decoder needs to know about a VP9 chunk before handing it to the platform:
-//! whether it shows a frame, and that frame's size and colour.
+//! whether it shows a frame, and that frame's size and color.
 //!
 //! The platform decoders decode the chunk; this reads only the start of each frame's
 //! uncompressed header (section 6.2), as far as the frame size, and follows the reference slots
@@ -11,7 +11,7 @@ use super::bits::BitReader;
 use super::{malformed, read_render_size, read_sync_code, superframe_index, unsupported};
 use crate::Result;
 
-/// The size and colour of a decoded frame.
+/// The size and color of a decoded frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameShape {
     pub width: usize,
@@ -25,7 +25,7 @@ pub struct FrameShape {
 /// What the start of one frame's header says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameInfo {
-    /// The frame's size and colour, or for `show_existing_frame` those of the frame it shows.
+    /// The frame's size and color, or for `show_existing_frame` those of the frame it shows.
     pub shape: FrameShape,
     pub shown: bool,
     /// Whether the frame is a key frame, which refreshes every reference slot.

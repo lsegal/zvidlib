@@ -8,12 +8,12 @@
 //! and writes reconstructed samples into a [`crate::engine::picture::Picture`]:
 //!
 //! 1. §8.4.2 — derive `IntraPredModeY` for each luma prediction block
-//!    from the signalled `prev_intra_luma_pred_flag` / `mpm_idx` /
-//!    `rem_intra_luma_pred_mode` and the neighbour modes; §8.4.3 —
+//!    from the signaled `prev_intra_luma_pred_flag` / `mpm_idx` /
+//!    `rem_intra_luma_pred_mode` and the neighbor modes; §8.4.3 —
 //!    derive `IntraPredModeC`.
 //! 2. §8.4.4.1 — for every transform block, gather the §8.4.4.2.1
 //!    reference samples from the already-reconstructed picture (the
-//!    §6.4.1 availability of left / above neighbours), run §8.4.4.2
+//!    §6.4.1 availability of left / above neighbors), run §8.4.4.2
 //!    prediction.
 //! 3. §8.6.2 — dequantize + inverse-transform the coded residual block
 //!    (when its coded-block-flag is set), add it to the prediction, and
@@ -21,7 +21,7 @@
 //!
 //! The transform-tree recursion mirrors the §8.4.4.1 luma decode order
 //! (the residual quadtree drives the transform-block grid) so each block
-//! sees its left / above neighbours already reconstructed before it
+//! sees its left / above neighbors already reconstructed before it
 //! predicts.
 
 use crate::engine::availability::PictureTiling;
@@ -29,7 +29,7 @@ use crate::engine::binarization::{
     CuPredMode, LumaIntraModeSource, PartMode, derive_intra_pred_mode_c, derive_intra_pred_mode_y,
     intra_luma_cand_mode_list, luma_intra_mode_source_from_flag,
 };
-use crate::engine::intra_mode_field::{IntraModeField, Neighbour};
+use crate::engine::intra_mode_field::{IntraModeField, Neighbor};
 use crate::engine::intra_pred::{
     Component as IpComponent, INTRA_DC, IntraPredError, IntraPredParams, MarkedReferenceSamples,
     intra_predict_with_substitution,
@@ -57,7 +57,7 @@ pub enum ReconError {
     /// The decoded CTU carried an inter prediction unit, which the intra
     /// reconstruction path does not handle.
     InterNotSupported,
-    /// The §6.4.1 picture-tiling geometry needed for neighbour
+    /// The §6.4.1 picture-tiling geometry needed for neighbor
     /// availability could not be built.
     Tiling(crate::engine::availability::AvailabilityError),
 }
@@ -219,7 +219,7 @@ fn qp_bd_offset(bit_depth: u8) -> i32 {
 /// §8.6.1 — derive `Qp′Y` for a luma transform block.
 ///
 /// `Qp′Y = QpY + QpBdOffsetY`, with `QpY` the slice QP plus any
-/// `CuQpDeltaVal` (clipped per the §8.6.1 wrap). The neighbour-prediction
+/// `CuQpDeltaVal` (clipped per the §8.6.1 wrap). The neighbor-prediction
 /// of `qPY_PRED` collapses to a single value when every coding unit in
 /// the picture shares the slice QP (no `cu_qp_delta`); the recursion
 /// threads `cu_qp_delta_val` so the general single-CU-per-QG case is
@@ -314,9 +314,9 @@ fn chroma_qp_act(params: &ReconParams, qp_y: i32, cidx: TfComponent, act: bool) 
 
 /// Gather the §8.4.4.2.1 reference-sample array for a transform block at
 /// plane position `(xb, yb)` of side `n_tbs` from the already-
-/// reconstructed picture, marking each neighbour available per the §6.4.1
+/// reconstructed picture, marking each neighbor available per the §6.4.1
 /// z-scan availability process (via [`ReconCtx::ref_sample_available`]):
-/// a neighbour is available iff it is inside the picture, already decoded
+/// a neighbor is available iff it is inside the picture, already decoded
 /// in z-scan order, and in the same slice / tile. The unavailable samples
 /// are substituted by [`intra_predict_with_substitution`].
 fn gather_reference_samples(
@@ -1055,7 +1055,7 @@ fn extract_residual_tree(
             // §8.5.4.1 step 4 — a tu_residual_act_flag == 1 unit
             // (4:4:4) derives all three co-located residual arrays
             // (ACT-adjusted qP), applies cross-component prediction,
-            // then the §8.6.8.2 inverse colour transform, before the
+            // then the §8.6.8.2 inverse color transform, before the
             // arrays land in the CU planes.
             if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 {
                 let mut r_y = match &unit.residual_luma {
@@ -1298,12 +1298,12 @@ fn inter_residual_block(
     Ok(r)
 }
 
-/// Per-picture intra-reconstruction neighbour state — the §8.4.2
+/// Per-picture intra-reconstruction neighbor state — the §8.4.2
 /// `IntraPredModeY` field plus the §6.4.1 picture tiling that resolves
-/// neighbour availability.
+/// neighbor availability.
 ///
 /// One [`ReconCtx`] is shared across every CTU of a slice so the §8.4.2
-/// most-probable-mode derivation sees the actual left / above neighbour
+/// most-probable-mode derivation sees the actual left / above neighbor
 /// modes (rather than the flat-single-CU `INTRA_DC` assumption). Build it
 /// with [`ReconCtx::new`]; reconstruct each CTU in tile-scan order with
 /// [`reconstruct_intra_ctu_ctx`].
@@ -1314,7 +1314,7 @@ pub struct ReconCtx {
     /// `SliceAddrRs[ ctbAddrRs ]` — the raster address of the first CTB
     /// of the independent slice segment that owns each CTB. All-zero for a
     /// single-slice picture; the multi-slice driver populates it so the
-    /// §6.4.1 z-scan availability denies neighbours across slice
+    /// §6.4.1 z-scan availability denies neighbors across slice
     /// boundaries.
     slice_addr_rs: Vec<u32>,
     /// §8.6.1 per-picture luma-QP derivation state (`None` for the
@@ -1328,7 +1328,7 @@ pub struct ReconCtx {
 }
 
 /// §8.6.1 quantization-parameter derivation state: the per-4×4 `QpY`
-/// map (feeding the `qPY_A` / `qPY_B` neighbour reads and the §8.7.2
+/// map (feeding the `qPY_A` / `qPY_B` neighbor reads and the §8.7.2
 /// deblocking QP), the decode-order `qPY_PREV` thread, and the current
 /// quantization group.
 #[derive(Debug)]
@@ -1372,7 +1372,7 @@ impl QpState {
 }
 
 impl ReconCtx {
-    /// Build the neighbour context for a `pic_width` × `pic_height` luma
+    /// Build the neighbor context for a `pic_width` × `pic_height` luma
     /// picture with the given `CtbLog2SizeY` / `MinTbLog2SizeY` and tile
     /// layout.
     ///
@@ -1597,7 +1597,7 @@ impl ReconCtx {
     /// address, `PicSizeInCtbsY` long). Each entry is the raster address
     /// of the first CTB of the independent slice segment owning that CTB.
     /// Used by the multi-slice driver so the §6.4.1 z-scan availability
-    /// denies cross-slice neighbours.
+    /// denies cross-slice neighbors.
     ///
     /// # Panics
     /// Panics if `map.len()` is not `PicSizeInCtbsY`.
@@ -1619,10 +1619,10 @@ impl ReconCtx {
             .unwrap_or(0)
     }
 
-    /// §6.4.1 z-scan availability of the neighbour luma location
+    /// §6.4.1 z-scan availability of the neighbor luma location
     /// `( x_nb, y_nb )` for the current prediction block at
     /// `( x_curr, y_curr )`, consulting the per-CTB `SliceAddrRs` map so
-    /// neighbours in a different slice segment are unavailable.
+    /// neighbors in a different slice segment are unavailable.
     fn available(&self, x_curr: usize, y_curr: usize, x_nb: i64, y_nb: i64) -> bool {
         self.tiling.z_scan_availability(
             x_curr as u32,
@@ -1633,9 +1633,9 @@ impl ReconCtx {
         )
     }
 
-    /// §8.4.4.2.1 reference-sample availability for one neighbour sample of
+    /// §8.4.4.2.1 reference-sample availability for one neighbor sample of
     /// a transform block. `(x_tb, y_tb)` is the current transform block's
-    /// **plane** top-left and `(x_ref, y_ref)` the neighbour's **plane**
+    /// **plane** top-left and `(x_ref, y_ref)` the neighbor's **plane**
     /// coordinates; `(sub_w, sub_h)` is the plane's `(SubWidthC, SubHeightC)`
     /// (`(1, 1)` for luma). The §6.4.1 z-scan availability is evaluated on
     /// the corresponding luma locations.
@@ -1691,8 +1691,8 @@ impl ReconCtx {
 
 /// Reconstruct one decoded coding tree unit's intra samples into `pic`,
 /// driving the §8.4.2 most-probable-mode derivation off the shared
-/// [`ReconCtx`] neighbour field. CTUs must be reconstructed in tile-scan
-/// order so each one's left / above neighbours are already recorded.
+/// [`ReconCtx`] neighbor field. CTUs must be reconstructed in tile-scan
+/// order so each one's left / above neighbors are already recorded.
 ///
 /// # Errors
 /// [`ReconError::InterNotSupported`] if any leaf coding unit is inter;
@@ -1708,7 +1708,7 @@ pub fn reconstruct_intra_ctu_ctx(
 }
 
 /// Reconstruct one **intra** leaf coding unit into `pic`, recording its
-/// §8.4.2 `IntraPredModeY` into the shared [`ReconCtx`] neighbour field.
+/// §8.4.2 `IntraPredModeY` into the shared [`ReconCtx`] neighbor field.
 ///
 /// This is the per-CU entry the §8.5 picture-level inter driver calls for
 /// an intra coding unit embedded in a P / B slice (mixed-mode pictures);
@@ -1731,7 +1731,7 @@ pub fn reconstruct_intra_cu_ctx(
 /// `(ctb_x, ctb_y)` is the CTB's luma top-left position.
 ///
 /// This single-CTU convenience builds a fresh single-CTU [`ReconCtx`]
-/// internally — its neighbours are the CTU's own already-reconstructed
+/// internally — its neighbors are the CTU's own already-reconstructed
 /// blocks, so a multi-CTU picture must instead share one [`ReconCtx`]
 /// across CTUs via [`reconstruct_intra_ctu_ctx`].
 ///
@@ -1855,7 +1855,7 @@ pub struct PlacedCtu<'a> {
     /// independent slice segment that owns this CTB. `0` for a
     /// single-slice picture; the multi-slice driver
     /// (`reconstruct_intra_multislice_picture`) sets it to the slice's
-    /// `slice_segment_address` so cross-slice neighbours are denied.
+    /// `slice_segment_address` so cross-slice neighbors are denied.
     pub slice_addr_rs: u32,
     /// The decoded coding tree unit.
     pub ctu: &'a CodingTreeUnit,
@@ -1865,11 +1865,11 @@ pub struct PlacedCtu<'a> {
 /// §8.7.3 sample-adaptive-offset in-loop filter.
 ///
 /// `ctus` are the picture's decoded coding tree units **in tile-scan
-/// (decode) order** — each one's left / above neighbours must already be
+/// (decode) order** — each one's left / above neighbors must already be
 /// reconstructed when it is processed, which the tile-scan order
 /// guarantees. The driver shares one [`ReconCtx`] across all CTUs so the
-/// §8.4.2 most-probable-mode derivation sees the true neighbour modes, then
-/// resolves each CTB's [`crate::engine::sao::ResolvedSao`] (honouring
+/// §8.4.2 most-probable-mode derivation sees the true neighbor modes, then
+/// resolves each CTB's [`crate::engine::sao::ResolvedSao`] (honoring
 /// `sao_merge_left_flag` / `sao_merge_up_flag`) and runs
 /// [`crate::engine::sao::apply_sao_picture`].
 ///
@@ -1908,8 +1908,8 @@ pub fn reconstruct_intra_picture(
     let pic_h_ctbs = pic_height_luma.div_ceil(ctb_size);
 
     // Build the per-CTB SliceAddrRs map from the placed CTUs (default 0
-    // for any CTB not covered) and feed it to the neighbour context so the
-    // §6.4.1 z-scan availability denies cross-slice neighbours.
+    // for any CTB not covered) and feed it to the neighbor context so the
+    // §6.4.1 z-scan availability denies cross-slice neighbors.
     let mut slice_addr_map = vec![0u32; pic_w_ctbs * pic_h_ctbs];
     for placed in ctus {
         let rx = (placed.x_ctb as usize) >> pic_params.ctb_log2_size_y;
@@ -1926,9 +1926,9 @@ pub fn reconstruct_intra_picture(
         reconstruct_intra_ctu_ctx(&mut pic, params, &mut ctx, placed.ctu)?;
 
         // §7.4.9.3 SAO merge: resolve against the already-resolved left /
-        // above CTB in the grid, but only when that neighbour is in the
+        // above CTB in the grid, but only when that neighbor is in the
         // SAME slice segment (the merge candidate availability follows the
-        // §6.4.1 slice-boundary rule). A neighbour in a different slice is
+        // §6.4.1 slice-boundary rule). A neighbor in a different slice is
         // not a merge candidate.
         let rx = (placed.x_ctb as usize) >> pic_params.ctb_log2_size_y;
         let ry = (placed.y_ctb as usize) >> pic_params.ctb_log2_size_y;
@@ -1979,7 +1979,7 @@ fn reconstruct_quadtree(
 }
 
 /// §8.4.2 — derive `IntraPredModeY` for one luma prediction block at
-/// `( x_pb, y_pb )` of side `n_pb`, consulting the [`ReconCtx`] neighbour
+/// `( x_pb, y_pb )` of side `n_pb`, consulting the [`ReconCtx`] neighbor
 /// field for the candidate modes, then record it back into the field.
 fn derive_and_record_luma_mode(
     ctx: &mut ReconCtx,
@@ -1990,15 +1990,15 @@ fn derive_and_record_luma_mode(
     pcm_flag: bool,
 ) -> u8 {
     // Step 1 / 2 — candidate modes from the left (A) and above (B)
-    // neighbours, gated on §6.4.1 z-scan availability.
+    // neighbors, gated on §6.4.1 z-scan availability.
     let avail_a = ctx.available(x_pb, y_pb, x_pb as i64 - 1, y_pb as i64);
     let avail_b = ctx.available(x_pb, y_pb, x_pb as i64, y_pb as i64 - 1);
     let cand_a = ctx
         .field
-        .cand_intra_pred_mode(x_pb, y_pb, Neighbour::Left, avail_a);
+        .cand_intra_pred_mode(x_pb, y_pb, Neighbor::Left, avail_a);
     let cand_b = ctx
         .field
-        .cand_intra_pred_mode(x_pb, y_pb, Neighbour::Above, avail_b);
+        .cand_intra_pred_mode(x_pb, y_pb, Neighbor::Above, avail_b);
 
     // Step 3 / 4 — candModeList + the prev_intra_luma_pred_flag selection.
     let cand_list = intra_luma_cand_mode_list(cand_a, cand_b);
@@ -2014,12 +2014,12 @@ fn derive_and_record_luma_mode(
 
 /// Reconstruct one leaf coding unit. Only intra CUs are handled; each luma
 /// prediction block's `IntraPredModeY` is derived per §8.4.2 from the
-/// [`ReconCtx`] neighbour field (most-probable-mode), and chroma
+/// [`ReconCtx`] neighbor field (most-probable-mode), and chroma
 /// `IntraPredModeC` per §8.4.3 from the first PB's luma mode.
 /// §8.4.1 — write a PCM coding unit's (already scaled) samples into
 /// the picture: `SL[xCb+i][yCb+j] = pcm_sample_luma[nCbS*j + i] <<
 /// (BitDepthY − PcmBitDepthY)` (equation 8-12; the shift was applied
-/// at parse time) and the chroma analogues.
+/// at parse time) and the chroma analogs.
 /// §8.4.4.2.7 — write a palette CU's reconstructed components into
 /// the picture. `qp_y` is the §8.6.1-derived QpY of the CU; per-
 /// component `Qp′` values (eq. 8-73..8-75) feed the escape
@@ -2111,7 +2111,7 @@ fn reconstruct_cu(
     cu: &CodingUnit,
 ) -> Result<(), ReconError> {
     if matches!(cu.cu_pred_mode, CuPredMode::Inter | CuPredMode::Skip) {
-        // Record the inter CU so a later intra block's §8.4.2 neighbour
+        // Record the inter CU so a later intra block's §8.4.2 neighbor
         // derivation maps it to INTRA_DC, then signal the inter path is
         // unhandled by this driver.
         ctx.field.record_non_intra_cu(
@@ -2130,7 +2130,7 @@ fn reconstruct_cu(
     if cu.pcm_flag {
         // §8.4.1 — PCM reconstruction: the parsed (already
         // bit-depth-scaled, equation 8-12) samples ARE the
-        // reconstructed picture; stamp the mode field so neighbours
+        // reconstructed picture; stamp the mode field so neighbors
         // see a written block (→ DC).
         ctx.field.record_intra_pb(x_cb, y_cb, n_cb, INTRA_DC, true);
         if let Some(pcm) = cu.pcm.as_ref() {
@@ -2141,7 +2141,7 @@ fn reconstruct_cu(
 
     if let Some(pal) = cu.palette.as_deref() {
         // §8.4.4.2.7 — palette-mode reconstruction. A palette CU has
-        // no IntraPredModeY; neighbours derive INTRA_DC (the PCM
+        // no IntraPredModeY; neighbors derive INTRA_DC (the PCM
         // convention).
         ctx.field.record_intra_pb(x_cb, y_cb, n_cb, INTRA_DC, true);
         // §8.6.1 QP derivation feeds the escape dequantization; the
@@ -2456,7 +2456,7 @@ fn reconstruct_transform_unit(
         apply_cu_chroma_qp_offset(params, off);
     }
 
-    // §8.6.8 adaptive colour transform (4:4:4 only): the three
+    // §8.6.8 adaptive color transform (4:4:4 only): the three
     // co-located residual arrays of this unit are jointly modified
     // before the per-component prediction + add.
     if unit.tu_residual_act_flag == 1 && params.chroma_array_type == 3 && !skip_chroma {
@@ -2482,7 +2482,7 @@ fn reconstruct_transform_unit(
         .residual_luma
         .as_ref()
         .is_some_and(|rb| rb.transform_skip);
-    // (§7.3.8.11: explicit_rdpcm_flag is only signalled for MODE_INTER
+    // (§7.3.8.11: explicit_rdpcm_flag is only signaled for MODE_INTER
     // blocks — an intra unit's residual never carries it.)
     let luma_residual = reconstruct_intra_block(
         pic,
@@ -2569,11 +2569,11 @@ fn reconstruct_transform_unit(
     Ok(())
 }
 
-/// §8.4.4.1 with `residual_adaptive_colour_transform_enabled_flag` and
+/// §8.4.4.1 with `residual_adaptive_color_transform_enabled_flag` and
 /// `tu_residual_act_flag == 1` (4:4:4): the transform unit's three
 /// co-located residual arrays are derived (ACT-adjusted qP per
 /// eq. 8-291 / 8-287 / 8-288), cross-component prediction applies
-/// first (§8.4.4.1 step 8), then the §8.6.8.2 inverse colour
+/// first (§8.4.4.1 step 8), then the §8.6.8.2 inverse color
 /// transform, then each component is predicted and stored.
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_act_transform_unit(
@@ -2641,7 +2641,7 @@ fn reconstruct_act_transform_unit(
     )?;
 
     // §8.4.4.1 step 8 — cross-component prediction precedes the
-    // colour transform (the §8.4.1 step-2 ordering).
+    // color transform (the §8.4.1 step-2 ordering).
     if let Some(c) = CcpInput::resolve(
         params.chroma_array_type,
         unit.cross_comp_pred_cb.as_ref(),
@@ -2669,7 +2669,7 @@ fn reconstruct_act_transform_unit(
         );
     }
 
-    // §8.6.8.2 — the inverse adaptive colour transformation.
+    // §8.6.8.2 — the inverse adaptive color transformation.
     crate::engine::transform::act_inverse(
         &mut r_y,
         &mut r_cb,
@@ -2864,7 +2864,7 @@ mod tests {
             palette: None,
             prediction_units: vec![],
             // prev_intra_luma_pred_flag + mpm_idx 0 ⇒ candModeList[0] =
-            // PLANAR for the all-DC neighbour fallback.
+            // PLANAR for the all-DC neighbor fallback.
             intra_luma: vec![IntraLumaMode {
                 prev_intra_luma_pred_flag: true,
                 mpm_idx: Some(0),
@@ -2884,7 +2884,7 @@ mod tests {
     /// Build a 16x16 transquant-bypass intra CTU whose single luma TB
     /// carries `levels` (row-major raw bypass residual) and whose luma
     /// mode comes from `luma_mode` (an MPM/rem selector against the
-    /// no-neighbour candModeList {PLANAR, DC, 26}).
+    /// no-neighbor candModeList {PLANAR, DC, 26}).
     fn bypass_intra_ctu(levels: Vec<i32>, luma_mode: IntraLumaMode) -> CodingTreeUnit {
         let unit = TransformUnit {
             residual_luma: Some(ResidualBlock {
@@ -2924,7 +2924,7 @@ mod tests {
     }
 
     /// §8.4.4.1 implicit RDPCM, vertical: a transquant-bypass TB in
-    /// mode 26 (candModeList[2] with no neighbours) whose residual has
+    /// mode 26 (candModeList[2] with no neighbors) whose residual has
     /// row 0 = 5 accumulates down every column (eq. 8-323), so the
     /// whole block reconstructs to 128 + 5.
     #[test]
@@ -3039,7 +3039,7 @@ mod tests {
 
     #[test]
     fn flat_intra_luma_reconstructs_to_constant_field() {
-        // pred = midlevel 128 (no neighbours); luma DC −67 dequant+IDCT
+        // pred = midlevel 128 (no neighbors); luma DC −67 dequant+IDCT
         // gives a uniform −47 residual, so recSamples = 128 − 47 = 81.
         let params = tiny_params();
         let ctu = flat_intra_ctu(-67, None, None);
@@ -3097,7 +3097,7 @@ mod tests {
     }
 
     /// Build an 8×8 intra CU at `(x0, y0)` carrying the given luma-mode
-    /// signalling and a uniform DC luma residual (no chroma).
+    /// signaling and a uniform DC luma residual (no chroma).
     fn intra_cu_8x8(
         x0: u32,
         y0: u32,
@@ -3130,16 +3130,16 @@ mod tests {
         }
     }
 
-    /// The §8.4.2 neighbour MPM derivation makes a CU's IntraPredModeY
-    /// depend on its already-reconstructed left / above neighbours. A right
-    /// CU signalling `mpm_idx == 0` against a left neighbour coded with a
-    /// non-DC angular mode picks up `candModeList[0]` = the neighbour's
+    /// The §8.4.2 neighbor MPM derivation makes a CU's IntraPredModeY
+    /// depend on its already-reconstructed left / above neighbors. A right
+    /// CU signaling `mpm_idx == 0` against a left neighbor coded with a
+    /// non-DC angular mode picks up `candModeList[0]` = the neighbor's
     /// mode (proved by inspecting the recorded IntraModeField), whereas the
     /// flat-single-CU path would have derived INTRA_DC.
     #[test]
-    fn neighbour_mpm_propagates_left_cu_mode_to_right_cu() {
+    fn neighbor_mpm_propagates_left_cu_mode_to_right_cu() {
         let params = tiny_params();
-        // Left CU (0,0): remaining-mode angular 18. Both neighbours are
+        // Left CU (0,0): remaining-mode angular 18. Both neighbors are
         // out-of-picture ⇒ candA == candB == INTRA_DC; the step-4 ordered
         // procedure maps rem_intra_luma_pred_mode 18 (with neither DC nor
         // PLANAR below it) up to IntraPredModeY 20.
@@ -3149,8 +3149,8 @@ mod tests {
             rem_intra_luma_pred_mode: Some(18),
         };
         // Right CU (8,0): mpm_idx 0 ⇒ IntraPredModeY = candModeList[0]. Its
-        // left neighbour (7,*) is the left CU (mode 20, available in z-scan
-        // order); its above neighbour is out-of-picture (DC). candA(20) !=
+        // left neighbor (7,*) is the left CU (mode 20, available in z-scan
+        // order); its above neighbor is out-of-picture (DC). candA(20) !=
         // candB(DC) and neither is PLANAR ⇒ candModeList[0] == candA == 20.
         let right = IntraLumaMode {
             prev_intra_luma_pred_flag: true,
@@ -3176,20 +3176,20 @@ mod tests {
 
         // The left CU's remaining-mode 18 resolves to IntraPredModeY 20.
         assert_eq!(ctx.recorded_mode(0, 0), Some(20), "left CU mode");
-        // The right CU's mpm_idx 0 picked up the left neighbour's mode 20
+        // The right CU's mpm_idx 0 picked up the left neighbor's mode 20
         // through candModeList[0] — the §8.4.2 propagation under test.
         assert_eq!(
             ctx.recorded_mode(8, 0),
             Some(20),
-            "right CU inherited the left neighbour's mode via MPM"
+            "right CU inherited the left neighbor's mode via MPM"
         );
     }
 
-    /// Counter-case: with NO recorded left neighbour (a single isolated
-    /// CU), the same `mpm_idx == 0` signalling derives candModeList[0] from
+    /// Counter-case: with NO recorded left neighbor (a single isolated
+    /// CU), the same `mpm_idx == 0` signaling derives candModeList[0] from
     /// the all-DC fallback ⇒ INTRA_PLANAR (0), not the angular 20 above.
     #[test]
-    fn isolated_cu_mpm_zero_is_planar_not_neighbour_mode() {
+    fn isolated_cu_mpm_zero_is_planar_not_neighbor_mode() {
         let params = tiny_params();
         let right = IntraLumaMode {
             prev_intra_luma_pred_flag: true,
@@ -3423,14 +3423,14 @@ mod tests {
         assert_eq!(out.sample(Plane::Luma, 4, 4), 88, "SAO band offset applied");
     }
 
-    /// Multi-slice neighbour isolation: two 16×16 CTUs side by side in a
+    /// Multi-slice neighbor isolation: two 16×16 CTUs side by side in a
     /// 32×16 picture. The right CTU's `mpm_idx == 0` inherits the left
     /// CTU's angular mode 20 through the §8.4.2 MPM when both share a slice
     /// (map `[0, 0]`), but falls back to INTRA_PLANAR when the right CTU is
     /// in a different slice (map `[0, 1]`) — the §6.4.1 z-scan availability
-    /// denies a neighbour across the slice boundary.
+    /// denies a neighbor across the slice boundary.
     #[test]
-    fn slice_boundary_blocks_neighbour_mpm() {
+    fn slice_boundary_blocks_neighbor_mpm() {
         let params = tiny_params();
         let left = IntraLumaMode {
             prev_intra_luma_pred_flag: false,
@@ -3464,7 +3464,7 @@ mod tests {
         reconstruct_intra_ctu_ctx(&mut pic, &params, &mut ctx, &r0).unwrap();
         assert_eq!(ctx.recorded_mode(16, 0), Some(20), "same-slice inherits 20");
 
-        // Cross-slice (map [0, 1]): the right CTU's left neighbour (15,*)
+        // Cross-slice (map [0, 1]): the right CTU's left neighbor (15,*)
         // is in slice 0 ⇒ denied ⇒ MPM falls back to PLANAR.
         let (l1, r1) = make_ctus();
         let mut pic2 = Picture::new(32, 16, 1, 8, 8);
@@ -3554,7 +3554,7 @@ mod tests {
     }
 
     /// A 16×16 PART_2Nx2N intra CU at `(x0, y0)` with a uniform DC luma
-    /// residual and the given luma-mode signalling (test helper).
+    /// residual and the given luma-mode signaling (test helper).
     fn intra_cu_16x16(x0: u32, y0: u32, luma: IntraLumaMode) -> CodingUnit {
         let unit = TransformUnit {
             residual_luma: Some(dc_block(4, 0)),
@@ -3606,7 +3606,7 @@ mod tests {
     }
 
     /// A 16×16 transquant-bypass 4:4:4 intra CTU: PLANAR luma (mpm 0,
-    /// no neighbours), derived chroma (mode 4), raw bypass residuals.
+    /// no neighbors), derived chroma (mode 4), raw bypass residuals.
     fn ccp_intra_ctu(
         luma_levels: Vec<i32>,
         cb_levels: Option<Vec<i32>>,
@@ -3811,7 +3811,7 @@ mod tests {
     }
 
     /// A zero ResScaleVal (`log2_res_scale_abs_plus1 == 0`) is the
-    /// signalled no-op: no chroma modification, cbf-clear blocks stay
+    /// signaled no-op: no chroma modification, cbf-clear blocks stay
     /// zero.
     #[test]
     fn ccp_zero_scale_is_noop() {
@@ -3833,7 +3833,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // §8.6.8 adaptive colour transform (4:4:4)
+    // §8.6.8 adaptive color transform (4:4:4)
     // -----------------------------------------------------------------
 
     /// A 16×16 transquant-bypass 4:4:4 intra CTU whose single TU has
@@ -3974,7 +3974,7 @@ mod tests {
     }
 
     /// §8.4.4.1 step-8 ordering: cross-component prediction applies
-    /// BEFORE the §8.6.8.2 colour transform. Luma coded 8 with
+    /// BEFORE the §8.6.8.2 color transform. Luma coded 8 with
     /// ResScaleVal +8 on Cb: rCb becomes 8 before the lifting ⇒
     /// tmp = 8 − 4 = 4, rY = 12, rCb = 4, rCr = 4 (Cr CCP absent,
     /// rCr = 0 + rCb after eq. 8-339... rCr = 0 → rCb' = 4 ⇒ rCr = 4).

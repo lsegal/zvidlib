@@ -398,7 +398,7 @@ pub struct ForwardBlockParams {
     pub n_tbs: usize,
     /// `qP` — the §8.6.1-derived quantization parameter for this block.
     pub q_p: u32,
-    /// The colour component `cIdx`.
+    /// The color component `cIdx`.
     pub component: Component,
     /// `CuPredMode[ xTbY ][ yTbY ]`.
     pub pred_mode: PredMode,

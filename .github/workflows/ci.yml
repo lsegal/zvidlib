@@ -20,19 +20,19 @@ on:
 permissions:
   contents: read
 
-# Superseded pull-request runs are cancelled, because the scarce resource here
+# Superseded pull-request runs are canceled, because the scarce resource here
 # is the runner pool rather than the minutes: a run for a commit that has
 # already been pushed over sits in the same queue as the run somebody is
 # waiting on, and this repository pushes to a branch several times before it is
-# reviewed. `main` pushes and `workflow_dispatch` runs are never cancelled -
-# the benchmark job's stored baseline is a chain, and a cancelled link is a
+# reviewed. `main` pushes and `workflow_dispatch` runs are never canceled -
+# the benchmark job's stored baseline is a chain, and a canceled link is a
 # missing comparison for the run after it.
 #
 # The exemption is carried by the *group* rather than by `cancel-in-progress`,
 # which is a literal here on purpose. `cancel-in-progress: ${{ ... }}` is
 # substituted before it is read, so a `push` rendered the string `false` and
 # every non-empty string is truthy: the flag meant to protect `main` was the
-# thing cancelling it, and only when two pushes landed close enough together to
+# thing canceling it, and only when two pushes landed close enough together to
 # overlap, which is why it survived so long (#451). Instead, only a
 # `pull_request` shares a group with anything - `github.ref` is
 # `refs/pull/N/merge`, so a PR's runs supersede each other and no other PR's -
@@ -810,7 +810,7 @@ jobs:
     strategy:
       # One target failing still leaves the other fourteen measured, and the
       # report job below refuses to build a baseline out of a partial suite
-      # anyway - so cancelling the survivors would only cost the log that says
+      # anyway - so canceling the survivors would only cost the log that says
       # which ones were fine.
       fail-fast: false
       matrix:

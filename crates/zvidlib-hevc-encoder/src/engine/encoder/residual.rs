@@ -298,7 +298,7 @@ pub(crate) fn write_residual_coding<S: ResidualBinSink>(
         }
         debug_assert!(
             sb_coded == 0 || !infer_sb_dc_sig || sig[0] == 1,
-            "an explicitly coded sub-block with no signalled significance must \
+            "an explicitly coded sub-block with no signaled significance must \
              carry its level at the DC cell"
         );
         if sb_coded == 0 {

@@ -41,7 +41,7 @@ export function scrubStrideFrames(msPerFrame) {
 
 // The frame the next step of the walk asks for. Decoding only runs forwards, so a target ahead
 // of the reader is continued towards a stride at a time and never overshot, while a target
-// behind it - or a position a cancelled decode left unknown - restarts at the random-access
+// behind it - or a position a canceled decode left unknown - restarts at the random-access
 // point the target decodes from.
 export function scrubWalkStart(position, target, msPerFrame, randomAccessPoints) {
   if (position === null) return randomAccessPointAtOrBefore(randomAccessPoints, target);

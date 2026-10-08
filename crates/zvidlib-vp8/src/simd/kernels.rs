@@ -411,7 +411,7 @@ pub unsafe fn sixtap<V: I32x>(
     }
 }
 
-/// `TM_PRED` of an `size`x`size` block: each sample is its left neighbour
+/// `TM_PRED` of an `size`x`size` block: each sample is its left neighbor
 /// plus the one above it minus the corner, clamped. `above` holds the `size`
 /// samples above the block, without the corner.
 #[inline(always)]

@@ -118,7 +118,7 @@ pub fn create_vp8(
 }
 
 /// Creates a Media Foundation VP9 profile 0 decoder. Its pictures are converted by the software
-/// decoder's own conversion, with the colour each frame's header names.
+/// decoder's own conversion, with the color each frame's header names.
 pub fn create_vp9(
     configuration: &VideoDecoderConfig,
     limits: &Limits,
@@ -181,7 +181,7 @@ enum Bitstream {
     Vp8 { convert: PlanarConverter },
     /// One VP9 chunk per sample, passed through unchanged: the transform decodes a superframe's
     /// hidden frames on the way to the frame it shows. `inspector` reads each chunk's headers
-    /// first, for the size and colour of the frame it shows, which `shapes` holds under the
+    /// first, for the size and color of the frame it shows, which `shapes` holds under the
     /// sample's timestamp until that frame is output.
     Vp9 {
         inspector: Box<ChunkInspector>,
@@ -367,12 +367,12 @@ struct DecoderCore {
     identities: HashMap<i64, FrameIndex>,
     /// The timestamps of submitted hidden VP8 frames. A hidden frame is decoded but never
     /// displayed, so it owns no presentation identity; should the transform still output it, its
-    /// sample is recognised here and dropped rather than taken for a frame nobody submitted.
+    /// sample is recognized here and dropped rather than taken for a frame nobody submitted.
     hidden: HashSet<i64>,
     next_identity: i64,
     /// Whether the samples `ProcessOutput` hands back are wanted as frames. A suppressed sample
     /// is still decoded and still collected - the transform will not proceed until its output is
-    /// taken - but it never reaches the staging copy or the colour conversion.
+    /// taken - but it never reaches the staging copy or the color conversion.
     output_wanted: bool,
 }
 
@@ -463,7 +463,7 @@ impl DecoderCore {
         sample: &EncodedVideoSample,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         let name = self.name();
         let (data, shown) = match &mut self.bitstream {
             Bitstream::Hevc {
@@ -549,7 +549,7 @@ impl DecoderCore {
     }
 
     fn drain(&mut self, cancellation: &CancellationToken) -> Result<Vec<DecodedVideoFrame>> {
-        check_cancelled(cancellation)?;
+        check_canceled(cancellation)?;
         let name = self.name();
         unsafe {
             self.transform
@@ -595,7 +595,7 @@ impl DecoderCore {
         let name = self.name();
         let mut frames = Vec::new();
         loop {
-            check_cancelled(cancellation)?;
+            check_canceled(cancellation)?;
             let mut data = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
                 pSample: ManuallyDrop::new(None),
@@ -1213,11 +1213,11 @@ fn frame_size(dimensions: VideoDimensions) -> u64 {
     (u64::from(dimensions.width) << 32) | u64::from(dimensions.height)
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
+fn check_canceled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_canceled() {
         Err(Error::new(
-            ErrorKind::Cancelled,
-            "codec operation cancelled",
+            ErrorKind::Canceled,
+            "codec operation canceled",
         ))
     } else {
         Ok(())

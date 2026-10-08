@@ -97,9 +97,9 @@ impl WebPreviewIndex {
     /// the event loop between them, so a page stays responsive while the index
     /// fills. A frame that will not decode leaves its slot empty and the pass
     /// carries on, exactly as the native pass does - a gap costs a fallback to
-    /// the neighbouring picture, not an error the caller has to show.
+    /// the neighboring picture, not an error the caller has to show.
     ///
-    /// Cancelling is the one failure that does *not* advance the pass: the
+    /// Canceling is the one failure that does *not* advance the pass: the
     /// position was never visited, so the next call asks for it again rather
     /// than leaving a hole a later lookup would fall through.
     pub async fn step(&mut self, cancellation: &CancellationToken) -> Result<bool> {
@@ -111,7 +111,7 @@ impl WebPreviewIndex {
                 Ok(picture) => self.pass.accept(&picture, &self.limits),
                 Err(_) => self.pass.skip(),
             },
-            Err(error) if error.kind() == ErrorKind::Cancelled => return Err(error),
+            Err(error) if error.kind() == ErrorKind::Canceled => return Err(error),
             Err(_) => self.pass.skip(),
         }
         Ok(self.pass.next_frame().is_some())

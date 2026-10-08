@@ -441,7 +441,7 @@ pub(super) fn predict_inter(
     // The samples the filters read, three rows and columns before the block
     // and four after, edge-clamped.
     let span = size + 7;
-    // The identity kernel copies its centre sample, so a whole-sample vector
+    // The identity kernel copies its center sample, so a whole-sample vector
     // is a copy: most of the encoder's vectors are whole samples, as the
     // motion search finds them.
     if fraction_x == 0 && fraction_y == 0 {

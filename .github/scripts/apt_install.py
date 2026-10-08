@@ -4,7 +4,7 @@
 The workflows installed their native dependencies with a bare `sudo apt-get
 update && sudo apt-get install -y ...`. Now and then a mirror stalls and
 `apt-get` waits on it forever: on 2026-10-07 several `Rust tests (<package>)`
-jobs sat in that step for over an hour, and a job that is not cancelled by hand
+jobs sat in that step for over an hour, and a job that is not canceled by hand
 holds its run until the 6-hour job timeout (#647).
 
 This runs `apt-get update` and `apt-get install` under `timeout`, so a stalled

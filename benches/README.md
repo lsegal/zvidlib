@@ -359,7 +359,7 @@ under parity on x86_64 and routed to the scalar reference there — and the
 `coeff_base` / `coeff_br` context derivation the coefficient coding loop runs on (§8.3.2, `crates/zvidlib-av1/src/av1_simd/coeff.rs`, the `av1_coeff_ctx` dispatch site).
 The last of those derives a whole block's contexts in one data-parallel pass
 ahead of the serial symbol loop, which is legal because the loop walks the
-up-right diagonal scan backwards, so every neighbour a position consults is
+up-right diagonal scan backwards, so every neighbor a position consults is
 already final — or zero, past the end-of-block. `av1_encode_stage_coeff_ctx` is
 that pass on its own, and is the group its scalar-versus-vector delta is visible
 in.
@@ -499,7 +499,7 @@ number for another.
 
 Both arms fold their output with the same cheap FNV step for the bit-exactness
 guard — over the RGBA bytes in one case and the picture's planes in the other —
-so the gap between the groups is the conversion and not an artefact of how each
+so the gap between the groups is the conversion and not an artifact of how each
 identifies its result. (`hevc_decode` previously took a `FrameDigest` per frame
 inside the timed loop; SHA-256 over an 8 MB frame cost more than the decode it
 was measuring, which inflated the group and buried the conversion it was meant
@@ -568,7 +568,7 @@ buy, because it does not say how much of a real frame goes through the stage.
 Issue #189 was that gap: `hevc_decode/<isa>` moved only ~1.06x between the
 `scalar` and `neon` arms while §8.5.3.3 luma interpolation measures 1.6-1.7x,
 §8.7.3 SAO 2.4x and §8.7.2 deblocking 1.3x in isolation. The breakdown below is
-what identified the missing colour-conversion kernel (#219) as the largest
+what identified the missing color-conversion kernel (#219) as the largest
 single reason, and then, one stage at a time, why each of the other isolated
 figures did not predict what that stage moved (#280 for inter prediction, #310
 for SAO).
@@ -645,7 +645,7 @@ ms/frame, a 1.41x whole-frame ratio.
 | `header_parse` | 0.0% | 0.0% | 0.00 | no |
 | _unattributed_ | 13.2% | 14.6% | 2.56 | n/a |
 
-"Share of decode" divides by the total minus `color_convert`, because colour
+"Share of decode" divides by the total minus `color_convert`, because color
 conversion is not decoding: it is the YUV420-to-RGBA pass every whole-frame
 measurement takes on the way out of the decoder. Both denominators are reported
 because the two answer different questions and are easy to confuse.
@@ -713,7 +713,7 @@ roughly a third for a stage no HEVC kernel touched. Issue #219 vectorized it
 (`crates/zvidlib-color/src/color_convert.rs`, timed by the `hevc_color_convert` group), and it
 falls from **9.16 ms/frame to 1.86 ms/frame — 4.9x** — which is most of why the
 whole-frame ratio moved from ~1.06x to 1.41x on this host. It is still a third
-of the `scalar` arm, because that arm is what a *scalar* colour conversion
+of the `scalar` arm, because that arm is what a *scalar* color conversion
 costs; on the `neon` arm it is 9.6%.
 
 #### `inter_pred`: the isolated ratio and the in-decode one, reconciled
@@ -987,7 +987,7 @@ on.
 **The phase finding transfers to both x86 backends; its size does not.** The
 vertical-only row is the only one above parity at every width on both backends,
 and the ordering of the three phases is the same on all three instruction sets,
-so the "who pays to narrow the source" argument below is not a NEON artefact.
+so the "who pays to narrow the source" argument below is not a NEON artifact.
 But the win is **smaller on x86 than on NEON, and smallest on the widest
 backend**: at 64x64 the vertical-only phase reads 1.43x on NEON, 1.29-1.31x on
 `sse4.1` and 1.10-1.12x on `avx2`. That ordering is the lane-count prediction
@@ -1500,7 +1500,7 @@ moves in the flattering direction: a 5-round draw on this same host reports a
 noise. An interquartile band over five readings is three of them, so it
 understates a spread it has barely sampled. The floor is only as trustworthy as
 the round count behind it, and a lower one obtained by shortening the run is an
-artefact rather than a tightening.
+artifact rather than a tightening.
 
 **Issue #438 moved that from prose into the instrument, because a trap only
 this document knows about is one the output still sets.** `--pair` now prints
@@ -1629,7 +1629,7 @@ contradicts. Uniformly over Table 8-8, three of sixteen phase combinations are
 horizontal-only, three vertical-only (which already narrowed), nine
 two-dimensional (which gains about a tenth) and one full-pel (which does not
 filter), so the per-phase ratios weight out to under a tenth of the stage. And
-that is the favourable half of the accounting: mirroring the chroma planes adds
+that is the favorable half of the accounting: mirroring the chroma planes adds
 another half a luma plane's worth of writing for a 4-tap filter on quarter-sized
 blocks, against a plane set already 50% larger in memory for carrying two
 representations of every eight-bit sample.
@@ -1693,7 +1693,7 @@ of decode proper. Two answers, and this time the first one is not a matter of
 degree.
 
 **No in-decode SAO sample reached a vector kernel at all.** §8.7.3.2's
-per-sample edge classification has to deny a neighbour read that crosses a slice
+per-sample edge classification has to deny a neighbor read that crosses a slice
 or tile boundary with filtering across it disabled, so `apply_sao_ctb_full` took
 its branch-free row path — the one that calls `sao_edge_row` / `sao_band_row` —
 only when the caller passed no `SaoBoundaries` at all. The decoder always passes
@@ -1702,18 +1702,18 @@ not known before it is parsed, and the same held for the `NoFilterMap` that
 carries §8.7.3.1's PCM and transquant-bypass suppression, which is present for a
 whole picture as soon as one coding unit anywhere in it qualifies. So every
 picture the decoder filtered went down the per-sample scalar path, with a
-`neighbour_allowed` CTB-grid lookup, an in-picture test and a `Picture::sample` /
+`neighbor_allowed` CTB-grid lookup, an in-picture test and a `Picture::sample` /
 `set_sample` plane resolution per sample — and both arms ran exactly the same
 code. 0.99x was not a slow kernel or a diluted stage; it was an unreached one,
 and no isolated measurement of the kernels could have predicted it.
 
 Both tests are now asked about the CTB rather than about the picture.
-`SaoBoundaries::ctb_neighbourhood_unconstrained` clears a CTB whose eight
-neighbours are all mutually filterable — the classifier reads at most one sample
+`SaoBoundaries::ctb_neighborhood_unconstrained` clears a CTB whose eight
+neighbors are all mutually filterable — the classifier reads at most one sample
 away, so no sample in such a CTB has a read the per-sample test could deny —
 and `NoFilterMap::any_in_luma_rect` clears one no suppressed cell reaches. Band
 offset (equation 8-414) classifies each sample by its own value and reads no
-neighbour, so no boundary constraint applies to it at all. A CTB that fails
+neighbor, so no boundary constraint applies to it at all. A CTB that fails
 either test still takes the scalar path, which stays the normative reference; on
 a single-slice single-tile picture none do.
 
@@ -2034,7 +2034,7 @@ immediately behind its target as well as the target, as many as
 `Limits::max_cached_frames` holds (32 by default), which is what makes stepping
 backwards free after a seek. A preview walk called `get` once per published
 picture and paid that tail every time, so a stride shorter than the tail
-converted everything it passed and the walk was back to #354's behaviour by a
+converted everything it passed and the walk was back to #354's behavior by a
 different route. Issue #402 moved intermediate steps onto
 `ExactFrameReader::get_step`, which converts the picture it was asked for and
 nothing else, and the knee went with it.
@@ -2115,7 +2115,7 @@ with no preview tier, no proxy and no change to the reader. That is the figure
 that **rejects decoding the group of pictures in parallel across several
 sessions**: it only ever helps a track with more than one random-access point,
 and on such a track the exact seek already answers in 19-31 ms. On the track
-that actually has the problem there is nothing to parallelise — one entry point
+that actually has the problem there is nothing to parallelize — one entry point
 admits one walk — so the direction is fastest exactly where it is not needed and
 inapplicable where it is.
 
@@ -2291,7 +2291,7 @@ measurement months later. Compiling on every PR makes that failure immediate and
 cheap.
 
 It deliberately does **not** time anything on a pull request. GitHub's shared
-runners differ in CPU model, neighbour load, and thermal state between two runs
+runners differ in CPU model, neighbor load, and thermal state between two runs
 of the same commit by far more than the regressions worth catching. A PR gate on
 those timings would fail on noise, and a check that fails on noise gets disabled.
 
@@ -2441,7 +2441,7 @@ directly comparable to each other either.
 
 Groups built through `bench_across_isas` run one arm per entry in
 `simd::available()`, so a runner without AVX2 simply has no `avx2` arm. That is
-the correct behaviour — the alternative is scalar numbers filed under a vector
+the correct behavior — the alternative is scalar numbers filed under a vector
 label — but it is invisible in a results table: an absent `av1_deblock/avx2` and
 a slow one look the same from the outside, and GitHub's runner pool is not
 uniform in AVX2 availability. The bench target therefore prints
@@ -2478,7 +2478,7 @@ python3 .github/scripts/criterion_baseline.py table \
 Three rounds and not one, because `table` takes the elementwise **minimum**
 across the baselines it is given. Contention only ever makes a measurement
 slower, so the fastest observation of an arm is the closest any round got to an
-uncontended one; averaging would fold every neighbour process into the number
+uncontended one; averaging would fold every neighbor process into the number
 instead. Three is a floor rather than a target: the aarch64 table below was
 drawn with six, because the host measuring it was running other work and more
 rounds is the only lever this recipe has against that.
@@ -2686,7 +2686,7 @@ reported with a control rather than on its own. `crates/zvidlib-av1-decoder/benc
 `av1_deblock` was re-measured in the same session, same recipe, and read
 **20.288 ms / 2.845 ms (7.13x)** against the **23.124 ms / 3.364 ms (6.87x)**
 the row above carries: both arms 12-15% faster, the ratio within 4%. Read the
-`av1_deblock_luma` ratio against its neighbours and its two absolute times as a
+`av1_deblock_luma` ratio against its neighbors and its two absolute times as a
 slightly quieter host's. The control also confirms on aarch64 what [One group
 name, two
 targets](#one-group-name-two-targets-and-the-row-that-moved-for-nothing) reports
@@ -2958,7 +2958,7 @@ for a quieter host, because the same session re-measured
 control and it lands on the committed row above: **26.975 ms / 3.927 ms
 (6.87x) / 3.381 ms (7.98x)** against the row's 26.956 ms / 3.934 ms (6.85x) /
 3.392 ms (7.95x), every arm within **0.32%**. The new row is therefore directly
-comparable to its neighbours as drawn. It also reproduces the figure the
+comparable to its neighbors as drawn. It also reproduces the figure the
 superseded `b284c38a6391` table carried under the name `av1_deblock` — #350's
 rounds collected `codec.rs`'s side, and #417 renamed it — to within **0.25%**
 on every arm (21.506 ms / 3.974 ms / 3.424 ms there), which is the paired
@@ -3372,7 +3372,7 @@ one is ahead: 937.520 µs against 1.165 ms at 320x180, 8.643 ms against 10.738 m
 at 1080p, the same ratio at both sizes because the group derives contexts for
 4x4 blocks and nothing else. Under #362's routing those two columns read the
 same number to within 0.13%, because they *were* the same kernel; the split
-reopening in AVX2's favour is what a kernel that actually fills its lanes looks
+reopening in AVX2's favor is what a kernel that actually fills its lanes looks
 like. `av1_encode_stage_tile`, which runs the derivation behind the serial range
 coder, carries a smaller share of it through — 1.23x against 1.22x — as it
 should, since the context pass is one stage of that group rather than all of it.
@@ -3687,7 +3687,7 @@ Those are host-specific answers rather than general ones. The Windows run is
 the discrete-GPU case the split was built to expose: a real PCIe transfer in
 `surface_copy` (`cuvidMapVideoFrame` plus `cuMemcpyDtoH`, or the staging-texture
 `CopySubresourceRegion` plus `Map`) rather than a unified-memory lock. The
-transfer is measurable but the colour conversion still dominates both
+transfer is measurable but the color conversion still dominates both
 backends, and together they account for more than 90% of steady-state decode.
 
 There is no readback arm on the software baseline. The seam covers the
@@ -3749,7 +3749,7 @@ encoder encodes to learn its parameter sets before the caller's first frame.
 | NVIDIA HEVC Encoder MFT (NVENC) | RTX 4080 + i9-10850K, Windows 11 (#487) | 294 Mpx/s, 141.7 fps | 4.7x | 425 ms | 417 ms |
 | VideoToolbox HEVC | Apple M1 (MacBookAir10,1), macOS 26.6.2 (#494) | 223 Mpx/s, 107.4 fps | 3.6x | 44.3 ms | 46 ms |
 
-The RGBA input reaches NVENC as ARGB32, so the colour conversion in that figure
+The RGBA input reaches NVENC as ARGB32, so the color conversion in that figure
 is the GPU's; the only CPU work per frame is the red/blue swap into BGRA and the
 copy into a Media Foundation buffer. Setup is dominated by NVENC's own session
 initialization, and is paid once per recording rather than per frame.
@@ -3922,7 +3922,7 @@ exist yet, and the target prints that on every run so a missing group is never
 read as a stage that costs nothing.
 
 `..._reconstruct` does exist, and it is the one stage whose measured shape
-depends on the access unit being modelled. The reconstruction loop always runs
+depends on the access unit being modeled. The reconstruction loop always runs
 (predict, add the coded residual, clip); the in-loop filters only modify samples
 when the access unit leaves them enabled on its PCM coding units
 (`pcm_loop_filter_disabled_flag == 0`), which is the shape this group models,

@@ -30,7 +30,7 @@ use crate::ColorRange;
 
 /// The predictor the WHT group subtracts, the mid-point of the 8-bit range.
 ///
-/// The tile encoder's own `DC_PRED` predictor depends on neighbouring
+/// The tile encoder's own `DC_PRED` predictor depends on neighboring
 /// reconstructions, which is tile work rather than transform work; a fixed
 /// predictor keeps this group measuring only the butterfly.
 const BENCH_PREDICTOR: i32 = 128;
@@ -184,7 +184,7 @@ pub fn tile_encode(plane: &[u8], width: usize, height: usize, qindex: u8) -> Vec
 /// visible.
 ///
 /// The coefficients fed to it are the plane's own lossless WHT output, so the
-/// magnitude distribution — and therefore the neighbour sums the contexts are
+/// magnitude distribution — and therefore the neighbor sums the contexts are
 /// made of — is the one the encoder really derives contexts over, not a
 /// synthetic one.
 ///

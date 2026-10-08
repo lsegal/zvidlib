@@ -136,7 +136,7 @@ struct Tile<'a> {
     left_partition: [u8; 8],
 }
 
-/// The neighbourhood of the block being decoded (the parts of libvpx's
+/// The neighborhood of the block being decoded (the parts of libvpx's
 /// `MACROBLOCKD` set by `set_offsets`).
 #[derive(Clone, Copy)]
 struct BlockContext {
@@ -2052,7 +2052,7 @@ fn tile_offset(index: usize, mis: usize, log2: u32) -> usize {
     offset.min(mis)
 }
 
-/// A scan order and its neighbour table (`ScanOrder`).
+/// A scan order and its neighbor table (`ScanOrder`).
 #[derive(Clone, Copy)]
 struct Scan {
     scan: &'static [i16],

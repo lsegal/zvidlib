@@ -33,11 +33,11 @@ pub fn pick_level(dimensions: VideoDimensions, timescale: u32, frame_duration: u
 }
 
 /// The complete `vpcC` box (`VPCodecConfigurationBox`, version 1) for an
-/// 8-bit 4:2:0 profile 0 stream whose bitstream colour space is `color_space`
+/// 8-bit 4:2:0 profile 0 stream whose bitstream color space is `color_space`
 /// (VP9 section 7.2.2).
 pub fn vpcc_box(level: u8, color_space: u8, full_range: bool) -> Vec<u8> {
-    // ISO/IEC 23091-2 colour primaries, transfer characteristics and matrix
-    // coefficients for each VP9 colour space; unknown and reserved values
+    // ISO/IEC 23091-2 color primaries, transfer characteristics and matrix
+    // coefficients for each VP9 color space; unknown and reserved values
     // map to "unspecified".
     let (primaries, transfer, matrix) = match color_space {
         1 | 3 => (6, 6, 6), // BT.601, SMPTE 170M
@@ -60,8 +60,8 @@ pub fn vpcc_box(level: u8, color_space: u8, full_range: bool) -> Vec<u8> {
     output
 }
 
-/// Builds the `vpcC` for a stream from its first key frame, reading the colour
-/// space and range the encoder signalled, or `None` when `frame` is not a
+/// Builds the `vpcC` for a stream from its first key frame, reading the color
+/// space and range the encoder signaled, or `None` when `frame` is not a
 /// profile 0 key frame.
 ///
 /// The browser encoder needs this because `WebCodecs` reports no decoder

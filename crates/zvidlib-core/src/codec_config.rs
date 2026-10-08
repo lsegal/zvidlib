@@ -45,8 +45,8 @@ pub struct Vp9CodecConfig {
     /// 3 is 4:4:4.
     pub chroma_subsampling: u8,
     pub video_full_range: bool,
-    /// ISO/IEC 23091-2 colour description; 2 means unspecified.
-    pub colour_primaries: u8,
+    /// ISO/IEC 23091-2 color description; 2 means unspecified.
+    pub color_primaries: u8,
     pub transfer_characteristics: u8,
     pub matrix_coefficients: u8,
 }
@@ -59,7 +59,7 @@ impl Default for Vp9CodecConfig {
             bit_depth: 8,
             chroma_subsampling: 0,
             video_full_range: false,
-            colour_primaries: 2,
+            color_primaries: 2,
             transfer_characteristics: 2,
             matrix_coefficients: 2,
         }
@@ -103,7 +103,7 @@ impl Vp9CodecConfig {
                     bit_depth: record[2] >> 4,
                     chroma_subsampling: (record[2] >> 1) & 0b111,
                     video_full_range: record[2] & 1 == 1,
-                    colour_primaries: record[3],
+                    color_primaries: record[3],
                     transfer_characteristics: record[4],
                     matrix_coefficients: record[5],
                 }
@@ -199,7 +199,7 @@ impl Vp9CodecConfig {
                 | u8::from(self.video_full_range),
         );
         bytes.extend_from_slice(&[
-            self.colour_primaries,
+            self.color_primaries,
             self.transfer_characteristics,
             self.matrix_coefficients,
             0,

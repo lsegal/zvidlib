@@ -103,7 +103,7 @@
 //!   the per-sub-layer DPB / reorder / latency triple loop.
 //! * §7.3.2.2 [`sps::SeqParameterSet`] — vps-id back-reference,
 //!   max-sub-layers / nesting flag, the §7.3.3 PTL re-walk,
-//!   `chroma_format_idc` / `separate_colour_plane_flag`,
+//!   `chroma_format_idc` / `separate_color_plane_flag`,
 //!   `pic_width_in_luma_samples` / `pic_height_in_luma_samples`,
 //!   conformance-window quad, `bit_depth_{luma,chroma}_minus8`,
 //!   `log2_max_pic_order_cnt_lsb_minus4`, the per-sub-layer
@@ -125,7 +125,7 @@
 //!   `vui_parameters_present_flag` gate whose §E.2.1
 //!   `vui_parameters()` body is decoded into [`vui::VuiParameters`]
 //!   (aspect-ratio / EXTENDED_SAR, overscan, video-signal-type +
-//!   colour-description, chroma-loc, default-display-window, the
+//!   color-description, chroma-loc, default-display-window, the
 //!   `vui_timing_info` block — `u(32)` num_units_in_tick / time_scale
 //!   plus the nested §E.2.3 `hrd_parameters()` call — and
 //!   bitstream-restriction), and the `sps_extension_present_flag`
@@ -410,12 +410,12 @@ pub use simd::{Isa, available_isas, detected_isa};
 pub use inter_recon::SliceWpTables;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use intra_mode_field::{IntraModeField, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE, Neighbour};
+pub use intra_mode_field::{IntraModeField, MIN_BLOCK_LOG2, MIN_BLOCK_SIZE, Neighbor};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use motion::{
-    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighbourPu,
-    PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbours, TemporalMvContext,
+    MergeCandidate, MergeListParams, MotionCell, MotionField, Mv, MvpContext, NeighborPu,
+    PartitionContext, RefPicId, SpatialMergeCandidates, SpatialMergeNeighbors, TemporalMvContext,
     append_combined_bi_candidates, append_zero_merge_candidates, build_merge_candidate,
     derive_chroma_mv, derive_mvp_candidate, derive_spatial_merge_candidates, derive_temporal_mv,
     reconstruct_mv,
@@ -504,7 +504,7 @@ pub use vui::VuiError;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use vui::{
-    BitstreamRestriction, ColourDescription, DefaultDisplayWindow, EXTENDED_SAR, VideoSignalType,
+    BitstreamRestriction, ColorDescription, DefaultDisplayWindow, EXTENDED_SAR, VideoSignalType,
     VuiParameters, VuiTimingInfo,
 };
 

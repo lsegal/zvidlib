@@ -384,7 +384,7 @@ impl Report {
 
     /// Profiled time other than [`Stage::ColorConvert`].
     ///
-    /// Colour conversion is on the path every whole-frame measurement takes
+    /// Color conversion is on the path every whole-frame measurement takes
     /// but is not decoding, and it is large enough on this crate's sample to
     /// move every other stage's share materially. Reporting both denominators
     /// keeps "share of what the benchmark measures" and "share of the decoder"
@@ -826,7 +826,7 @@ mod tests {
         );
         let vector = report.vectorized_share();
         assert!((vector - 0.25).abs() < 1e-9, "vectorized share {vector}");
-        // No colour conversion was profiled, so both denominators agree.
+        // No color conversion was profiled, so both denominators agree.
         assert!((report.vectorized_decode_share() - vector).abs() < 1e-9);
         assert_eq!(report.decode_total(), report.total());
         assert!(report.markdown_table(1).contains("`residual_cabac`"));
@@ -874,9 +874,9 @@ mod tests {
     }
 
     #[test]
-    fn colour_conversion_is_out_of_the_decode_denominator() {
+    fn color_conversion_is_out_of_the_decode_denominator() {
         // The one case where the two denominators are meant to disagree, which
-        // an injected report can state exactly: 20 ms of colour conversion in
+        // an injected report can state exactly: 20 ms of color conversion in
         // a 100 ms profile is 20% of the total and none of the decode, and
         // every other stage's decode share is against the remaining 80 ms.
         let report = report_of(

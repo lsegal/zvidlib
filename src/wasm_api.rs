@@ -76,7 +76,7 @@ fn error_code_for_kind(kind: ErrorKind) -> &'static str {
         ErrorKind::Io => "IO",
         ErrorKind::Codec => "CODEC",
         ErrorKind::Graphics => "GRAPHICS",
-        ErrorKind::Cancelled => "CANCELLED",
+        ErrorKind::Canceled => "CANCELED",
         ErrorKind::InvalidState => "INVALID_STATE",
         ErrorKind::Internal => "INTERNAL",
         ErrorKind::WouldBlock => "WOULD_BLOCK",
@@ -109,7 +109,7 @@ fn normalize_browser_error(error: JsValue, context: &str) -> JsValue {
 /// Cancels `cancellation` when `signal` aborts, so a decode already under way stops there.
 ///
 /// The returned closure is the live `abort` listener and has to outlive the operation it is
-/// cancelling; dropping it removes the listener.
+/// canceling; dropping it removes the listener.
 fn cancel_on_abort(signal: &AbortSignal, cancellation: &CancellationToken) -> Closure<dyn FnMut()> {
     let cancellation = cancellation.clone();
     let listener = Closure::<dyn FnMut()>::new(move || cancellation.cancel());
@@ -120,8 +120,8 @@ fn cancel_on_abort(signal: &AbortSignal, cancellation: &CancellationToken) -> Cl
 fn check_signal(signal: Option<&AbortSignal>) -> Result<(), JsValue> {
     if signal.is_some_and(AbortSignal::aborted) {
         Err(js_error(
-            ErrorKind::Cancelled,
-            "the browser operation was cancelled",
+            ErrorKind::Canceled,
+            "the browser operation was canceled",
         ))
     } else {
         Ok(())
@@ -1388,7 +1388,7 @@ impl WasmPreviewIndex {
     /// One preview per call is the point: the caller comes back through the
     /// event loop between them, so the page stays responsive while the index
     /// fills. A frame that will not decode leaves its position empty and the
-    /// pass carries on - a gap costs a fallback to the neighbouring picture,
+    /// pass carries on - a gap costs a fallback to the neighboring picture,
     /// not an error. Aborting is the one failure that does not advance the
     /// pass, so the next call asks for the same position again.
     pub fn step(&self, signal: Option<AbortSignal>) -> Promise {
@@ -2933,10 +2933,10 @@ mod tests {
         let controller = AbortController::new().unwrap();
         let cancellation = CancellationToken::new();
         let _listener = cancel_on_abort(&controller.signal(), &cancellation);
-        assert!(!cancellation.is_cancelled());
+        assert!(!cancellation.is_canceled());
         controller.abort();
         assert!(
-            cancellation.is_cancelled(),
+            cancellation.is_canceled(),
             "aborting the signal cancels the decode it was passed to"
         );
     }
@@ -3267,7 +3267,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("an aborted stream must not open successfully"),
         };
-        assert_error_code(&error, "CANCELLED");
+        assert_error_code(&error, "CANCELED");
     }
 
     #[wasm_bindgen_test(async)]
@@ -4056,7 +4056,7 @@ mod tests {
         options.set_video_codec("vp8".to_owned()).unwrap();
         let mut output = browser_output(&options);
         let video = output.video(0).unwrap();
-        // Two and a half seconds of a grey frame at 30 frames a second.
+        // Two and a half seconds of a gray frame at 30 frames a second.
         const FRAMES: u64 = 75;
         let pixels = owned_u8_array(&[128_u8; 32 * 32 * 4]);
         let frame = WasmVideoFrame::rgba(32, 32, pixels).unwrap();

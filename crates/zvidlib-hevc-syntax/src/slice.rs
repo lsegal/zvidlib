@@ -1,7 +1,7 @@
 //! Slice segment header parser per ITU-T Rec. H.265 §7.3.6.1.
 //!
 //! Round-6 scope: parse the `slice_segment_header()` syntax structure
-//! (§7.3.6.1) for an independent slice segment, materialising every
+//! (§7.3.6.1) for an independent slice segment, materializing every
 //! field that does **not** require decoded-picture-buffer state to
 //! interpret. The parse takes the activated SPS and PPS as context
 //! because several field widths and presence gates are derived from
@@ -11,7 +11,7 @@
 //! gates come from the SPS, and the tiles / entropy-sync entry-point
 //! block comes from the PPS).
 //!
-//! ## What this round materialises
+//! ## What this round materializes
 //!
 //! * `first_slice_segment_in_pic_flag`, `no_output_of_prior_pics_flag`
 //!   (IRAP only), `slice_pic_parameter_set_id`.
@@ -22,7 +22,7 @@
 //! * For independent slice segments (`!dependent_slice_segment_flag`):
 //!   the `slice_reserved_flag[]` block, `slice_type`,
 //!   `pic_output_flag` (only when `output_flag_present_flag`),
-//!   `colour_plane_id` (only when `separate_colour_plane_flag`),
+//!   `color_plane_id` (only when `separate_color_plane_flag`),
 //!   `slice_temporal_mvp_enabled_flag` (only when
 //!   `sps_temporal_mvp_enabled_flag`), the SAO luma / chroma gates,
 //!   `slice_qp_delta` (`se(v)`), the chroma QP offsets, the
@@ -48,12 +48,12 @@
 //!   `stRpsIdx == num_short_term_ref_pic_sets` case, which is not yet
 //!   exposed publicly. When the current NAL unit is **not** an IDR
 //!   (`nal_unit_type != IDR_W_RADL && != IDR_N_LP`), the parser stops
-//!   right after `colour_plane_id` and surfaces the remainder as
+//!   right after `color_plane_id` and surfaces the remainder as
 //!   [`SliceSegmentHeader::opaque_tail`].
 //! * The **P / B reference-list / weighted-prediction sub-structures**
 //!   (`ref_pic_lists_modification()` §7.3.6.2 and `pred_weight_table()`
 //!   §7.3.6.3) need DPB-derived `NumPicTotalCurr` / `RefPicList`
-//!   values. When `slice_type` is P or B the parser materialises the
+//!   values. When `slice_type` is P or B the parser materializes the
 //!   common P/B fields up to (but not including) the point where those
 //!   sub-structures would begin, then surfaces the remainder as the
 //!   opaque tail. The §7.3.6.2 syntax structure itself is implemented
@@ -197,14 +197,14 @@ pub struct SliceDeblocking {
     pub tc_offset_div2: i8,
 }
 
-/// One long-term reference picture entry signalled in the slice
+/// One long-term reference picture entry signaled in the slice
 /// header (§7.3.6.1). For the first `num_long_term_sps` entries the
 /// `lt_idx_sps` indexes the SPS's long-term-ref-pic table; for the
 /// remaining `num_long_term_pics` entries the slice header carries
 /// the POC LSB and `used_by_curr_pic_lt_flag` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceLongTermRefPic {
-    /// Source of the entry: SPS table or in-slice signalling.
+    /// Source of the entry: SPS table or in-slice signaling.
     pub source: SliceLongTermRefPicSource,
     /// `delta_poc_msb_present_flag[i]`.
     pub delta_poc_msb_present_flag: bool,
@@ -225,7 +225,7 @@ pub enum SliceLongTermRefPicSource {
         lt_idx_sps: u32,
     },
     /// Remaining `num_long_term_pics` entries: the POC LSB and
-    /// `used_by_curr_pic_lt_flag` are signalled directly in the slice
+    /// `used_by_curr_pic_lt_flag` are signaled directly in the slice
     /// header.
     InSlice {
         /// `poc_lsb_lt[i]` (`u(v)`, width
@@ -242,7 +242,7 @@ impl SliceLongTermRefPic {
     /// > `UsedByCurrPicLt[ i ]` is set equal to
     /// > `used_by_curr_pic_lt_sps_flag[ lt_idx_sps[ i ] ]` when the
     /// > entry's source is the SPS table, and to
-    /// > `used_by_curr_pic_lt_flag[ i ]` when the entry is signalled
+    /// > `used_by_curr_pic_lt_flag[ i ]` when the entry is signaled
     /// > directly in the slice header.
     ///
     /// Returns `None` when [`SliceLongTermRefPicSource::Sps`] points at
@@ -297,7 +297,7 @@ pub struct EntryPointOffsets {
     /// `offset_len_minus1` (`ue(v)`, range 0..=31). Each
     /// `entry_point_offset_minus1[i]` is `offset_len_minus1 + 1` bits.
     /// Only meaningful when `num_entry_point_offsets > 0`; left at 0
-    /// when no offsets are signalled.
+    /// when no offsets are signaled.
     pub offset_len_minus1: u8,
     /// `entry_point_offset_minus1[i]` (`u(offset_len_minus1 + 1)`) for
     /// `i = 0 .. num_entry_point_offsets`. Empty when
@@ -319,7 +319,7 @@ impl EntryPointOffsets {
 /// Parsed `ref_pic_lists_modification()` syntax structure
 /// (ITU-T Rec. H.265 §7.3.6.2 / §7.4.7.2).
 ///
-/// The structure is signalled in the slice header when
+/// The structure is signaled in the slice header when
 /// `lists_modification_present_flag == 1 && NumPicTotalCurr > 1`
 /// (§7.3.6.1 gate). It carries a per-list "explicit list" override of
 /// the implicit `RefPicList0` / `RefPicList1` derivation of §8.3.4: the
@@ -350,7 +350,7 @@ pub struct RefPicListsModification {
     /// Empty when `ref_pic_list_modification_flag_l0 == 0`.
     pub list_entry_l0: Vec<u32>,
     /// `ref_pic_list_modification_flag_l1` (`u(1)`). `None` when the
-    /// slice is not a B slice (the field is not signalled).
+    /// slice is not a B slice (the field is not signaled).
     pub ref_pic_list_modification_flag_l1: Option<bool>,
     /// `list_entry_l1[i]` for `i = 0 ..= num_ref_idx_l1_active_minus1`.
     /// Empty for P slices and when `ref_pic_list_modification_flag_l1
@@ -364,7 +364,7 @@ impl RefPicListsModification {
     ///
     /// * `slice_type` — the active slice type. Per §7.3.6.2 the L1
     ///   block (`ref_pic_list_modification_flag_l1` /
-    ///   `list_entry_l1[]`) is only signalled for B slices. For an
+    ///   `list_entry_l1[]`) is only signaled for B slices. For an
     ///   I slice the structure is never present at all (the §7.3.6.1
     ///   gate `lists_modification_present_flag && NumPicTotalCurr > 1`
     ///   sits inside the inter-slice `slice_type != I` branch), so
@@ -513,7 +513,7 @@ impl RefPicListsModification {
 ///
 /// * `pps_curr_pic_ref_enabled_flag` — §7.4.7.2 closing-clause flag,
 ///   from the SCC extension of the active PPS. Inferred to `false`
-///   when the SCC PPS is not signalled (§7.4.3.3.1.4).
+///   when the SCC PPS is not signaled (§7.4.3.3.1.4).
 /// * `nal_unit_type` — used only by the F.7.4.7.2 multilayer-extension
 ///   variant of equation 7-57 (`F-56`): when the multilayer extension
 ///   applies and the current picture is IDR (`IDR_W_RADL` /
@@ -538,7 +538,7 @@ pub struct NumPicTotalCurrInputs<'a> {
     /// `num_long_term_sps + num_long_term_pics`.
     pub used_by_curr_pic_lt: &'a [bool],
     /// `pps_curr_pic_ref_enabled_flag` (§7.4.3.3.1.4 SCC PPS). Inferred
-    /// to `false` when not signalled.
+    /// to `false` when not signaled.
     pub pps_curr_pic_ref_enabled_flag: bool,
     /// `nal_unit_type` of the slice's NAL unit (Table 7-1). Consumed
     /// only when [`Self::multilayer_extension`] is `true`.
@@ -578,7 +578,7 @@ impl<'a> NumPicTotalCurrInputs<'a> {
 
     /// Build the inputs from an *explicit-form* short-term RPS, where
     /// the `UsedByCurrPicS0` / `UsedByCurrPicS1` arrays are the
-    /// SPS-signalled `used_by_curr_pic_sX_flag` arrays themselves
+    /// SPS-signaled `used_by_curr_pic_sX_flag` arrays themselves
     /// (§7.4.8 equations 7-65 / 7-66). Returns `None` when the RPS
     /// uses inter-prediction (`inter_ref_pic_set_prediction_flag ==
     /// 1`) — the §7.4.8 derivation must be run first and the result
@@ -671,7 +671,7 @@ pub struct PredWeightEntry {
     /// §7.3.6.3 outer gate (`pic_layer_id != nuh_layer_id ||
     /// PicOrderCnt(RefPicListX[i]) != PicOrderCnt(CurrPic)`) is `false`
     /// for this `i` — for a base-profile single-layer slice the gate is
-    /// always `true`, so this flag is always signalled.
+    /// always `true`, so this flag is always signaled.
     pub luma_weight_flag: bool,
     /// `chroma_weight_lX_flag[i]` (`u(1)`). Absent (inferred `false`)
     /// when `ChromaArrayType == 0` or when the outer gate is `false`
@@ -698,7 +698,7 @@ pub struct PredWeightEntry {
 /// Parsed `pred_weight_table()` syntax structure (ITU-T Rec. H.265
 /// §7.3.6.3 / §7.4.7.3).
 ///
-/// The structure is signalled in the slice header when
+/// The structure is signaled in the slice header when
 /// `(weighted_pred_flag && slice_type == P) ||
 /// (weighted_bipred_flag && slice_type == B)` (§7.3.6.1 gate). It
 /// carries per-reference weighting factors and additive offsets that
@@ -716,11 +716,11 @@ pub struct PredWeightEntry {
 ///       luma_weight_lX_flag[ i ]   u(1)
 /// ```
 ///
-/// — the flag is only signalled when the reference is a *different
+/// — the flag is only signaled when the reference is a *different
 /// picture* (i.e. either an inter-layer reference or a temporal
 /// reference). For a base-profile single-layer slice every active
 /// reference is temporal, so the gate is universally `true` and every
-/// flag is signalled. For inter-layer / SCC self-reference cases the
+/// flag is signaled. For inter-layer / SCC self-reference cases the
 /// gate is `false` for some `i`, and the parser must skip the
 /// corresponding flag bit and infer it to `0` (§7.4.7.3 "When
 /// luma_weight_lX_flag\[ i \] is not present, it is inferred to be equal
@@ -749,7 +749,7 @@ pub struct PredWeightEntry {
 ///   delta_chroma_weight_lX[i][j]` when the chroma flag is set, else
 ///   inferred to `1 << ChromaLog2WeightDenom`.
 /// * `ChromaOffsetLX[i][j]` per equation 7-58 (a clipped expression
-///   parameterised by `WpOffsetHalfRangeC` and `ChromaLog2WeightDenom`).
+///   parameterized by `WpOffsetHalfRangeC` and `ChromaLog2WeightDenom`).
 ///
 /// The accessor methods on this struct apply those derivations.
 ///
@@ -811,11 +811,11 @@ pub struct PredWeightTableInputs<'a> {
     /// Active `num_ref_idx_l1_active_minus1`. Ignored for P slices.
     pub num_ref_idx_l1_active_minus1: u8,
     /// `ChromaArrayType` per §7.4.2.2. When `0` (monochrome or
-    /// separate-colour-plane) the entire chroma sub-block is absent.
+    /// separate-color-plane) the entire chroma sub-block is absent.
     pub chroma_array_type: u8,
     /// `high_precision_offsets_enabled_flag` from the SPS range
     /// extension (§7.4.3.2.2 / equations 7-33 / 7-34). Inferred to
-    /// `false` when the SPS range extension is not signalled.
+    /// `false` when the SPS range extension is not signaled.
     pub high_precision_offsets_enabled_flag: bool,
     /// `BitDepthY` from the SPS (§7.4.3.2.1), used by
     /// `WpOffsetHalfRangeY` when [`Self::high_precision_offsets_enabled_flag`]
@@ -1145,15 +1145,15 @@ fn parse_pred_weight_list(
 
     // Luma flag pass.
     for (i, e) in entries.iter_mut().enumerate() {
-        let signalled = signal_luma.map(|s| s[i]).unwrap_or(true);
-        e.luma_weight_flag = if signalled { br.u1()? != 0 } else { false };
+        let signaled = signal_luma.map(|s| s[i]).unwrap_or(true);
+        e.luma_weight_flag = if signaled { br.u1()? != 0 } else { false };
     }
 
     // Chroma flag pass — present only when ChromaArrayType != 0.
     if chroma_present {
         for (i, e) in entries.iter_mut().enumerate() {
-            let signalled = signal_chroma.map(|s| s[i]).unwrap_or(true);
-            e.chroma_weight_flag = if signalled { br.u1()? != 0 } else { false };
+            let signaled = signal_chroma.map(|s| s[i]).unwrap_or(true);
+            e.chroma_weight_flag = if signaled { br.u1()? != 0 } else { false };
         }
     }
 
@@ -1248,7 +1248,7 @@ fn chroma_offset_eq_7_58(
 ///
 /// Fields that this round defers (the non-IDR POC/RPS block, the P/B
 /// reference-list / weighted-prediction sub-structures) are absent from
-/// the materialised struct; when one of those points is reached the
+/// the materialized struct; when one of those points is reached the
 /// remainder of the header is surfaced via [`Self::opaque_tail`] and
 /// the corresponding `Option` fields stay `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1277,9 +1277,9 @@ pub struct SliceSegmentHeader {
     pub slice_type: Option<SliceType>,
     /// `pic_output_flag`. Inferred to true when not present (§7.4.7.1).
     pub pic_output_flag: bool,
-    /// `colour_plane_id` (`u(2)`). `None` when not present
-    /// (`separate_colour_plane_flag == 0`).
-    pub colour_plane_id: Option<u8>,
+    /// `color_plane_id` (`u(2)`). `None` when not present
+    /// (`separate_color_plane_flag == 0`).
+    pub color_plane_id: Option<u8>,
     /// `slice_pic_order_cnt_lsb` (`u(v)`, width
     /// `log2_max_pic_order_cnt_lsb_minus4 + 4` bits). `None` when the
     /// current NAL unit is an IDR — IDR pictures have no slice POC LSB
@@ -1324,13 +1324,13 @@ pub struct SliceSegmentHeader {
     /// SAO block for P / B slices.
     pub num_ref_idx_active_override_flag: Option<bool>,
     /// `num_ref_idx_l0_active_minus1` (§7.3.6.1, range 0..=14). For P
-    /// / B slices, signalled when `num_ref_idx_active_override_flag ==
+    /// / B slices, signaled when `num_ref_idx_active_override_flag ==
     /// 1` and otherwise inferred to `pps.num_ref_idx_l0_default_active_
     /// minus1` per §7.4.7.1. `None` when the slice is I or the parser
     /// stopped before reaching this point.
     pub num_ref_idx_l0_active_minus1: Option<u8>,
     /// `num_ref_idx_l1_active_minus1` (§7.3.6.1, range 0..=14). For B
-    /// slices, signalled when `num_ref_idx_active_override_flag == 1`
+    /// slices, signaled when `num_ref_idx_active_override_flag == 1`
     /// and otherwise inferred to `pps.num_ref_idx_l1_default_active_
     /// minus1` per §7.4.7.1. `None` when the slice is not B or the
     /// parser stopped before reaching this point.
@@ -1389,7 +1389,7 @@ pub struct SliceSegmentHeader {
     /// gate is statically present
     /// (`(pps.weighted_pred_flag && slice_type == P) ||
     /// (pps.weighted_bipred_flag && slice_type == B)`). `None` when the
-    /// outer gate is statically absent (the table is not signalled), for
+    /// outer gate is statically absent (the table is not signaled), for
     /// I slices, for dependent slice segments, and for headers whose
     /// parse stopped before this point.
     ///
@@ -1533,7 +1533,7 @@ impl SliceSegmentHeader {
         let mut slice_reserved_flags = Vec::new();
         let mut slice_type = None;
         let mut pic_output_flag = true;
-        let mut colour_plane_id = None;
+        let mut color_plane_id = None;
         let mut slice_pic_order_cnt_lsb: Option<u32> = None;
         let mut short_term_ref_pic_set_sps_flag: Option<bool> = None;
         let mut inline_short_term_ref_pic_set: Option<ShortTermRefPicSet> = None;
@@ -1554,9 +1554,9 @@ impl SliceSegmentHeader {
                 pic_output_flag = br.u1()? != 0;
             }
 
-            if sps.separate_colour_plane_flag {
+            if sps.separate_color_plane_flag {
                 let id = br.u(2)? as u8;
-                colour_plane_id = Some(id);
+                color_plane_id = Some(id);
             }
 
             // Non-IDR POC + reference-picture-set block (§7.3.6.1).
@@ -1608,7 +1608,7 @@ impl SliceSegmentHeader {
                     num_long_term_pics = Some(nl_pics);
                     long_term_ref_pics = entries;
                 }
-                // §7.3.6.1: slice_temporal_mvp_enabled_flag is signalled
+                // §7.3.6.1: slice_temporal_mvp_enabled_flag is signaled
                 // inside the non-IDR block — an IDR picture never
                 // carries it and §7.4.7.1 infers it to 0.
                 if sps.sps_temporal_mvp_enabled_flag {
@@ -1648,7 +1648,7 @@ impl SliceSegmentHeader {
                 slice_reserved_flags,
                 slice_type,
                 pic_output_flag,
-                colour_plane_id,
+                color_plane_id,
                 slice_pic_order_cnt_lsb: None,
                 short_term_ref_pic_set_sps_flag: None,
                 inline_short_term_ref_pic_set: None,
@@ -1818,7 +1818,7 @@ impl SliceSegmentHeader {
                     } else {
                         // `NumPicTotalCurr <= 1` — the §7.3.6.1
                         // gate is statically false; the structure
-                        // is not signalled and we continue at
+                        // is not signaled and we continue at
                         // `mvd_l1_zero_flag`.
                         (None, Some(npc))
                     }
@@ -1842,7 +1842,7 @@ impl SliceSegmentHeader {
                         slice_reserved_flags,
                         slice_type,
                         pic_output_flag,
-                        colour_plane_id,
+                        color_plane_id,
                         slice_pic_order_cnt_lsb,
                         short_term_ref_pic_set_sps_flag,
                         inline_short_term_ref_pic_set,
@@ -1936,7 +1936,7 @@ impl SliceSegmentHeader {
                     } else {
                         // !from_l0 implies slice_type == B (an I/P slice
                         // takes the inferred `true` branch). For a B slice
-                        // L1 is signalled by the override block.
+                        // L1 is signaled by the override block.
                         let n1 = num_ref_idx_l1_active_minus1.expect("L1 active populated for B");
                         n1 > 0
                     };
@@ -1969,7 +1969,7 @@ impl SliceSegmentHeader {
             };
 
         // §7.3.6.1 P / B `pred_weight_table()` gate. The table is
-        // signalled iff either `(weighted_pred_flag && slice_type == P)`
+        // signaled iff either `(weighted_pred_flag && slice_type == P)`
         // or `(weighted_bipred_flag && slice_type == B)`. When the gate
         // is statically absent the parser walks straight past it into
         // the merge-candidate block; when it is present the standalone
@@ -2011,7 +2011,7 @@ impl SliceSegmentHeader {
             None
         };
 
-        // §7.3.6.1 `five_minus_max_num_merge_cand` (ue(v)), signalled
+        // §7.3.6.1 `five_minus_max_num_merge_cand` (ue(v)), signaled
         // for every inter slice immediately after the (optional)
         // pred_weight_table(). §7.4.7.1 derives
         // `MaxNumMergeCand = 5 - five_minus_max_num_merge_cand`, with
@@ -2060,7 +2060,7 @@ impl SliceSegmentHeader {
             slice_cr_qp_offset = parse_qp_offset(&mut br, "slice_cr_qp_offset")?;
         }
 
-        // SCC adaptive-colour-transform per-slice QP offsets (§7.3.6.1),
+        // SCC adaptive-color-transform per-slice QP offsets (§7.3.6.1),
         // present only when the SCC PPS body set
         // `pps_slice_act_qp_offsets_present_flag`. §7.4.7.1 bounds the
         // sum `PpsActQpOffset{Y,Cb,Cr} + slice_act_{y,cb,cr}_qp_offset`
@@ -2154,7 +2154,7 @@ impl SliceSegmentHeader {
             slice_reserved_flags,
             slice_type,
             pic_output_flag,
-            colour_plane_id,
+            color_plane_id,
             slice_pic_order_cnt_lsb,
             short_term_ref_pic_set_sps_flag,
             inline_short_term_ref_pic_set,
@@ -2214,9 +2214,9 @@ impl SliceSegmentHeader {
 }
 
 /// `ChromaArrayType` per §7.4.2.2: equal to `chroma_format_idc` unless
-/// `separate_colour_plane_flag == 1`, in which case it is 0.
+/// `separate_color_plane_flag == 1`, in which case it is 0.
 fn chroma_array_type(sps: &SeqParameterSet) -> u8 {
-    if sps.separate_colour_plane_flag {
+    if sps.separate_color_plane_flag {
         0
     } else {
         sps.chroma_format_idc
@@ -2242,7 +2242,7 @@ fn pic_height_in_ctbs_y(sps: &SeqParameterSet) -> u32 {
 
 /// §7.3.6.1 — the entry-point-offset block (`num_entry_point_offsets`,
 /// `offset_len_minus1`, `entry_point_offset_minus1[i]`), present when
-/// tiles or entropy-coding sync are enabled. Signalled by BOTH
+/// tiles or entropy-coding sync are enabled. Signaled by BOTH
 /// independent and dependent slice segments.
 fn parse_entry_point_offsets(
     br: &mut BitReader<'_>,
@@ -2414,7 +2414,7 @@ fn parse_slice_deblocking(
         }
         (beta as i8, tc as i8)
     } else {
-        // When deblocking is disabled the offsets are not signalled and
+        // When deblocking is disabled the offsets are not signaled and
         // are inferred to 0 (their effect is moot when disabled).
         (0, 0)
     };
@@ -2527,7 +2527,7 @@ fn parse_long_term_ref_pic_block(
 /// Resolution of the active short-term RPS for the in-place
 /// `NumPicTotalCurr` derivation at the §7.3.6.1
 /// `ref_pic_lists_modification()` gate. The result is always the
-/// post-§7.4.8 materialised form (explicit or inter-predicted both
+/// post-§7.4.8 materialized form (explicit or inter-predicted both
 /// produce the same shape).
 enum ActiveShortTermRps {
     /// The active short-term RPS has been resolved to its post-§7.4.8
@@ -2537,7 +2537,7 @@ enum ActiveShortTermRps {
     /// The slice has no active short-term RPS (an IDR slice, where the
     /// non-IDR POC/RPS block is absent). `NumPicTotalCurr` is `0`.
     Empty,
-    /// Materialisation of the active RPS failed — for instance because
+    /// Materialization of the active RPS failed — for instance because
     /// the inter-RPS-prediction `used_by_curr_pic_flag` /
     /// `use_delta_flag` arrays did not match the source RPS's
     /// `NumDeltaPocs[RefRpsIdx] + 1`. The slice parser surfaces this
@@ -2556,12 +2556,12 @@ fn resolve_active_short_term_rps(
     inline_rps: Option<&ShortTermRefPicSet>,
     short_term_ref_pic_set_idx: Option<u32>,
 ) -> ActiveShortTermRps {
-    // Materialise the SPS list once; we may need it both as a source
+    // Materialize the SPS list once; we may need it both as a source
     // for the slice-inline inter-RPS-prediction and as the active RPS
     // for the SPS form. The list is short (cap
     // `HEVC_MAX_NUM_SHORT_TERM_RPS = 64`) so this is inexpensive
     // relative to a frame decode.
-    let sps_materialised = match sps.materialize_short_term_ref_pic_sets() {
+    let sps_materialized = match sps.materialize_short_term_ref_pic_sets() {
         Ok(v) => v,
         Err(_) => return ActiveShortTermRps::MaterializeFailed,
     };
@@ -2580,7 +2580,7 @@ fn resolve_active_short_term_rps(
                     if ref_rps_idx < 0 {
                         return ActiveShortTermRps::MaterializeFailed;
                     }
-                    sps_materialised.get(ref_rps_idx as usize)
+                    sps_materialized.get(ref_rps_idx as usize)
                 } else {
                     None
                 };
@@ -2591,11 +2591,11 @@ fn resolve_active_short_term_rps(
             }
         },
         Some(true) => {
-            // §7.4.7.1: when not signalled (because
+            // §7.4.7.1: when not signaled (because
             // `num_short_term_ref_pic_sets <= 1`), the index is
             // inferred to 0.
             let idx = short_term_ref_pic_set_idx.unwrap_or(0) as usize;
-            match sps_materialised.into_iter().nth(idx) {
+            match sps_materialized.into_iter().nth(idx) {
                 None => ActiveShortTermRps::Empty,
                 Some(m) => ActiveShortTermRps::Materialized(m),
             }
@@ -2651,7 +2651,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn ctx_sps(
         chroma_format_idc: u8,
-        separate_colour_plane_flag: bool,
+        separate_color_plane_flag: bool,
         sao: bool,
         mvp: bool,
         width: u32,
@@ -2663,14 +2663,14 @@ mod tests {
         // Hand-assemble the smallest valid SPS RBSP that decodes to the
         // requested gate values, by parsing the tiny fixture's SPS and
         // patching the relevant fields. The slice parser only consults
-        // chroma_format_idc, separate_colour_plane_flag,
+        // chroma_format_idc, separate_color_plane_flag,
         // sample_adaptive_offset_enabled_flag,
         // sps_temporal_mvp_enabled_flag, the CTB / picture-size
         // derivations, and log2_max_pic_order_cnt_lsb_minus4, so a
         // patched struct is sufficient for these unit tests.
         let mut sps = SeqParameterSet::parse(TINY_SPS_RBSP).expect("tiny SPS");
         sps.chroma_format_idc = chroma_format_idc;
-        sps.separate_colour_plane_flag = separate_colour_plane_flag;
+        sps.separate_color_plane_flag = separate_color_plane_flag;
         sps.sample_adaptive_offset_enabled_flag = sao;
         sps.sps_temporal_mvp_enabled_flag = mvp;
         sps.pic_width_in_luma_samples = width;
@@ -2969,7 +2969,7 @@ mod tests {
             (0, 8),     // slice_pic_order_cnt_lsb = 0
             (1, 1),     // short_term_ref_pic_set_sps_flag = 1
             // num_short_term_ref_pic_sets == 1 so short_term_ref_pic_set_idx
-            // is NOT signalled (inferred 0).
+            // is NOT signaled (inferred 0).
             (0, 1),   // slice_temporal_mvp_enabled_flag = 0
             (1, 1),   // sao_luma = 1
             (0, 1),   // sao_chroma = 0
@@ -2987,10 +2987,10 @@ mod tests {
     }
 
     /// Non-IDR I-slice using the SPS-resident ST RPS with multiple
-    /// entries: `short_term_ref_pic_set_idx` is signalled `u(v)` with
+    /// entries: `short_term_ref_pic_set_idx` is signaled `u(v)` with
     /// width `Ceil(Log2(num_short_term_ref_pic_sets))`.
     #[test]
-    fn parses_non_idr_i_slice_with_sps_rps_idx_signalled() {
+    fn parses_non_idr_i_slice_with_sps_rps_idx_signaled() {
         let mut sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         sps.num_short_term_ref_pic_sets = 3; // idx width = 2 bits
         sps.short_term_ref_pic_sets = vec![
@@ -3097,7 +3097,7 @@ mod tests {
     }
 
     /// The §7.4.7.1 cross-check: when `num_short_term_ref_pic_sets ==
-    /// 0`, signalling `short_term_ref_pic_set_sps_flag == 1` is illegal.
+    /// 0`, signaling `short_term_ref_pic_set_sps_flag == 1` is illegal.
     #[test]
     fn rejects_st_sps_flag_when_no_sps_rps() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
@@ -3199,8 +3199,8 @@ mod tests {
     }
 
     /// IDR P-slice with `num_ref_idx_active_override_flag == 1` and an
-    /// explicitly signalled `num_ref_idx_l0_active_minus1 == 1`. P
-    /// slices never signal L1; verify the parser materialises the
+    /// explicitly signaled `num_ref_idx_l0_active_minus1 == 1`. P
+    /// slices never signal L1; verify the parser materializes the
     /// override flag and the explicit L0 value, leaves L1 absent,
     /// decodes a two-entry `pred_weight_table()` in place (the §7.3.6.3
     /// gate is statically present here via `pps.weighted_pred_flag =
@@ -3404,7 +3404,7 @@ mod tests {
     }
 
     /// IDR P-slice with `pps.cabac_init_present_flag == 1`: the cabac-
-    /// init bit is signalled (P slice still walks the gate, even though
+    /// init bit is signaled (P slice still walks the gate, even though
     /// `mvd_l1_zero_flag` is absent). With `mvp == 0` the collocated
     /// block is absent.
     #[test]
@@ -3448,7 +3448,7 @@ mod tests {
     /// `num_ref_idx_l0_active_minus1 == 0` (single L0 entry): §7.4.7.1
     /// infers `collocated_from_l0_flag = 1` (no bit consumed since
     /// slice_type != B) and the `collocated_ref_idx` field is absent
-    /// (only signalled when the active list has more than one entry).
+    /// (only signaled when the active list has more than one entry).
     /// `slice_temporal_mvp_enabled_flag` sits inside the §7.3.6.1
     /// non-IDR block, after the POC + RPS fields.
     #[test]
@@ -3498,9 +3498,9 @@ mod tests {
     /// Non-IDR (TRAIL_R) P-slice with `mvp == 1` and
     /// `num_ref_idx_l0_active_minus1 == 2` (three L0 entries):
     /// `collocated_from_l0_flag` is inferred to 1 (P slice) and
-    /// `collocated_ref_idx` is signalled `ue(v)`.
+    /// `collocated_ref_idx` is signaled `ue(v)`.
     #[test]
-    fn parses_p_slice_temporal_mvp_collocated_ref_idx_signalled() {
+    fn parses_p_slice_temporal_mvp_collocated_ref_idx_signaled() {
         let sps = ctx_sps(1, false, true, true, 16, 16, 1, 0, 4);
         let mut pps = PicParameterSet::parse(TINY_PPS_RBSP).expect("PPS");
         pps.weighted_pred_flag = true;
@@ -3641,7 +3641,7 @@ mod tests {
     /// slices, the active short-term RPS is empty and the §7.4.7.2
     /// `NumPicTotalCurr` is `0`. The §7.3.6.1 outer gate
     /// (`... && NumPicTotalCurr > 1`) is therefore statically false
-    /// and `ref_pic_lists_modification()` is not signalled; the parser
+    /// and `ref_pic_lists_modification()` is not signaled; the parser
     /// continues straight into the mvd / cabac-init / collocated block
     /// (all absent for this P slice + no-MVP / no-cabac-init /
     /// no-temporal-MVP configuration) and walks the rest of the tail
@@ -3744,7 +3744,7 @@ mod tests {
         assert!(rplm.ref_pic_list_modification_flag_l0);
         // L0 active_minus1 == 0 (PPS TINY default) → 1 entry.
         assert_eq!(rplm.list_entry_l0, vec![0]);
-        // P slice → L1 fields are not signalled.
+        // P slice → L1 fields are not signaled.
         assert_eq!(rplm.ref_pic_list_modification_flag_l1, None);
         assert!(rplm.list_entry_l1.is_empty());
         // Full inter tail walked, no opaque suffix.
@@ -3756,7 +3756,7 @@ mod tests {
     /// and an inline short-term RPS in explicit form carrying *one*
     /// `used_by_curr_pic_s0_flag` entry: equation 7-57 gives
     /// `NumPicTotalCurr == 1`, the §7.3.6.1 outer gate is statically
-    /// false, `ref_pic_lists_modification()` is not signalled, and the
+    /// false, `ref_pic_lists_modification()` is not signaled, and the
     /// parser continues straight into the rest of the inter tail.
     #[test]
     fn skips_rplm_when_num_pic_total_curr_is_one() {
@@ -3795,7 +3795,7 @@ mod tests {
     /// using an SPS-resident short-term RPS whose
     /// `inter_ref_pic_set_prediction_flag == 1` with malformed
     /// per-position arrays (lengths do not match the source's
-    /// `NumDeltaPocs[RefRpsIdx] + 1`). The §7.4.8 materialiser rejects
+    /// `NumDeltaPocs[RefRpsIdx] + 1`). The §7.4.8 materializer rejects
     /// the chain and the parser surfaces an opaque tail starting at the
     /// `ref_pic_lists_modification()` bit so the caller can inspect the
     /// bitstream.
@@ -3815,7 +3815,7 @@ mod tests {
             ShortTermRefPicSet {
                 // The picked RPS is in inter-prediction form but the
                 // arrays are empty (length 0 ≠ source's NumDeltaPocs+1
-                // = 2) — materialisation fails and the parse defers.
+                // = 2) — materialization fails and the parse defers.
                 inter_ref_pic_set_prediction_flag: true,
                 ..Default::default()
             },
@@ -3851,7 +3851,7 @@ mod tests {
     /// Non-IDR P-slice with `pps.lists_modification_present_flag == 1`
     /// using an SPS-resident short-term RPS whose
     /// `inter_ref_pic_set_prediction_flag == 1` and well-formed
-    /// per-position arrays. The §7.4.8 materialiser succeeds: the
+    /// per-position arrays. The §7.4.8 materializer succeeds: the
     /// derived RPS has `NumPicTotalCurr == 1` (single positive POC
     /// gated `false`) so the §7.3.6.1 outer gate is statically false
     /// and the parser walks the inter-slice tail to `byte_alignment()`
@@ -3917,8 +3917,8 @@ mod tests {
         assert_eq!(sh.slice_type, Some(SliceType::P));
         assert_eq!(sh.short_term_ref_pic_set_sps_flag, Some(true));
         assert_eq!(sh.short_term_ref_pic_set_idx, Some(1));
-        // §7.4.8 materialisation succeeded, NumPicTotalCurr == 0 ⇒
-        // gate statically false, no RPLM signalled.
+        // §7.4.8 materialization succeeded, NumPicTotalCurr == 0 ⇒
+        // gate statically false, no RPLM signaled.
         assert!(sh.ref_pic_lists_modification.is_none());
         // The parser walked through to byte_alignment().
         assert!(sh.opaque_tail.is_none());
@@ -3989,7 +3989,7 @@ mod tests {
     /// Non-IDR (TRAIL_R) B-slice walking the full inter-slice tail
     /// through `byte_alignment()` with `pps.weighted_bipred_flag == 0`:
     /// exercises the B-only `mvd_l1_zero_flag` bit and the temporal-MVP
-    /// `collocated_from_l0_flag` signalling, then walks straight to
+    /// `collocated_from_l0_flag` signaling, then walks straight to
     /// `five_minus_max_num_merge_cand` and the shared I-slice tail.
     #[test]
     fn parses_b_slice_full_inter_tail_with_mvp() {
@@ -4276,7 +4276,7 @@ mod tests {
         assert!(sh.dependent_slice_segment_flag);
         assert_eq!(sh.slice_segment_address, 2);
         assert_eq!(sh.slice_type, None);
-        // SAO flags are not signalled in a dependent segment — they are
+        // SAO flags are not signaled in a dependent segment — they are
         // inherited by the caller; the struct leaves them false.
         assert!(!sh.slice_sao_luma_flag);
         assert!(!sh.slice_sao_chroma_flag);
@@ -4522,7 +4522,7 @@ mod tests {
         );
     }
 
-    /// The §7.3.6.2 structure is only signalled for inter slices. The
+    /// The §7.3.6.2 structure is only signaled for inter slices. The
     /// parser rejects an I-slice call up front rather than reading any
     /// bits (the bitreader position must stay at 0).
     #[test]
@@ -4977,7 +4977,7 @@ mod tests {
     }
 
     /// Minimal monochrome P-slice case (`ChromaArrayType == 0` so no
-    /// chroma fields are signalled): one reference, `luma_weight_l0_flag
+    /// chroma fields are signaled): one reference, `luma_weight_l0_flag
     /// == 1`, `delta_luma_weight_l0[0] == 5`, `luma_offset_l0[0] == 0`.
     ///
     /// Bit layout:
@@ -5109,7 +5109,7 @@ mod tests {
         assert_eq!(pwt.entries_l1.len(), 1);
         assert!(!pwt.entries_l0[0].luma_weight_flag);
         assert!(!pwt.entries_l1[0].chroma_weight_flag);
-        // No deltas were signalled; absent values inferred to 0.
+        // No deltas were signaled; absent values inferred to 0.
         assert_eq!(pwt.entries_l0[0].delta_luma_weight, 0);
         assert_eq!(pwt.entries_l1[0].delta_chroma_offset, [0, 0]);
         // Derived LumaWeightLX[0] = (1 << 0) + 0 = 1 (inferred form).
@@ -5376,7 +5376,7 @@ mod tests {
     }
 
     /// I-slice with WPP enabled (`entropy_coding_sync_enabled_flag ==
-    /// 1`): the §7.3.6.1 entry-point block is signalled with
+    /// 1`): the §7.3.6.1 entry-point block is signaled with
     /// `num_entry_point_offsets = 2`, `offset_len_minus1 = 3` (each
     /// entry is `u(4)`), and per-row byte offsets `{6, 9}`. Verify
     /// the parser captures the offsets verbatim and exposes the
@@ -5428,7 +5428,7 @@ mod tests {
     /// `num_entry_point_offsets` is `1 * 1 − 1 == 0`, so the block is
     /// present (the gate fires on `tiles_enabled_flag`) but
     /// `num_entry_point_offsets` must be 0 and the `offset_len_minus1`
-    /// / per-entry loop are skipped. Verify the parser materialises an
+    /// / per-entry loop are skipped. Verify the parser materializes an
     /// empty vec and reports a bare gate.
     #[test]
     fn parses_tiles_block_with_single_tile_no_offsets() {

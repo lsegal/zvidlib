@@ -68,13 +68,13 @@ fn yuv_digest(picture: &DecodedPicture) -> FrameDigest {
     FrameDigest::from_frame(&frame).unwrap()
 }
 
-/// Every frame of the bundled SVT-AV1 colour sample (8-bit 4:2:0 Main, with
+/// Every frame of the bundled SVT-AV1 color sample (8-bit 4:2:0 Main, with
 /// CDF adaptation, CDEF, loop restoration, warped motion, inter-intra and
 /// reference frame motion vectors) decodes to exactly the samples an
 /// independent decoder produces. The digests are of FFmpeg/libdav1d's decode;
 /// see `tests/fixtures/codec/README.md`.
 #[test]
-fn colour_sample_decodes_bit_exactly_against_an_independent_decoder() {
+fn color_sample_decodes_bit_exactly_against_an_independent_decoder() {
     let expected = digests(include_str!(
         "../../tests/fixtures/big_buck_bunny_av1_yuv420.sha256"
     ));
@@ -169,7 +169,7 @@ fn limits_bound_frame_size_and_obu_count() {
     assert_eq!(error.kind(), ErrorKind::ResourceLimit);
 }
 
-/// A small libaom or SVT-AV1 fixture made to reach tools the colour sample
+/// A small libaom or SVT-AV1 fixture made to reach tools the color sample
 /// above never does, with the per-frame digests of FFmpeg/libdav1d's decode
 /// of it (film grain applied) and the tools it must reach. See
 /// `tests/fixtures/codec/README.md` for how each was made.

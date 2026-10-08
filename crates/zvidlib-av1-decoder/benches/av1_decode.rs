@@ -452,8 +452,8 @@ fn av1_mc_blend_mask(criterion: &mut Criterion) {
 /// Intra block size the prediction groups predict in.
 const INTRA_BLOCK: usize = 32;
 
-/// Neighbour samples for one intra block, deterministic and non-degenerate.
-fn intra_neighbours() -> (Vec<u8>, Vec<u8>) {
+/// Neighbor samples for one intra block, deterministic and non-degenerate.
+fn intra_neighbors() -> (Vec<u8>, Vec<u8>) {
     let top = (0..INTRA_BLOCK)
         .map(|index| (index * 7 + 13) as u8)
         .collect();
@@ -475,7 +475,7 @@ fn intra_blocks() -> usize {
 /// alike; it is measured anyway because it is the third of the three intra
 /// predictors the decoder reaches, and a flat profile is itself the finding.
 fn av1_intra_prediction(criterion: &mut Criterion) {
-    let (top, left) = intra_neighbours();
+    let (top, left) = intra_neighbors();
     let blocks = intra_blocks();
     let work = FrameWork::new(
         1,

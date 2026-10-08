@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn av1_codec_string_carries_every_chroma_sample_position() {
-        // 4:2:0 colour with each `chroma_sample_position`; the value is the last
+        // 4:2:0 color with each `chroma_sample_position`; the value is the last
         // digit of the `av01.` string.
         for pos in 0..4u8 {
             let av1c = boxed(b"av1C", &[0x81, 0x04, 0x0c | pos, 0]);
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn reads_a_version_1_vpcc_box_and_derives_its_codec_string() {
         // Profile 0, level 3.1, 8-bit, colocated 4:2:0, limited range,
-        // BT.709 colour description, no initialization data.
+        // BT.709 color description, no initialization data.
         let bytes = vpcc(1, &[0, 31, 0x82, 1, 1, 1, 0, 0]);
         let config = Vp9CodecConfig::parse(&bytes).unwrap();
         assert_eq!(
@@ -324,7 +324,7 @@ mod tests {
                 bit_depth: 8,
                 chroma_subsampling: 1,
                 video_full_range: false,
-                colour_primaries: 1,
+                color_primaries: 1,
                 transfer_characteristics: 1,
                 matrix_coefficients: 1,
             }

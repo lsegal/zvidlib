@@ -6,7 +6,7 @@
 //! [`crate::av1_intra_decoder`] selects its two reconstruction paths:
 //!
 //! - `base_q_idx == 0` (`CodedLossless`): every transform block is a 4x4 forward WHT
-//!   ([`super::wht::fwht4x4`]) of the source residual, coded as-is. Prediction neighbours are the
+//!   ([`super::wht::fwht4x4`]) of the source residual, coded as-is. Prediction neighbors are the
 //!   source samples, which under lossless coding *are* the reconstruction.
 //! - `base_q_idx != 0` (non-lossless): each coding block picks a square transform size through
 //!   §5.11.16 `read_tx_size` under `TX_MODE_SELECT`, and each transform block picks a `tx_type`
@@ -149,7 +149,7 @@ pub(super) const TYPE_GAIN_SAMPLE_INTERVAL: usize = 2;
 /// correction frame-wide. So each accumulator is aged by `(n-1)/n` before a new probe joins it,
 /// and a probe's weight decays geometrically over the following `n` probes - which, since the
 /// size searches that probe are visited in the decoder's superblock raster order, makes the
-/// ratio a block reads back the one its own neighbourhood measured.
+/// ratio a block reads back the one its own neighborhood measured.
 ///
 /// `1` is the shortest window there is: a non-probing trial is corrected by the single most
 /// recent probe at that size and by nothing older. On its own that is too noisy an estimate to
@@ -222,7 +222,7 @@ pub(crate) enum GainLocality {
     /// The superblock column's accumulator alone, whose most recent probes before the current
     /// superblock are the ones directly above it.
     Column,
-    /// Both, summed, so the ratio a block reads back is measured on its own neighbourhood in
+    /// Both, summed, so the ratio a block reads back is measured on its own neighborhood in
     /// both axes.
     Blended,
 }
@@ -614,7 +614,7 @@ pub(crate) struct FrameEncoder<'a> {
     #[cfg(test)]
     linear_credit_product: std::cell::Cell<i128>,
     /// Cost a running size trial may reach before it is abandoned, or [`i64::MAX`] when nothing
-    /// is being trialled. A trial's cost is a sum of squared errors and `lambda * bits`, so it
+    /// is being trialed. A trial's cost is a sum of squared errors and `lambda * bits`, so it
     /// only grows: once the partial sum passes what the incumbent size already costs, no
     /// remaining block can bring it back and the rest of the trial cannot change the answer.
     /// [`FrameEncoder::choose_tx_size`] sets it from the incumbent, for any trial whose ranking
@@ -824,9 +824,9 @@ struct TxCandidate {
 /// Reusable buffers for one transform block's §8.3.2 coefficient contexts.
 ///
 /// The contexts are derived for the whole block in a single pass before the serial symbol loop
-/// runs, which is legal because every neighbour `coeff_base` and `coeff_br` consult lies later in
+/// runs, which is legal because every neighbor `coeff_base` and `coeff_br` consult lies later in
 /// the up-right diagonal scan than the position consulting it, and the loop walks that scan
-/// backwards — so those neighbours are already final (or, past the end-of-block, zero) before the
+/// backwards — so those neighbors are already final (or, past the end-of-block, zero) before the
 /// first symbol is written. See [`crate::av1_simd::coeff`] for the vector kernel that pass
 /// dispatches to.
 ///
@@ -1570,7 +1570,7 @@ impl<'a> FrameEncoder<'a> {
         const SPLIT_HEADER_BITS: i64 = 24;
         // A split subtree's cost is a sum of squared errors and positive bit counts, so it is
         // never negative: once the whole block costs no more than the header the split would
-        // pay, the comparison below cannot come out in the split's favour and the four subtree
+        // pay, the comparison below cannot come out in the split's favor and the four subtree
         // searches are pure waste. This is the search's own arithmetic, not an approximation.
         if self.shortcuts() && whole <= self.lambda * SPLIT_HEADER_BITS {
             self.split_memo[slot] = 0;
@@ -1603,9 +1603,9 @@ impl<'a> FrameEncoder<'a> {
         (bsl.min(MEMO_LEVELS - 1) * self.mi_rows + r) * self.mi_cols + c
     }
 
-    /// The `tx_depth` context (§9.3): how many of the above and left neighbours already carry a
+    /// The `tx_depth` context (§9.3): how many of the above and left neighbors already carry a
     /// transform at least as large as this block's `Max_Tx_Size_Rect`. Every block this encoder
-    /// codes is intra and unskipped, so the neighbour value is always the neighbour's own
+    /// codes is intra and unskipped, so the neighbor value is always the neighbor's own
     /// transform extent rather than its block size.
     fn tx_depth_ctx(&self, r: usize, c: usize, max_tx: usize) -> usize {
         let above = r > 0 && usize::from(self.above_tx_width[c]) >= max_tx;
@@ -1702,7 +1702,7 @@ impl<'a> FrameEncoder<'a> {
             return 4 << self.tx_size_memo[slot];
         }
         let largest = bw.min(MAX_TX_WIDTH);
-        // Only the depth cap is needed here; it does not vary with the neighbour context.
+        // Only the depth cap is needed here; it does not vary with the neighbor context.
         let (_, max_depth) = cdf::tx_depth_cdf(bw, 0);
         #[cfg(test)]
         {
@@ -1865,7 +1865,7 @@ impl<'a> FrameEncoder<'a> {
     /// Joins a probe to one accumulator, which is the frame's running sum at that size.
     ///
     /// #272 aged each accumulator by `(n-1)/n` first, so a probe's weight decayed over the
-    /// following `TYPE_GAIN_MEMORY` probes and a block read back the ratio its own neighbourhood
+    /// following `TYPE_GAIN_MEMORY` probes and a block read back the ratio its own neighborhood
     /// measured rather than the frame's. [`TYPE_GAIN_TRUST`] then shrank a *remembered* ratio to
     /// an eighth, and under that shrinkage the window stopped being measurable: issue #308 swept
     /// every window from `1` to the un-decayed sum on `scene_edge`, on three frames built to
@@ -1878,7 +1878,7 @@ impl<'a> FrameEncoder<'a> {
     /// Ages an accumulator by `(n-1)/n` before a new probe joins it.
     ///
     /// A probe's influence then decays away over the following `n` probes, so the ratio a block
-    /// reads back is the one its own neighbourhood measured rather than the whole frame's, and it
+    /// reads back is the one its own neighborhood measured rather than the whole frame's, and it
     /// follows the content across a region boundary within a few coding blocks instead of never.
     /// One multiply and one divide per accumulator, on the sampled trials only.
     ///
@@ -2110,7 +2110,7 @@ impl<'a> FrameEncoder<'a> {
                 // `saturating_mul` this replaces (#412) turned that into a silently wrong
                 // *ranking* rather than a panic: a saturated product collapses the credit to
                 // `i64::MAX / dct`, which is smaller than the real credit, so the trial is
-                // under-credited and the size it loses to is an artefact of the accumulator's
+                // under-credited and the size it loses to is an artifact of the accumulator's
                 // magnitude rather than of the block.
                 //
                 // Reachability, at the bounds this crate actually enforces. A transform block's
@@ -2145,7 +2145,7 @@ impl<'a> FrameEncoder<'a> {
                 // size ranking moves rather than failing. Nothing ships this model, but a
                 // calibration sweep is the one consumer for which a wrong number is worse than a
                 // panic: `measure_type_gain_models` ranks this arm against the others, and an arm
-                // that saturated would report a penalty that is an artefact of the accumulator's
+                // that saturated would report a penalty that is an artifact of the accumulator's
                 // magnitude rather than of the model.
                 //
                 // Reachability. `blocks` is `trial_searched_blocks`, at most 256 - a 64x64 coding
@@ -2540,7 +2540,7 @@ impl<'a> FrameEncoder<'a> {
 
     /// Spec §7.11.2 DC intra prediction over the reconstruction, for any `size x size` transform
     /// block: the rounded average of the `size` samples immediately above and/or to the left, or
-    /// 128 when neither neighbour is available. Mirrors the decoder's `dc_prediction_sized`.
+    /// 128 when neither neighbor is available. Mirrors the decoder's `dc_prediction_sized`.
     fn dc_prediction(&self, x: usize, y: usize, size: usize) -> u8 {
         let above = |offset: usize| u32::from(self.recon[(y - 1) * self.coded_w + x + offset]);
         let left = |offset: usize| u32::from(self.recon[(y + offset) * self.coded_w + x - 1]);
@@ -2564,7 +2564,7 @@ impl<'a> FrameEncoder<'a> {
         }
     }
 
-    /// DC intra prediction for the lossless path, whose neighbours are the (padded) source
+    /// DC intra prediction for the lossless path, whose neighbors are the (padded) source
     /// samples because lossless reconstruction reproduces them exactly (§7.11.2.5).
     fn lossless_dc_avg(&self, sx: usize, sy: usize) -> i32 {
         let have_above = sy > 0;
@@ -2597,7 +2597,7 @@ impl<'a> FrameEncoder<'a> {
     }
 
     /// Codes one transform block's quantized coefficients (§5.11.39), returning whether the
-    /// block carried any (`false` means `all_zero` was signalled). The coefficient contexts are
+    /// block carried any (`false` means `all_zero` was signaled). The coefficient contexts are
     /// updated either way; only the symbol writes are suppressed when `emit` is false, so a
     /// speculative trial and the replay that follows it derive identical contexts.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -2761,7 +2761,7 @@ impl<'a> FrameEncoder<'a> {
     /// `getTXBSkipCtx` (§8.3.2), over the transform block's own width and height in 4x4 units.
     ///
     /// The specification's first case returns context 0 outright when the transform covers the
-    /// whole coding block, without consulting a neighbour. Every coding block here is square, so
+    /// whole coding block, without consulting a neighbor. Every coding block here is square, so
     /// that is exactly `tx_width == block_width`. It cannot fire on a lossless frame, whose
     /// transforms are all 4x4 while no coding block is narrower than
     /// [`MIN_PARTITION_WIDTH`], but it fires on most non-lossless blocks. The decoders derive
@@ -3137,7 +3137,7 @@ mod tests {
     }
 
     /// Deriving the contexts up front is only legal because the backwards scan never consults a
-    /// neighbour it has not already coded, and never consults a non-zero one past the
+    /// neighbor it has not already coded, and never consults a non-zero one past the
     /// end-of-block. Replay the incremental derivation the coding loop used to do and check it
     /// against the one-pass answer, for every end-of-block a block can have.
     #[test]
@@ -3233,7 +3233,7 @@ mod tests {
         );
 
         // The trial's own cost, and a rival size that gets no credit at all. Under the exact
-        // credit the trialled size wins; under the saturated one it loses, which is the silent
+        // credit the trialed size wins; under the saturated one it loses, which is the silent
         // ranking change #412 is about.
         let trial_cost = searched + (1 << 40);
         let rival_cost = trial_cost - (1 << 41);
@@ -3334,7 +3334,7 @@ mod tests {
     ///
     /// Saturating does not fail loudly. It collapses the credit to `i64::MAX / probes`, which is
     /// *smaller* than the real credit, so the arm is silently under-credited and would report a
-    /// penalty that is an artefact of the accumulator's magnitude rather than of the model. This
+    /// penalty that is an artifact of the accumulator's magnitude rather than of the model. This
     /// reaches that cliff and asserts the ranking no longer moves across it.
     #[test]
     fn the_per_block_credit_is_exact_where_the_saturating_product_had_a_cliff() {
@@ -3363,7 +3363,7 @@ mod tests {
         );
 
         // The trial's own cost, and a rival size that gets no credit at all. Under the exact
-        // credit the trialled size wins; under the saturated one it loses, which is the silent
+        // credit the trialed size wins; under the saturated one it loses, which is the silent
         // ranking change this issue is about.
         let trial_cost = 1i64 << 42;
         let rival_cost = -(3i64 << 46);

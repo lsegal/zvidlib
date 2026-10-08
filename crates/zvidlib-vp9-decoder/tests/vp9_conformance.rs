@@ -31,7 +31,7 @@ fn block_on<T>(future: impl Future<Output = T>) -> T {
 
 /// The VP9 MP4 fixtures, decoded through the registered factory, match
 /// libvpx's decode of the same tracks converted to RGBA by this crate's
-/// BT.601 `convert_to_rgba8` (both tracks leave their colour space
+/// BT.601 `convert_to_rgba8` (both tracks leave their color space
 /// unspecified), for sequential, reverse and alternating access. The
 /// 256x144 track's superframes carry hidden alternate reference frames and
 /// it has two random-access points; the 250x142 one has edges that are not

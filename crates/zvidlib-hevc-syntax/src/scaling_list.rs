@@ -211,7 +211,7 @@ pub struct ScalingListMatrix {
 }
 
 /// The full parsed-and-derived `scaling_list_data()` structure: all 24
-/// `(sizeId, matrixId)` slots. Slots not signalled for `sizeId == 3`
+/// `(sizeId, matrixId)` slots. Slots not signaled for `sizeId == 3`
 /// (matrixId 1, 2, 4, 5 are skipped by the `matrixId += 3` step)
 /// retain their default value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,7 +247,7 @@ impl ScalingListData {
     /// `ScalingList` coefficient arrays (§7.4.5), applying the
     /// default-list and prediction-inference rules.
     pub fn parse(br: &mut BitReader<'_>) -> Result<Self, ScalingListError> {
-        // Seed every slot with its default; signalled slots overwrite.
+        // Seed every slot with its default; signaled slots overwrite.
         // sizeId == 3 only visits matrixId 0 and 3 (the `+= 3` step),
         // so the other four slots stay at their (unused) default.
         let mut lists = Self::all_default().lists;
@@ -291,7 +291,7 @@ impl ScalingListData {
                         size_lists[matrix_id] = size_lists[ref_matrix_id].clone();
                     }
                 } else {
-                    // Explicitly signalled list.
+                    // Explicitly signaled list.
                     let n = coef_num(size_id);
                     let mut next_coef: i32 = 8;
                     let mut dc_coef: u16 = 8;
@@ -347,7 +347,7 @@ impl ScalingListData {
     /// flat lists.
     ///
     /// `chroma_array_type` is the §7.4.3.2.1 `ChromaArrayType`
-    /// (`separate_colour_plane_flag ? 0 : chroma_format_idc`). It only
+    /// (`separate_color_plane_flag ? 0 : chroma_format_idc`). It only
     /// affects the 32x32 chroma matrices: equations 7-50 / 7-51 derive
     /// `ScalingFactor[3][matrixId]` for `matrixId ∈ {1, 2, 4, 5}` from
     /// the corresponding 16x16 lists (`ScalingList[2][matrixId]`) **only
@@ -404,7 +404,7 @@ impl ScalingListData {
         }
 
         // 32x32 (sizeId 3) — only matrixId 0 (intra Y) and 3 (inter Y)
-        // are signalled (the `matrixId += 3` step). Equation 7-48 uses
+        // are signaled (the `matrixId += 3` step). Equation 7-48 uses
         // the 8x8 scan with each entry replicated into a 4x4 block,
         // 7-49 overrides [0][0] with the DC coefficient.
         for &matrix_id in &[0usize, 3usize] {
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(coef_num(3), 64);
     }
 
-    /// An explicitly-signalled 4x4 list (sizeId 0, matrixId 0): all 16
+    /// An explicitly-signaled 4x4 list (sizeId 0, matrixId 0): all 16
     /// slots carry delta 0, so every coefficient equals the
     /// `nextCoef` seed (8). Verifies the running modulo accumulator and
     /// that no DC coefficient is read for sizeId <= 1.

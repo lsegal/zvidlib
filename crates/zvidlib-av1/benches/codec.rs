@@ -236,7 +236,7 @@ fn av1_deblock_chroma_by_isa(criterion: &mut Criterion) {
 }
 
 /// AV1 sub-pel motion compensation: the arm that exercises `av1_mc`, reached
-/// through `McContext::new`, which honours the crate-wide override.
+/// through `McContext::new`, which honors the crate-wide override.
 fn av1_motion_compensation_by_isa(criterion: &mut Criterion) {
     const BLOCK: usize = 16;
     let plane = isa_luma_plane();

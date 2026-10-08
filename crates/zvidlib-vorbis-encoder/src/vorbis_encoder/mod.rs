@@ -178,7 +178,7 @@ impl VorbisEncoder {
     /// Feeds interleaved PCM (`frames * channels` samples, nominally in
     /// -1.0..=1.0) and returns every audio packet completed so far with its
     /// granule position. An empty slice is a no-op (unlike
-    /// `vorbis_analysis_wrote(0)`, end of stream is signalled by `finish`).
+    /// `vorbis_analysis_wrote(0)`, end of stream is signaled by `finish`).
     pub fn encode(
         &mut self,
         interleaved: &[f32],

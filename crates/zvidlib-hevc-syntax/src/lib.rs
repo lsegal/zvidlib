@@ -97,6 +97,6 @@ pub use vps::{
 pub use vui::VuiError;
 #[doc(hidden)]
 pub use vui::{
-    BitstreamRestriction, ColourDescription, DefaultDisplayWindow, EXTENDED_SAR, VideoSignalType,
+    BitstreamRestriction, ColorDescription, DefaultDisplayWindow, EXTENDED_SAR, VideoSignalType,
     VuiParameters, VuiTimingInfo,
 };

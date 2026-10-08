@@ -191,7 +191,7 @@ fn yuv_frames() -> Vec<VideoFrame> {
 }
 
 /// The same sequence as limited-range RGBA, which is what the VP8 encoder
-/// takes: luma as grey, tinted by the chroma planes.
+/// takes: luma as gray, tinted by the chroma planes.
 fn rgba_frames() -> Vec<VideoFrame> {
     let limits = Limits::default();
     let (width, height) = (STREAM_WIDTH as usize, STREAM_HEIGHT as usize);

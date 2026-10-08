@@ -275,7 +275,7 @@ pub(crate) fn encode_png_rgb(width: usize, height: usize, rgb: &[u8]) -> Vec<u8>
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&(width as u32).to_be_bytes());
     ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    // Bit depth 8, colour type 2 (RGB), deflate, adaptive filtering, no interlace.
+    // Bit depth 8, color type 2 (RGB), deflate, adaptive filtering, no interlace.
     ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
 
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();

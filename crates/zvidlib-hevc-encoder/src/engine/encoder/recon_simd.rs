@@ -256,9 +256,9 @@ pub(crate) struct EdgeStats {
 /// accumulates the source-versus-reconstruction error of each into `stats`.
 ///
 /// `here` is the run of reconstructed samples, `a` and `b` the two co-located
-/// neighbour runs the edge-offset class selects, and `src` the co-located
+/// neighbor runs the edge-offset class selects, and `src` the co-located
 /// source samples. The caller is responsible for trimming the run to the
-/// samples whose neighbours lie inside the plane, which is why no bounds
+/// samples whose neighbors lie inside the plane, which is why no bounds
 /// handling appears here: `edgeIdx == 2` (category 0) contributes nothing and
 /// is the only sample class this kernel drops.
 ///
@@ -271,8 +271,8 @@ pub(crate) fn edge_offset_row(
     src: &[u8],
     stats: &mut EdgeStats,
 ) {
-    assert_eq!(here.len(), a.len(), "run and first neighbour differ");
-    assert_eq!(here.len(), b.len(), "run and second neighbour differ");
+    assert_eq!(here.len(), a.len(), "run and first neighbor differ");
+    assert_eq!(here.len(), b.len(), "run and second neighbor differ");
     assert_eq!(here.len(), src.len(), "run and source differ");
     match isa_code() {
         #[cfg(target_arch = "x86_64")]
@@ -797,7 +797,7 @@ pub(crate) fn band_offset_rect_narrow_scalar(
         let recon_row = &here[y * here_stride..y * here_stride + width];
         let src_row = &src[y * src_stride..y * src_stride + width];
         let mut i = 0;
-        // Two samples at a time into two accumulator sets, so neighbours that
+        // Two samples at a time into two accumulator sets, so neighbors that
         // share a band do not serialize on one slot.
         while i + 2 <= width {
             for set in 0..2 {
@@ -1255,7 +1255,7 @@ mod x86 {
     ///
     /// The eight lanes alternate between the two sets in pairs, which is what
     /// splits the dependency chain: lanes 0,1,4,5 into set 0 and 2,3,6,7 into
-    /// set 1, so two runs of same-band neighbours accumulate independently.
+    /// set 1, so two runs of same-band neighbors accumulate independently.
     #[cfg(test)]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn band_offset_rect_avx2_narrow(
@@ -1963,7 +1963,7 @@ mod tests {
         let _guard = simd::test_lock();
         for &n in RUNS {
             let here = samples(0x1111_2222_3333_4444, n);
-            // Neighbours drawn from an overlapping window of the same fixture
+            // Neighbors drawn from an overlapping window of the same fixture
             // so that all five `edgeIdx` values, including the skipped
             // category 0, occur rather than only the extremes.
             let a = samples(0x1111_2222_3333_4445, n);
@@ -2669,8 +2669,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "run and second neighbour differ")]
-    fn a_neighbour_run_of_the_wrong_length_is_rejected() {
+    #[should_panic(expected = "run and second neighbor differ")]
+    fn a_neighbor_run_of_the_wrong_length_is_rejected() {
         let mut stats = EdgeStats::default();
         edge_offset_row(&[0i32; 8], &[0i32; 8], &[0i32; 7], &[0u8; 8], &mut stats);
     }
@@ -2769,7 +2769,7 @@ mod tests {
     ///
     /// The runs are L1-resident and the arms are interleaved within each round
     /// — every arm is timed once per round, and the reported time is the
-    /// minimum across rounds — so a scheduling artefact has to hit the same arm
+    /// minimum across rounds — so a scheduling artifact has to hit the same arm
     /// in every round to survive. The spread column is what separates a result
     /// from noise: it is how far the *worst* round of an arm sat above its own
     /// best, and a ratio nearer 1.00x than that spread has not separated from
