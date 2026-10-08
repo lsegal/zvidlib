@@ -13,6 +13,7 @@ pub mod cover;
 mod ebml;
 pub mod mp4;
 pub mod mp4_demux;
+pub mod prefetch;
 pub mod webm;
 pub mod webm_demux;
 
@@ -44,6 +45,7 @@ pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
     Mp4Track, probe_mp4,
 };
+pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 pub use webm::WebmMuxer;
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,

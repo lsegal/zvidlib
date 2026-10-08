@@ -111,7 +111,7 @@ impl Mp4Track {
     /// decode-only sample (one `presentation_order` does not list) given an
     /// identity past the last presentation frame so it never collides with
     /// a frame a caller asks for. Reads no sample data.
-    fn presentation_index_by_decode(&self) -> Result<Vec<u64>> {
+    pub(crate) fn presentation_index_by_decode(&self) -> Result<Vec<u64>> {
         let mut presentation_index_by_decode = vec![None; self.samples.len()];
         for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
             let presentation_index = u64::try_from(presentation_index)
@@ -697,7 +697,7 @@ async fn read_header<S: ByteSource + ?Sized>(
     })
 }
 
-async fn read_exact<S: ByteSource + ?Sized>(
+pub(crate) async fn read_exact<S: ByteSource + ?Sized>(
     source: &S,
     mut offset: u64,
     mut output: &mut [u8],

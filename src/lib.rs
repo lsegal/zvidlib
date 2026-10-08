@@ -19,7 +19,7 @@ pub use zvidlib_av1::{
 pub use zvidlib_av1_syntax as av1;
 #[doc(inline)]
 pub use zvidlib_container::{
-    codec_config, conformance, container, cover, mp4, mp4_demux, webm, webm_demux,
+    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, webm, webm_demux,
 };
 #[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
@@ -204,6 +204,8 @@ pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
     Mp4Track, probe_mp4,
 };
+#[doc(no_inline)]
+pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 #[cfg(feature = "opus-decoder")]
 #[doc(no_inline)]
 pub use opus::NativeOpusDecoder;
