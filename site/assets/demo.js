@@ -73,6 +73,7 @@ async function startScrubber() {
   const status = $("#scrub-status");
   const timeline = $("#scrub-timeline");
   const play = $("#scrub-play");
+  const mute = $("#scrub-mute");
   const buttons = [$("#scrub-prev"), play, $("#scrub-next"), $("#scrub-random"), timeline];
   const previewBar = $("#scrub-previews-bar");
 
@@ -100,10 +101,17 @@ async function startScrubber() {
 
   // The clip's soundtrack, read through zvidlib's exact sample ranges and scheduled on the Web Audio
   // clock. The picture runs on the page's clock from the moment the first sample is heard.
+  // Without one, the picture still plays and the mute button says why there is no sound.
   let sound = null;
+  let silentReason = "";
   try {
+    if (!globalThis.AudioContext) throw new Error("this browser has no Web Audio");
     const track = input.audio(0);
     const config = await track.decoderConfig();
+    if (globalThis.AudioDecoder) {
+      const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      if (!support.supported) throw new Error(`this browser cannot decode ${config.codec}`);
+    }
     sound = {
       track,
       codec: config.codec.startsWith("mp4a") ? "AAC" : config.codec.startsWith("opus") ? "Opus" : config.codec,
@@ -111,10 +119,14 @@ async function startScrubber() {
       channels: config.numberOfChannels,
       length: Number(await track.sampleCount()),
     };
-  } catch {
+  } catch (error) {
     sound = null;
+    silentReason = errorText(zvid, error);
   }
   let audioContext = null;
+  // Every source plays through this gain, which the mute button turns down without stopping them.
+  let audioGain = null;
+  let muted = false;
   let audioSources = [];
   let audioOrigin = 0;
   let audioRun = 0;
@@ -227,7 +239,7 @@ async function startScrubber() {
         }
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
-        source.connect(audioContext.destination);
+        source.connect(audioGain);
         // A slice that arrives late starts part-way through, and one that arrives too late is skipped.
         const late = audioContext.currentTime - at;
         if (late < buffer.duration) {
@@ -285,7 +297,12 @@ async function startScrubber() {
     play.textContent = playing ? "Pause" : "Play";
     if (playing) {
       // Created on the click itself, so the browser lets it make sound.
-      if (sound && !audioContext) audioContext = new AudioContext();
+      if (sound && !audioContext) {
+        audioContext = new AudioContext();
+        audioGain = audioContext.createGain();
+        audioGain.gain.value = muted ? 0 : 1;
+        audioGain.connect(audioContext.destination);
+      }
       audioContext?.resume();
       beginPlayback(shown < 0 || shown >= last ? 0 : shown, performance.now());
       requestAnimationFrame(tick);
@@ -294,7 +311,19 @@ async function startScrubber() {
     }
   }
 
+  function showMute() {
+    mute.disabled = !sound;
+    mute.setAttribute("aria-pressed", String(muted));
+    mute.textContent = !sound ? "No audio" : muted ? "🔇 Muted" : "🔊 Sound on";
+    mute.title = !sound ? `No audio: ${silentReason}` : muted ? "Unmute" : "Mute";
+  }
+
   play.addEventListener("click", () => setPlaying(!playing));
+  mute.addEventListener("click", () => {
+    muted = !muted;
+    audioGain?.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
+    showMute();
+  });
   $("#scrub-prev").addEventListener("click", () => (setPlaying(false), seek(shown - 1)));
   $("#scrub-next").addEventListener("click", () => (setPlaying(false), seek(shown + 1)));
   $("#scrub-random").addEventListener("click", () => (setPlaying(false), seek(Math.floor(Math.random() * frameCount))));
@@ -307,9 +336,10 @@ async function startScrubber() {
   status.textContent =
     `Opened ${(Number(input.byteLength) / 1048576).toFixed(1)} MiB ${input.container?.toUpperCase()} · ` +
     `${frameCount} frames · AV1 ${canvas.width}x${canvas.height}` +
-    (sound ? ` · ${sound.channels}-channel ${sound.rate / 1000} kHz ${sound.codec} soundtrack, played with Play` : "") +
+    (sound ? ` · ${sound.channels}-channel ${sound.rate / 1000} kHz ${sound.codec} soundtrack, played with Play` : ` · no audio (${silentReason})`) +
     (previews ? ` · seek previews every ${previews.stride} frames, filling in the background` : "");
   for (const control of buttons) control.disabled = false;
+  showMute();
   seek(0);
 }
 
