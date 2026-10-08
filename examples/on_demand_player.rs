@@ -1,7 +1,8 @@
-//! Plays an MP4 on demand natively with `OnDemandPlayer` (issue #689): only the
-//! movie header is read up front, and then only the compressed samples playback
-//! reaches, within a 4 MiB budget. Audio plays on the default output device;
-//! the decoded frames are counted rather than drawn.
+//! Plays an MP4 or WebM on demand natively with `OnDemandPlayer` (issue #689):
+//! only the container's header and index are read up front, and then only the
+//! compressed samples playback reaches, within a 4 MiB budget. Audio plays on
+//! the default output device; the decoded frames are counted rather than
+//! drawn.
 //!
 //! ```console
 //! cargo run --release --example on_demand_player --features native -- [movie.mp4] [language]

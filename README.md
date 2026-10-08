@@ -192,7 +192,7 @@ try {
 input.close();
 ```
 
-Play and seek a remote MP4 without downloading it: `OnDemandPlayback` reads only the movie header and the compressed samples playback reaches, with HTTP range requests (or from a `Blob`), into byte-budgeted caches. No call waits on the network; one that needs a sample not loaded yet throws `WOULD_BLOCK`, and `prefetch()` loads it:
+Play and seek a remote MP4 or WebM without downloading it: `OnDemandPlayback` reads only the container's header and index and the compressed samples playback reaches, with HTTP range requests (or from a `Blob`), into byte-budgeted caches. No call waits on the network; one that needs a sample not loaded yet throws `WOULD_BLOCK`, and `prefetch()` loads it:
 
 ```js
 import init, { OnDemandPlayback, errorCode } from "zvidlib";

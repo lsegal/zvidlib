@@ -1,9 +1,11 @@
-//! Opening an MP4 for on-demand playback, shared by the native
-//! [`crate::OnDemandPlayer`] and the browser's `OnDemandPlayback` (issue #689).
+//! Opening an MP4 or WebM for on-demand playback, shared by the native
+//! [`crate::OnDemandPlayer`] and the browser's `OnDemandPlayback` (issues #689
+//! and #685).
 //!
-//! Both read only the movie header up front and then the compressed samples
-//! playback reaches, through an [`TrackSampleLoader`] per track bounded by a
-//! byte budget. What they share is how a track becomes a source the
+//! Both open the input through `crate::container::open_media`, whichever
+//! container it is, and read only its header and index up front and then the
+//! compressed samples playback reaches, through a [`TrackSampleLoader`] per
+//! track bounded by a byte budget. What they share is how a track becomes a source the
 //! [`crate::PlaybackController`] plays: which of the crate's decoders a video
 //! track opens on and with what configuration, how an audio track's packets
 //! are indexed and how many of them a read decodes ahead, and the silence that
@@ -18,13 +20,12 @@ use crate::codec::{
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, VideoDimensions};
-use crate::mp4_demux::Mp4Demuxer;
 use crate::playback::{OnDemandVideoSource, PlaybackAudioSource, PrefetchAudioSource};
 use crate::timeline::{FrameIndex, SampleRange};
 use crate::track::Track;
 use crate::{
     Error, ErrorKind, Limits, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider, Result,
-    TrackKind, TrackSampleLoader,
+    TrackSampleLoader,
 };
 
 /// The compressed video a playback may hold when the caller does not say:
@@ -50,10 +51,6 @@ pub(crate) const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 /// needs. Each AAC frame overlaps the one before it, so one is enough; the
 /// second covers the decoder's own start-up.
 pub(crate) const AAC_PREROLL_PACKETS: usize = 2;
-
-pub(crate) fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Track> {
-    demuxer.tracks.iter().find(|track| track.kind == kind)
-}
 
 /// `video` decoded on the crate's own decoder from samples a fresh
 /// [`TrackSampleLoader`] of `budget_bytes` loads on demand from `source`.

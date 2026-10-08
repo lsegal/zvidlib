@@ -1,11 +1,13 @@
-//! On-demand browser playback of an MP4 that is never loaded whole (issue #677).
+//! On-demand browser playback of an MP4 or WebM input that is never loaded
+//! whole (issues #677 and #685).
 //!
 //! [`WasmOnDemandPlayback`] is the JavaScript face of the on-demand
 //! [`PlaybackController`] of issue #672. It reads the file through a
 //! [`RangeSource`]: HTTP range requests against a URL, slices of a `Blob` or
-//! `File`, or an application's own `read(offset, length)`. Only the movie
-//! header and the compressed samples playback reaches are fetched, into caches
-//! bounded by the configured byte budgets.
+//! `File`, or an application's own `read(offset, length)`. The container is
+//! detected from the input's leading bytes, and only its header and index and
+//! the compressed samples playback reaches are fetched, into caches bounded by
+//! the configured byte budgets.
 //!
 //! Every playback call is synchronous and never waits on the network. One that
 //! needs a sample not loaded yet throws a `WOULD_BLOCK` error and leaves
@@ -41,16 +43,15 @@
 //! the page's `performance.now()` otherwise. [`SilentAudioSource`] stands in
 //! for the audio the controller schedules against it.
 
-use crate::audio::{AudioDecoder, AudioSampleReader, EncodedAudioSample};
+use crate::audio::{AudioDecoder, AudioSampleReader, AudioTrackTiming, EncodedAudioSample};
 use crate::codec::{CancellationToken, HardwarePreference};
 use crate::codec_config::derive_codec_string;
-use crate::io::{ByteSource, IoFuture};
+use crate::io::{ByteSource, CachingByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions};
 use crate::on_demand::{
     AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
     SilentAudioSource, VIDEO_ONLY_CLOCK_RATE, VIDEO_READAHEAD_SAMPLES, audio_packets,
-    crate_video_source, first_track,
+    crate_video_source,
 };
 use crate::playback::{
     AudioOutputBackend, IndexedPresentationTimeline, OnDemandVideoSource, PlaybackAudioSource,
@@ -101,6 +102,16 @@ extern "C" {
 /// asked for, and so the most decoded pictures a playback holds at once: a
 /// third of a second at 24 frames a second.
 const DECODED_VIDEO_FRAMES: u64 = 8;
+
+/// The page size opening an input reads its container's header and index
+/// through. A WebM's index is every block's header, a few bytes each across
+/// all of its clusters, so a page combines the headers of the blocks near each
+/// other into one request instead of two requests a block (issue #685).
+const INDEX_PAGE_BYTES: u64 = 4 * 1024;
+
+/// The index pages opening an input holds at once. The index is read front to
+/// back, so only the pages around the read in progress are worth keeping.
+const INDEX_CACHE_BYTES: u64 = 64 * 1024;
 
 /// How many prefetch passes an audio decode may take to load packets the plan
 /// missed before giving up on the request.
@@ -334,11 +345,13 @@ pub(crate) struct BrowserAudioSource {
 
 impl BrowserAudioSource {
     /// Fails with [`ErrorKind::Unsupported`] unless `audio` is an AAC track
-    /// this browser decodes through `WebCodecs`, or an Opus track. Reads no
-    /// packet but an Opus track's last, whose first two bytes give its length.
+    /// this browser decodes through `WebCodecs`, or an Opus track. `timing` is
+    /// the track's timing on the decoded sample clock, as its container gives
+    /// it. Reads no packet but an Opus track's last, whose first two bytes give
+    /// its length.
     async fn open(
         audio: Track,
-        movie_timescale: u32,
+        timing: AudioTrackTiming,
         source: RangeSource,
         budget_bytes: u64,
         limits: Limits,
@@ -369,7 +382,6 @@ impl BrowserAudioSource {
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
-        let timing = audio.audio_timing(movie_timescale)?;
         let loader = TrackSampleLoader::new(audio, source, budget_bytes)?;
         let (packets, preroll) = audio_packets(&loader).await?;
         let has_software = software.is_some();
@@ -923,9 +935,9 @@ enum VideoBackend {
     SoftwareOnly,
 }
 
-/// Playback of an MP4 read on demand through a URL, `Blob` or range reader,
-/// timed by a Web Audio context, or by the page's clock for a video with no
-/// audio track and no context.
+/// Playback of an MP4 or WebM input read on demand through a URL, `Blob` or
+/// range reader, timed by a Web Audio context, or by the page's clock for a
+/// video with no audio track and no context.
 ///
 /// `play`, `pause`, `seek`, `present` and `currentFrame` never wait on the
 /// network. When one needs a sample that has not been loaded, it throws an
@@ -964,13 +976,21 @@ impl WasmOnDemandPlayback {
         let options = parse_on_demand_options(options)?;
         let limits = Limits::default();
         let source = RangeSource::open(source).await.map_err(core_error)?;
-        let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
+        let index_source =
+            CachingByteSource::new(source.clone(), INDEX_PAGE_BYTES, INDEX_CACHE_BYTES)
+                .map_err(core_error)?;
+        let media = crate::container::open_media(&index_source, &limits)
             .await
             .map_err(core_error)?;
-        let video = first_track(&demuxer, TrackKind::Video)
+        let video = media
+            .first_track(TrackKind::Video)
             .ok_or_else(|| js_error(ErrorKind::Unsupported, "the input has no video track"))?
             .clone();
-        let audio = first_track(&demuxer, TrackKind::Audio).cloned();
+        let audio = media
+            .first_track(TrackKind::Audio)
+            .map(|audio| Ok((audio.clone(), media.audio_timing(audio)?)))
+            .transpose()
+            .map_err(core_error)?;
         // Checked before any audio is read, rather than once it has been.
         if audio.is_some() && options.audio_context.is_none() {
             return Err(missing_audio_context());
@@ -1018,10 +1038,10 @@ impl WasmOnDemandPlayback {
         let frame_count = video.presentation_order.len() as u64;
 
         let audio_source = match audio {
-            Some(audio) => Some(
+            Some((audio, timing)) => Some(
                 BrowserAudioSource::open(
                     audio,
-                    demuxer.movie_timescale,
+                    timing,
                     source.clone(),
                     options.audio_budget_bytes,
                     limits,
@@ -1126,8 +1146,8 @@ impl WasmOnDemandPlayback {
     /// bound the compressed samples held at once, and default to 16 MiB and
     /// 1 MiB.
     ///
-    /// Only the movie header is read here, and the first bytes of an Opus
-    /// track's last packet. The video decodes through `WebCodecs` when the
+    /// Only the container's header and sample index are read here, and the
+    /// first bytes of an Opus track's last packet. The video decodes through `WebCodecs` when the
     /// browser supports the track, and on the crate's software decoder
     /// otherwise; `videoDecoder` says which. AAC audio decodes through
     /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
@@ -1184,7 +1204,8 @@ impl WasmOnDemandPlayback {
         self.audio_budget_bytes as f64
     }
 
-    /// Every byte read from the source so far, movie header included.
+    /// Every byte read from the source so far, the container's header and
+    /// index included.
     #[wasm_bindgen(getter, js_name = fetchedBytes)]
     pub fn fetched_bytes(&self) -> f64 {
         self.source.fetched_bytes() as f64
@@ -1322,6 +1343,7 @@ impl WasmOnDemandPlayback {
 #[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
+    use crate::container::{MediaTracks, open_media};
     use crate::io::MemorySource;
     use crate::wasm_api::error_code;
     use crate::web_audio_decoder::WebAudioDecodeSession;
@@ -1377,16 +1399,14 @@ mod tests {
         options.into()
     }
 
-    async fn sample_tracks() -> (Mp4Demuxer, MemorySource) {
+    async fn sample_tracks() -> (MediaTracks, MemorySource) {
         tracks_of(SAMPLE).await
     }
 
-    async fn tracks_of(bytes: &[u8]) -> (Mp4Demuxer, MemorySource) {
+    async fn tracks_of(bytes: &[u8]) -> (MediaTracks, MemorySource) {
         let source = MemorySource::new(bytes.to_vec());
-        let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
-            .await
-            .unwrap();
-        (demuxer, source)
+        let media = open_media(&source, &Limits::default()).await.unwrap();
+        (media, source)
     }
 
     /// Opens `source` with its video on the software decoder, whatever this
@@ -1408,8 +1428,8 @@ mod tests {
     }
 
     async fn browser_decodes_audio_of(bytes: &[u8]) -> bool {
-        let (demuxer, _) = tracks_of(bytes).await;
-        let audio = first_track(&demuxer, TrackKind::Audio).unwrap();
+        let (media, _) = tracks_of(bytes).await;
+        let audio = media.first_track(TrackKind::Audio).unwrap();
         let config = WebAudioDecoderConfig::for_track(audio).unwrap();
         let support: AudioDecoderSupport = JsFuture::from(js_to_promise(
             JsAudioDecoder::is_config_supported(&config.to_js()),
@@ -1439,8 +1459,8 @@ mod tests {
         if let Some(frames) = EAGER.with_borrow(Clone::clone) {
             return frames;
         }
-        let (demuxer, source) = sample_tracks().await;
-        let video = first_track(&demuxer, TrackKind::Video).unwrap();
+        let (media, source) = sample_tracks().await;
+        let video = media.first_track(TrackKind::Video).unwrap();
         let limits = Limits::default();
         let samples = video
             .to_encoded_video_samples(&source, &limits)
@@ -1685,8 +1705,8 @@ mod tests {
         if !browser_decodes_av1_sample().await {
             return;
         }
-        let (demuxer, _) = tracks_of(AV1_SAMPLE).await;
-        let video = first_track(&demuxer, TrackKind::Video).unwrap().clone();
+        let (media, _) = tracks_of(AV1_SAMPLE).await;
+        let video = media.first_track(TrackKind::Video).unwrap().clone();
         let derived = derive_codec_string(video.codec, &video.decoder_config).unwrap();
         let config = webcodecs_config(&video, &derived, video.dimensions.unwrap()).unwrap();
         let source = RangeSource::open(make_suspending_reader(AV1_SAMPLE))
@@ -1807,14 +1827,15 @@ mod tests {
         if !browser_decodes_sample_audio().await {
             return;
         }
-        let (demuxer, _) = sample_tracks().await;
+        let (media, _) = sample_tracks().await;
+        let audio = media.first_track(TrackKind::Audio).unwrap();
         let limits = Limits::default();
         let source = RangeSource::open(make_suspending_reader(SAMPLE))
             .await
             .unwrap();
         let mut audio = BrowserAudioSource::open(
-            first_track(&demuxer, TrackKind::Audio).unwrap().clone(),
-            demuxer.movie_timescale,
+            audio.clone(),
+            media.audio_timing(audio).unwrap(),
             source,
             256 * 1024,
             limits,
@@ -1959,6 +1980,31 @@ mod tests {
     thread_local! {
         /// [`small_mp4`]'s files, without and with Opus, once encoded.
         static SMALL: RefCell<[Option<Rc<Vec<u8>>>; 2]> = const { RefCell::new([None, None]) };
+        /// [`small_webm`]'s files, by video codec and whether they have Opus,
+        /// once encoded.
+        static SMALL_WEBM: RefCell<Vec<((Codec, bool), Rc<Vec<u8>>)>> =
+            const { RefCell::new(Vec::new()) };
+        /// [`small_opus`]'s track, once encoded.
+        static SMALL_OPUS: RefCell<Option<SmallOpus>> = const { RefCell::new(None) };
+    }
+
+    type SmallOpus = (
+        crate::mp4::Mp4TrackConfig,
+        Vec<crate::EncodedSample>,
+        crate::AudioGapless,
+    );
+
+    /// The Opus track [`small_mp4`] and [`small_webm`] carry: three seconds
+    /// of it, its packets and its gapless trim. Encoded once and shared.
+    async fn small_opus() -> SmallOpus {
+        if let Some(opus) = SMALL_OPUS.with_borrow(Clone::clone) {
+            return opus;
+        }
+        let (track, packets, gapless, _) =
+            crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE).await;
+        let opus = (track, packets, gapless);
+        SMALL_OPUS.set(Some(opus.clone()));
+        opus
     }
 
     /// Three seconds of lossless monochrome 32x18 AV1 at 30 fps, which
@@ -2005,9 +2051,7 @@ mod tests {
             format: Mp4TrackFormat::Video(dimensions),
         }];
         let audio = if opus {
-            let (track, packets, gapless, _) =
-                crate::web_audio_decoder::tests::opus_packets(48_000 * SMALL_FRAMES / SMALL_RATE)
-                    .await;
+            let (track, packets, gapless) = small_opus().await;
             tracks.push(track);
             Some((packets, gapless))
         } else {
@@ -2055,6 +2099,162 @@ mod tests {
         muxer.finish().await.unwrap().into_inner()
     }
 
+    /// [`small_mp4`]'s three seconds of moving gradient as a WebM, its video
+    /// encoded as `codec` (VP8 or VP9, both lossy) and with `opus`, the same
+    /// Opus track muxed beside it with its `CodecDelay` and end trim. Encoded
+    /// once and shared, as [`small_mp4`] is.
+    async fn small_webm(codec: Codec, opus: bool) -> Rc<Vec<u8>> {
+        let key = (codec, opus);
+        let cached = SMALL_WEBM.with_borrow(|small| {
+            small
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, bytes)| Rc::clone(bytes))
+        });
+        if let Some(bytes) = cached {
+            return bytes;
+        }
+        let bytes = Rc::new(encode_small_webm(codec, opus).await);
+        SMALL_WEBM.with_borrow_mut(|small| small.push((key, Rc::clone(&bytes))));
+        bytes
+    }
+
+    async fn encode_small_webm(codec: Codec, opus: bool) -> Vec<u8> {
+        use crate::codec::{VideoEncoderConfig, VideoEncoderFactory};
+        use crate::io::MemorySink;
+        use crate::media::{ColorRange, PixelFormat, Plane, VideoDimensions};
+        use crate::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+        use crate::transfer::{CpuFrameSource, FrameSource, Orientation};
+        use crate::{CodecProfile, HardwarePreference, VideoFrame, WebmMuxer};
+
+        let limits = Limits::default();
+        let dimensions = VideoDimensions::new(32, 18, &limits).unwrap();
+        let (factory, profile): (Box<dyn VideoEncoderFactory>, _) = match codec {
+            Codec::Vp8 => (
+                Box::new(crate::native_vp8_video_encoder_factory()),
+                CodecProfile::Vp8,
+            ),
+            Codec::Vp9 => (
+                Box::new(crate::native_vp9_video_encoder_factory()),
+                CodecProfile::Vp9Profile0,
+            ),
+            _ => unreachable!("a small WebM is VP8 or VP9"),
+        };
+        let mut encoder = factory
+            .create(
+                &VideoEncoderConfig {
+                    codec,
+                    profile,
+                    coded_dimensions: dimensions,
+                    input_format: PixelFormat::Rgba8,
+                    color_range: ColorRange::Limited,
+                    hardware: HardwarePreference::Avoid,
+                    timescale: SMALL_RATE as u32,
+                    frame_duration: 1,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut tracks = vec![Mp4TrackConfig {
+            encoder: encoder.config().clone(),
+            format: Mp4TrackFormat::Video(dimensions),
+        }];
+        let audio = if opus {
+            let (track, packets, gapless) = small_opus().await;
+            tracks.push(track);
+            Some((packets, gapless))
+        } else {
+            None
+        };
+        let mut muxer = WebmMuxer::new(MemorySink::new(), tracks, 100_000)
+            .await
+            .unwrap();
+        let mut video = Vec::new();
+        for index in 0..SMALL_FRAMES {
+            let frame = VideoFrame::new(
+                dimensions,
+                PixelFormat::Rgba8,
+                ColorRange::Limited,
+                vec![Plane {
+                    data: small_rgba(index),
+                    stride: dimensions.width as usize * 4,
+                }],
+                &limits,
+            )
+            .unwrap();
+            video.extend(
+                encoder
+                    .encode(
+                        FrameIndex(index),
+                        FrameSource::Cpu(CpuFrameSource {
+                            frame: &frame,
+                            orientation: Orientation::TopLeft,
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        video.extend(encoder.finish().await.unwrap());
+        // A WebM cluster interleaves its tracks, so the samples are written
+        // in presentation-time order across both.
+        let seconds = |pts: i64, timescale: u64| pts as f64 / timescale as f64;
+        let mut samples: Vec<_> = video
+            .into_iter()
+            .map(|sample| (seconds(sample.pts, SMALL_RATE), 0, sample))
+            .collect();
+        let gapless = audio.map(|(packets, gapless)| {
+            samples.extend(
+                packets
+                    .into_iter()
+                    .map(|packet| (seconds(packet.pts, 48_000), 1, packet)),
+            );
+            gapless
+        });
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, track, sample) in samples {
+            muxer.write_sample(track, sample).await.unwrap();
+        }
+        if let Some(gapless) = gapless {
+            muxer.set_audio_gapless(1, gapless).unwrap();
+        }
+        muxer.finish().await.unwrap().into_inner()
+    }
+
+    /// Every frame of `bytes`'s video, decoded in software from every sample
+    /// held in memory: what on-demand playback of a lossy input must
+    /// reproduce.
+    async fn eager_frames_of(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let (media, source) = tracks_of(bytes).await;
+        let video = media.first_track(TrackKind::Video).unwrap();
+        let limits = Limits::default();
+        let samples = video
+            .to_encoded_video_samples(&source, &limits)
+            .await
+            .unwrap();
+        let derived = derive_codec_string(video.codec, &video.decoder_config).unwrap();
+        let (factory, configuration) = crate::on_demand::crate_video_decoder(
+            video,
+            derived.profile,
+            video.dimensions.unwrap(),
+            &samples,
+            HardwarePreference::Avoid,
+            &limits,
+        )
+        .unwrap();
+        let mut reader =
+            crate::ExactFrameReader::new(factory.as_ref(), configuration, samples, limits).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut decoded = Vec::new();
+        for frame in 0..video.presentation_order.len() as u64 {
+            decoded.push(packed_rgba(
+                &reader.get(FrameIndex(frame), &cancellation).unwrap(),
+            ));
+        }
+        decoded
+    }
+
     /// Opens one of [`small_mp4`]'s files on the software video decoder,
     /// which decodes it back to exactly the gray levels it was encoded from;
     /// these tests are about its audio and its clock, not how its video
@@ -2096,16 +2296,23 @@ mod tests {
     /// decoder either way.
     #[wasm_bindgen_test(async)]
     async fn opus_audio_reads_load_packets_on_demand_and_match_an_eager_decode() {
-        let bytes = small_mp4(true).await;
+        // Issue #685: a WebM's Opus track, timed by its `CodecDelay` rather
+        // than an edit list, loads and decodes the same way.
+        let mp4 = small_mp4(true).await;
+        let webm = small_webm(Codec::Vp9, true).await;
+        for bytes in [mp4, webm] {
+            opus_reads_match_an_eager_decode(&bytes).await;
+        }
+    }
+
+    async fn opus_reads_match_an_eager_decode(bytes: &[u8]) {
         let source = MemorySource::new(bytes.to_vec());
-        let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
-            .await
-            .unwrap();
-        let track = first_track(&demuxer, TrackKind::Audio).unwrap().clone();
+        let media = open_media(&source, &Limits::default()).await.unwrap();
+        let track = media.first_track(TrackKind::Audio).unwrap().clone();
         assert_eq!(track.codec, Codec::Opus);
         let packets = track.samples.len();
         let limits = Limits::default();
-        let mut eager = WebAudioDecodeSession::open(&bytes, 0, &limits)
+        let mut eager = WebAudioDecodeSession::open(bytes, 0, &limits)
             .await
             .unwrap();
         let length = eager.presentation_length();
@@ -2114,10 +2321,10 @@ mod tests {
         let cancellation = CancellationToken::new();
 
         for software in [false, true] {
-            let reader = make_suspending_reader(&bytes);
+            let reader = make_suspending_reader(bytes);
             let mut audio = BrowserAudioSource::open(
                 track.clone(),
-                demuxer.movie_timescale,
+                media.audio_timing(&track).unwrap(),
                 RangeSource::open(reader.clone()).await.unwrap(),
                 64 * 1024,
                 limits,
@@ -2332,6 +2539,74 @@ mod tests {
         sleep(200.0).await;
         let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
         assert_eq!(field(&presentation, "finished"), JsValue::TRUE);
+    }
+
+    /// Issue #685: a WebM plays, presents and seeks over a suspending source
+    /// through the same path an MP4 does, with VP8 or VP9 video and Opus audio
+    /// or none. Its frames are the ones an eager decode of the whole file
+    /// gives. The file is a few kilobytes, smaller than the pages its index is
+    /// read through, so what opening fetches is measured natively instead.
+    #[wasm_bindgen_test(async)]
+    async fn plays_webm_inputs_over_a_suspending_source() {
+        for (codec, opus) in [(Codec::Vp8, true), (Codec::Vp9, true), (Codec::Vp9, false)] {
+            let bytes = small_webm(codec, opus).await;
+            let eager = eager_frames_of(&bytes).await;
+            assert_eq!(eager.len() as u64, SMALL_FRAMES);
+            let reader = make_suspending_reader(&bytes);
+            let playback = open_small(reader, Some(options(1 << 20))).await.unwrap();
+            assert_eq!(playback.has_audio(), opus, "{codec:?}");
+            assert_eq!(playback.sample_rate(), if opus { 48_000 } else { 0 });
+            assert_eq!(
+                parse_u64(&playback.frame_count(), "frames").unwrap(),
+                SMALL_FRAMES
+            );
+
+            until_loaded(&playback, WasmOnDemandPlayback::play).await;
+            let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), 0);
+            assert_eq!(pixels(&field(&presentation, "picture")), eager[0]);
+
+            playback.seek(JsValue::from_f64(45.0)).unwrap();
+            let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), 45, "{codec:?}");
+            assert_eq!(pixels(&field(&presentation, "picture")), eager[45]);
+
+            playback.pause().unwrap();
+            playback.seek(JsValue::from_f64(89.0)).unwrap();
+            let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+            assert_eq!(pixels(&picture), eager[89]);
+
+            // Whichever video decoder the browser picks, the WebM opens and
+            // seeks the same way.
+            let automatic = WasmOnDemandPlayback::open_inner(
+                make_suspending_reader(&bytes),
+                Some(options(1 << 20)),
+            )
+            .await
+            .unwrap();
+            until_loaded(&automatic, WasmOnDemandPlayback::play).await;
+            for frame in [0_u64, 30] {
+                automatic.seek(JsValue::from_f64(frame as f64)).unwrap();
+                let presentation = until_loaded(&automatic, WasmOnDemandPlayback::present).await;
+                assert_eq!(frame_of(&presentation), frame);
+                assert_eq!(pixels(&field(&presentation, "picture")).len(), 32 * 18 * 4);
+            }
+        }
+    }
+
+    /// Issue #685: a WebM opens from a URL and a `Blob` as an MP4 does.
+    #[wasm_bindgen_test(async)]
+    async fn opens_a_webm_from_a_url_and_a_blob() {
+        let bytes = small_webm(Codec::Vp9, false).await;
+        let eager = eager_frames_of(&bytes).await;
+        let url = make_object_url(&bytes, "video/webm").unwrap();
+        let blob = make_blob(&bytes, "video/webm").unwrap();
+        for source in [JsValue::from_str(&url), blob.into()] {
+            let playback = open_small(source, Some(options(1 << 20))).await.unwrap();
+            playback.seek(JsValue::from_f64(20.0)).unwrap();
+            let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+            assert_eq!(pixels(&picture), eager[20]);
+        }
     }
 
     /// An input with audio needs an audio context to play it through.

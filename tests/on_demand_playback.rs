@@ -1,35 +1,31 @@
 //! `PlaybackController` plays and seeks through on-demand video and audio
 //! sources: synchronously over a source that answers immediately, as native
 //! playback does, and over a source whose every read suspends, as a browser
-//! `fetch` does, without ever waiting on it (issue #672).
+//! `fetch` does, without ever waiting on it (issue #672). Each test runs over
+//! the bundled MP4 and over a WebM, opened through the same container-agnostic
+//! entry point (issue #685).
 
 #![cfg(not(target_arch = "wasm32"))]
+
+mod common;
 
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
+use common::{block_on, vp9_opus_webm};
 use zvidlib::io::{ByteSource, CachingByteSource, IoFuture, MemorySource};
 use zvidlib::{
-    AudioBuffer, AudioDecoder, AudioOutputBackend, AudioSampleReader, CancellationToken,
-    CodecProfile, ColorRange, EncodedAudioSample, ErrorKind, ExactFrameReader, FrameIndex,
-    HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PixelFormat, PlaybackController,
-    PlaybackOptions, Result, Track, TrackKind, TrackSampleLoader, TrackSampleProvider,
-    VideoDecoderConfig, VideoFrame, WebAudioOutput, native_hevc_video_decoder_factory,
+    AudioBuffer, AudioDecoder, AudioOutputBackend, AudioPacketProvider, AudioSampleReader,
+    AudioTrackTiming, CancellationToken, Codec, CodecProfile, ColorRange, EncodedAudioSample,
+    ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, IndexedPresentationTimeline,
+    Limits, NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PixelFormat,
+    PlaybackController, PlaybackOptions, Result, Track, TrackKind, TrackSampleLoader,
+    TrackSampleProvider, VideoDecoderConfig, VideoDecoderFactory, VideoFrame, WebAudioOutput,
+    native_hevc_video_decoder_factory, native_vp9_video_decoder_factory,
 };
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    loop {
-        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-    }
-}
 
 /// A source whose every read suspends once before completing, the way a
 /// browser `fetch` does, so a synchronous caller polling it once never gets
@@ -135,35 +131,65 @@ impl AudioOutputBackend for Backend {
     }
 }
 
+/// An input's bytes and tracks, with what decoding its video takes.
 struct Bundled {
     bytes: Vec<u8>,
-    movie_timescale: u32,
     video: Track,
     audio: Track,
+    /// The audio track's timing on the decoded sample clock, as its
+    /// container gives it.
+    timing: AudioTrackTiming,
+    decoder: Box<dyn VideoDecoderFactory>,
+    profile: CodecProfile,
 }
 
+/// Opens `bytes` through the container-agnostic entry point on-demand
+/// playback uses.
+fn open(bytes: Vec<u8>, decoder: Box<dyn VideoDecoderFactory>, profile: CodecProfile) -> Bundled {
+    let source = MemorySource::new(bytes.clone());
+    let media = block_on(zvidlib::container::open_media(&source, &Limits::default())).unwrap();
+    let track = |kind| {
+        media
+            .first_track(kind)
+            .cloned()
+            .unwrap_or_else(|| panic!("the input has no {kind:?} track"))
+    };
+    let audio = track(TrackKind::Audio);
+    Bundled {
+        timing: media.audio_timing(&audio).unwrap(),
+        video: track(TrackKind::Video),
+        audio,
+        bytes,
+        decoder,
+        profile,
+    }
+}
+
+/// The bundled HEVC and AAC MP4.
 fn bundled() -> Bundled {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/media/BigBuckBunny.mp4"
     ))
     .to_vec();
-    let source = MemorySource::new(bytes.clone());
-    let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
-    let track = |kind| {
-        demuxer
-            .tracks
-            .iter()
-            .find(|track| track.kind == kind)
-            .cloned()
-            .unwrap_or_else(|| panic!("the bundled sample has no {kind:?} track"))
-    };
-    Bundled {
-        movie_timescale: demuxer.movie_timescale,
-        video: track(TrackKind::Video),
-        audio: track(TrackKind::Audio),
+    open(
         bytes,
-    }
+        Box::new(native_hevc_video_decoder_factory()),
+        CodecProfile::HevcMain,
+    )
+}
+
+/// A VP9 and Opus WebM, whose index comes from its block headers and whose
+/// audio is timed by its `CodecDelay` rather than an edit list.
+fn webm() -> Bundled {
+    let bundled = open(
+        vp9_opus_webm(true),
+        Box::new(native_vp9_video_decoder_factory()),
+        CodecProfile::Vp9Profile0,
+    );
+    assert_eq!(bundled.video.codec, Codec::Vp9);
+    assert_eq!(bundled.audio.codec, Codec::Opus);
+    bundled
 }
 
 /// A small frame cache: the bundled sample is 1080p and CI decodes it in
@@ -175,19 +201,32 @@ fn video_limits() -> Limits {
     }
 }
 
-fn video_configuration(track: &Track) -> VideoDecoderConfig {
-    VideoDecoderConfig {
-        codec: track.codec,
-        profile: CodecProfile::HevcMain,
-        coded_dimensions: track.dimensions.unwrap(),
-        output_format: PixelFormat::Rgba8,
-        color_range: ColorRange::Limited,
-        hardware: HardwarePreference::Avoid,
-        configuration: track.decoder_config.clone(),
-    }
-}
-
 impl Bundled {
+    fn video_configuration(&self) -> VideoDecoderConfig {
+        VideoDecoderConfig {
+            codec: self.video.codec,
+            profile: self.profile,
+            coded_dimensions: self.video.dimensions.unwrap(),
+            output_format: PixelFormat::Rgba8,
+            color_range: ColorRange::Limited,
+            hardware: HardwarePreference::Avoid,
+            configuration: self.video.decoder_config.clone(),
+        }
+    }
+
+    /// The audio track's packet provider over `loader`, built from the
+    /// track's index alone.
+    fn audio_packets<S: ByteSource + 'static>(
+        &self,
+        loader: &TrackSampleLoader<S>,
+    ) -> Box<dyn AudioPacketProvider> {
+        Box::new(match self.audio.codec {
+            Codec::Aac => loader.aac_packet_provider().unwrap(),
+            Codec::Opus => block_on(loader.opus_packet_provider()).unwrap(),
+            codec => panic!("no packet provider for {codec:?}"),
+        })
+    }
+
     fn eager_audio_packets(&self) -> Vec<EncodedAudioSample> {
         let source = MemorySource::new(self.bytes.clone());
         block_on(
@@ -211,7 +250,7 @@ impl Bundled {
             packets,
             sample_rate,
             channels,
-            self.audio.audio_timing(self.movie_timescale).unwrap(),
+            self.timing.clone(),
             2,
             Limits::default(),
         )
@@ -226,8 +265,8 @@ impl Bundled {
         )
         .unwrap();
         ExactFrameReader::new(
-            &native_hevc_video_decoder_factory(),
-            video_configuration(&self.video),
+            self.decoder.as_ref(),
+            self.video_configuration(),
             samples,
             video_limits(),
         )
@@ -275,7 +314,15 @@ fn presentation_start(timeline: &IndexedPresentationTimeline, frame: u64) -> u64
 /// drives the controller directly, never reporting anything not loaded.
 #[test]
 fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
-    let bundled = bundled();
+    plays_and_seeks_through_a_synchronous_on_demand_video_provider(&bundled());
+}
+
+#[test]
+fn playback_plays_and_seeks_a_webm_through_a_synchronous_on_demand_video_provider() {
+    plays_and_seeks_through_a_synchronous_on_demand_video_provider(&webm());
+}
+
+fn plays_and_seeks_through_a_synchronous_on_demand_video_provider(bundled: &Bundled) {
     let total_video_bytes: u64 = bundled
         .video
         .samples
@@ -289,8 +336,8 @@ fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
     )
     .unwrap();
     let video = ExactFrameReader::from_provider(
-        &native_hevc_video_decoder_factory(),
-        video_configuration(&bundled.video),
+        bundled.decoder.as_ref(),
+        bundled.video_configuration(),
         Box::new(TrackSampleProvider::new(bundled.video.clone(), cache).unwrap()),
         video_limits(),
     )
@@ -327,7 +374,7 @@ fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
         picture.unwrap().planes[0].data,
         eager.get(FrameIndex(target), &cancellation).unwrap().planes[0].data
     );
-    assert_scheduled_audio_matches(&bundled, &backend.scheduled.lock().unwrap());
+    assert_scheduled_audio_matches(bundled, &backend.scheduled.lock().unwrap());
 }
 
 /// Retries `step` until it stops reporting `WouldBlock`, awaiting the
@@ -367,11 +414,27 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         .iter()
         .map(|sample| u64::from(sample.size))
         .sum();
-    let video_budget: u64 = bundled.video.samples[..24]
+    assert!(first_samples_bytes(&bundled, 24) < total_video_bytes / 10);
+    plays_and_seeks_through_on_demand_sources_over_a_suspending_source(&bundled);
+}
+
+/// The same over a WebM, whose 24-sample budget holds less than one of its
+/// two groups of pictures.
+#[test]
+fn playback_plays_and_seeks_a_webm_through_on_demand_sources_over_a_suspending_source() {
+    plays_and_seeks_through_on_demand_sources_over_a_suspending_source(&webm());
+}
+
+/// The compressed bytes of the track's first `count` video samples.
+fn first_samples_bytes(bundled: &Bundled, count: usize) -> u64 {
+    bundled.video.samples[..count]
         .iter()
         .map(|sample| u64::from(sample.size))
-        .sum();
-    assert!(video_budget < total_video_bytes / 10);
+        .sum()
+}
+
+fn plays_and_seeks_through_on_demand_sources_over_a_suspending_source(bundled: &Bundled) {
+    let video_budget = first_samples_bytes(bundled, 24);
     let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
@@ -379,8 +442,8 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
     )
     .unwrap();
     let video_reader = ExactFrameReader::from_provider(
-        &native_hevc_video_decoder_factory(),
-        video_configuration(&bundled.video),
+        bundled.decoder.as_ref(),
+        bundled.video_configuration(),
         Box::new(video_loader.sample_provider().unwrap()),
         video_limits(),
     )
@@ -393,7 +456,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         256 * 1024,
     )
     .unwrap();
-    let audio_reader = bundled.audio_reader(Box::new(audio_loader.aac_packet_provider().unwrap()));
+    let audio_reader = bundled.audio_reader(bundled.audio_packets(&audio_loader));
     let audio = OnDemandAudioSource::new(audio_reader, audio_loader, 32);
 
     let backend = Backend::default();
@@ -457,14 +520,22 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         eager.get(FrameIndex(30), &cancellation).unwrap().planes[0].data
     );
 
-    assert_scheduled_audio_matches(&bundled, &backend.scheduled.lock().unwrap());
+    assert_scheduled_audio_matches(bundled, &backend.scheduled.lock().unwrap());
 }
 
 /// Prefetching ahead of time - between frames, as a render loop does - means
 /// the next frames never report anything missing at all.
 #[test]
 fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
-    let bundled = bundled();
+    prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(&bundled());
+}
+
+#[test]
+fn prefetching_ahead_keeps_webm_playback_from_reporting_missing_samples() {
+    prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(&webm());
+}
+
+fn prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(bundled: &Bundled) {
     let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
@@ -472,8 +543,8 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
     )
     .unwrap();
     let video_reader = ExactFrameReader::from_provider(
-        &native_hevc_video_decoder_factory(),
-        video_configuration(&bundled.video),
+        bundled.decoder.as_ref(),
+        bundled.video_configuration(),
         Box::new(video_loader.sample_provider().unwrap()),
         video_limits(),
     )
@@ -484,7 +555,7 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
         256 * 1024,
     )
     .unwrap();
-    let audio_reader = bundled.audio_reader(Box::new(audio_loader.aac_packet_provider().unwrap()));
+    let audio_reader = bundled.audio_reader(bundled.audio_packets(&audio_loader));
     let backend = Backend::default();
     let timeline = bundled.timeline();
     let mut playback = PlaybackController::new_with_indexed_timeline(
