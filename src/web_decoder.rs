@@ -15,15 +15,15 @@
 //! calling thread and is meant for the handful of frames a thumbnail or a
 //! preview pass needs rather than real-time playback.
 
-use crate::av1::{Av1CodecConfigurationRecord, Av1Obu, Av1Parser};
 use crate::codec::{
     CancellationToken, CodecProfile, EncodedVideoSample, ExactFrameReader, HardwarePreference,
-    SampleProvider, VideoDecoderConfig, VideoDecoderFactory,
+    SampleProvider,
 };
 use crate::codec_config::{DerivedCodecString, derive_codec_string};
 use crate::io::MemorySource;
-use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
+use crate::media::{Codec, VideoDimensions, VideoFrame};
 use crate::mp4_demux::Mp4Track;
+use crate::on_demand::crate_video_decoder;
 use crate::timeline::FrameIndex;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
@@ -314,70 +314,6 @@ pub(crate) async fn webcodecs_supports(config: &JsVideoDecoderConfig) -> Result<
     Ok(support.get_supported().unwrap_or(false))
 }
 
-/// The crate's own software decoder for `codec`.
-fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>> {
-    match codec {
-        #[cfg(feature = "hevc-decoder")]
-        Codec::Hevc => Ok(Box::new(crate::native_hevc_video_decoder_factory())),
-        #[cfg(feature = "av1-decoder")]
-        Codec::Av1 => Ok(Box::new(crate::native_av1_video_decoder_factory())),
-        #[cfg(feature = "vp8-decoder")]
-        Codec::Vp8 => Ok(Box::new(crate::native_vp8_video_decoder_factory())),
-        #[cfg(feature = "vp9-decoder")]
-        Codec::Vp9 => Ok(Box::new(crate::native_vp9_video_decoder_factory())),
-        // Uncompressed video, H.264, the audio codecs, any codec a later
-        // zvidlib-core adds, and a decoder whose Cargo feature is off.
-        _ => Err(Error::new(
-            ErrorKind::Unsupported,
-            "only HEVC, AV1, VP8 and VP9 have a software decoder backend, each with its \
-             <codec>-decoder Cargo feature",
-        )),
-    }
-}
-
-/// The crate's software decoder for `track` and the configuration it decodes
-/// the track with.
-///
-/// `profile` is the profile the track's configuration box names, so an HEVC
-/// Main 10 track is opened as Main 10 (issue #508) and a VP9 track as the VP9
-/// profile its `vpcC` declares. `samples` are the track's leading samples in
-/// decode order: an AV1 or VP9 track's color range is read from the first one
-/// when its configuration record does not say, so a caller that loads samples
-/// on demand need only pass that one.
-pub(crate) fn software_video_decoder(
-    track: &Mp4Track,
-    profile: CodecProfile,
-    dimensions: VideoDimensions,
-    samples: &[EncodedVideoSample],
-    limits: &Limits,
-) -> Result<(Box<dyn VideoDecoderFactory>, VideoDecoderConfig)> {
-    let factory = software_decoder_factory(track.codec)?;
-    // The HEVC decoder only accepts limited-range input, while the AV1
-    // and VP9 decoders report whatever range the stream signals and the
-    // reader holds every frame to the configured one.
-    let (profile, color_range) = match track.codec {
-        Codec::Av1 => (
-            CodecProfile::Av1Main,
-            av1_color_range(track, samples, limits),
-        ),
-        Codec::Vp9 => (profile, vp9_color_range(track, samples)),
-        _ => (profile, ColorRange::Limited),
-    };
-    // The decoders validate the configuration record itself, so a stream
-    // they cannot decode (color AV1, say) is refused here, at open,
-    // rather than on its first frame.
-    let configuration = VideoDecoderConfig {
-        codec: track.codec,
-        profile,
-        coded_dimensions: dimensions,
-        output_format: PixelFormat::Rgba8,
-        color_range,
-        hardware: HardwarePreference::Avoid,
-        configuration: track.decoder_config.clone(),
-    };
-    Ok((factory, configuration))
-}
-
 /// The portable software decoder, behind the same exact-frame reader native
 /// callers use.
 struct SoftwareDecoder {
@@ -385,7 +321,7 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
-    /// `profile` is as [`software_video_decoder`] takes it.
+    /// `profile` is as [`crate_video_decoder`] takes it.
     fn open(
         track: &Mp4Track,
         profile: CodecProfile,
@@ -393,8 +329,14 @@ impl SoftwareDecoder {
         samples: Vec<EncodedVideoSample>,
         limits: &Limits,
     ) -> Result<Self> {
-        let (factory, configuration) =
-            software_video_decoder(track, profile, dimensions, &samples, limits)?;
+        let (factory, configuration) = crate_video_decoder(
+            track,
+            profile,
+            dimensions,
+            &samples,
+            HardwarePreference::Avoid,
+            limits,
+        )?;
         let reader = ExactFrameReader::new(factory.as_ref(), configuration, samples, *limits)?;
         Ok(Self { reader })
     }
@@ -410,54 +352,6 @@ impl SoftwareDecoder {
         yield_to_event_loop().await;
         let frame = self.reader.get(presentation_index, cancellation)?;
         Ok((frame.dimensions, packed_rgba(&frame)))
-    }
-}
-
-/// The color range an AV1 track's sequence header signals: from `av1C`'s
-/// `configOBUs` when it carries one, which it need not, and otherwise from the
-/// first sample, a key frame that must. Limited when neither parses, which
-/// leaves the reader to reject the first frame that disagrees.
-fn av1_color_range(
-    track: &Mp4Track,
-    samples: &[EncodedVideoSample],
-    limits: &Limits,
-) -> ColorRange {
-    let from_config = Av1CodecConfigurationRecord::parse(&track.decoder_config, limits)
-        .ok()
-        .and_then(|record| {
-            record.config_obus.into_iter().find_map(|obu| match obu {
-                Av1Obu::SequenceHeader { sequence, .. } => Some(sequence),
-                _ => None,
-            })
-        });
-    let sequence = from_config.or_else(|| {
-        let mut parser = Av1Parser::new(*limits).ok()?;
-        parser.parse_low_overhead(&samples.first()?.data).ok()?;
-        parser.sequence
-    });
-    match sequence {
-        Some(sequence) if sequence.color_config.color_range => ColorRange::Full,
-        _ => ColorRange::Limited,
-    }
-}
-
-/// The color range a VP9 track's first key frame signals, which is what
-/// its pictures are decoded in. The `vpcC` box's `videoFullRangeFlag` stands
-/// in when the first sample does not parse, and limited range when neither
-/// says, which leaves the reader to reject the first frame that disagrees.
-fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRange {
-    let full = samples
-        .first()
-        .and_then(|sample| zvidlib_vp9_syntax::chunk_full_range(&sample.data))
-        .or_else(|| {
-            crate::Vp9CodecConfig::parse(&track.decoder_config)
-                .ok()
-                .map(|config| config.video_full_range)
-        });
-    if full == Some(true) {
-        ColorRange::Full
-    } else {
-        ColorRange::Limited
     }
 }
 
@@ -1003,6 +897,8 @@ pub(crate) fn normalize_js_error(error: JsValue, context: &str) -> Error {
 #[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
+    use crate::codec::{VideoDecoderConfig, VideoDecoderFactory};
+    use crate::media::{ColorRange, PixelFormat};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
