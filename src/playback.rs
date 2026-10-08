@@ -118,7 +118,7 @@ pub trait PrefetchAudioSource: PlaybackAudioSource {
     fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()>;
 }
 
-/// Exact video frames decoded from compressed samples an [`TrackSampleLoader`] loads on demand,
+/// Exact video frames decoded from compressed samples a [`TrackSampleLoader`] loads on demand,
 /// for a byte source whose reads suspend, such as a browser `fetch`.
 ///
 /// [`PlaybackVideoSource::get_exact`] never waits on the source: it reports
@@ -185,7 +185,7 @@ impl<S: ByteSource> PrefetchVideoSource for OnDemandVideoSource<S> {
     }
 }
 
-/// Exact audio ranges decoded from compressed packets an [`TrackSampleLoader`] loads on demand,
+/// Exact audio ranges decoded from compressed packets a [`TrackSampleLoader`] loads on demand,
 /// for a byte source whose reads suspend, such as a browser `fetch`.
 ///
 /// [`PlaybackAudioSource::read`] never waits on the source: it reports

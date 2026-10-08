@@ -2,7 +2,7 @@
 //!
 //! [`WebmDemuxer::open`] builds the same decode-order sample index
 //! [`crate::Mp4Demuxer`] does, as [`Track`] values, so everything that
-//! consumes an MP4 index - [`Track::to_encoded_video_samples`],
+//! consumes a track index - [`Track::to_encoded_video_samples`],
 //! [`Track::to_encoded_audio_samples`], [`crate::ExactFrameReader`],
 //! [`crate::AudioSampleReader`], the browser decoders - reads a WebM track the
 //! same way. Opus and Vorbis audio tracks are indexed alongside the video, and
@@ -1002,7 +1002,7 @@ fn audio_codec(codec_id: &str) -> Option<Codec> {
     }
 }
 
-/// Wraps a track's `CodecPrivate` in the MP4 box an [`Track`] carries, so
+/// Wraps a track's `CodecPrivate` in the MP4 box a [`Track`] carries, so
 /// decoders configure from a WebM track exactly as from an MP4 one.
 fn decoder_config(
     codec: Codec,

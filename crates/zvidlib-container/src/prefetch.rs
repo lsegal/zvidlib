@@ -5,7 +5,7 @@
 //! [`TrackSampleProvider`] reads through its source from inside
 //! [`ExactFrameReader::get`], which is synchronous, so it can only drive a
 //! source that resolves on the first poll. This module splits the read in two
-//! instead. An [`TrackSampleLoader`] owns the track's index and the source, and
+//! instead. A [`TrackSampleLoader`] owns the track's index and the source, and
 //! loads samples asynchronously into a byte-budgeted cache. The providers it
 //! hands out answer a reader's synchronous reads from that cache alone and
 //! report [`ErrorKind::WouldBlock`] for a sample that is not loaded yet rather
@@ -325,7 +325,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
     }
 }
 
-/// A [`SampleProvider`] that answers from an [`TrackSampleLoader`]'s cache and
+/// A [`SampleProvider`] that answers from a [`TrackSampleLoader`]'s cache and
 /// reports [`ErrorKind::WouldBlock`] for a sample that is not loaded yet.
 pub struct PrefetchedSampleProvider {
     presentation_index_by_decode: Vec<u64>,
@@ -354,7 +354,7 @@ impl SampleProvider for PrefetchedSampleProvider {
     }
 }
 
-/// An [`AudioPacketProvider`] that answers from an [`TrackSampleLoader`]'s
+/// An [`AudioPacketProvider`] that answers from a [`TrackSampleLoader`]'s
 /// cache and reports [`ErrorKind::WouldBlock`] for a packet that is not
 /// loaded yet.
 pub struct PrefetchedAudioPacketProvider {
@@ -392,7 +392,7 @@ impl AudioPacketProvider for PrefetchedAudioPacketProvider {
     }
 }
 
-/// The cache an [`TrackSampleLoader`] fills and its providers read, shared
+/// The cache a [`TrackSampleLoader`] fills and its providers read, shared
 /// between them.
 #[derive(Clone)]
 struct SharedCache {

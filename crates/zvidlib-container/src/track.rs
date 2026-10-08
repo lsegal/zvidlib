@@ -41,7 +41,7 @@ pub struct TrackSample {
     pub is_sync: bool,
 }
 
-/// Read-only metadata and indexes for one MP4 track.
+/// Read-only metadata and indexes for one demuxed track, from any container.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Track {
     pub id: u32,
@@ -52,7 +52,8 @@ pub struct Track {
     pub dimensions: Option<VideoDimensions>,
     pub channels: Option<u16>,
     pub sample_rate: Option<u32>,
-    /// Complete codec configuration box, including its header.
+    /// Complete codec configuration box, including its header, in the form an
+    /// MP4 sample entry carries it whichever container the track came from.
     pub decoder_config: Vec<u8>,
     pub edits: Vec<EditMapping>,
     /// Samples in decode order.
@@ -224,7 +225,7 @@ impl Track {
     /// packets - from its validated byte range.
     ///
     /// Packet intervals use the decoded PCM sample clock and remain contiguous
-    /// even when the MP4 track timescale differs from the decoded sample rate.
+    /// even when the track timescale differs from the decoded sample rate.
     pub async fn to_encoded_audio_samples<S: ByteSource + ?Sized>(
         &self,
         source: &S,
@@ -353,8 +354,9 @@ impl Track {
         Ok(ranges)
     }
 
-    /// Converts MP4 edit-list timing to the presentation sample clock used by
-    /// [`crate::AudioSampleReader`], including decoder priming and end padding.
+    /// Converts the track's MP4 edit-list timing to the presentation sample
+    /// clock used by [`crate::AudioSampleReader`], including decoder priming
+    /// and end padding.
     ///
     /// An Opus track without an edit list still has its `dOps` pre-skip
     /// trimmed as priming, and ends where its sample table does: the packets
@@ -436,8 +438,8 @@ impl Track {
 /// [`ByteSource`] on demand, holding only `track`'s index (and whatever `S`
 /// itself caches) rather than every sample's bytes.
 ///
-/// Built from a shared MP4/WebM [`Track`] index, so it works over either
-/// container.
+/// Built from a container-neutral [`Track`] index, so it works over MP4 and
+/// WebM alike.
 ///
 /// `S::read_at`'s future must resolve the first time it is polled: this
 /// provider is used from [`ExactFrameReader::get`][crate::codec::ExactFrameReader::get],

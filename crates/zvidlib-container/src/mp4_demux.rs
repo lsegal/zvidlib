@@ -1610,7 +1610,11 @@ fn unsupported(m: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::AudioPacketProvider;
+    use crate::codec::SampleProvider;
     use crate::io::{CachingByteSource, IoFuture, MemorySource};
+    use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
+    use crate::track::{TrackAudioPacketProvider, TrackSampleProvider};
     use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
