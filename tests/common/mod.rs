@@ -12,8 +12,8 @@ use zvidlib::mp4::{Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::transfer::{CpuFrameSource, FrameSource, Orientation};
 use zvidlib::{
     AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, Codec, CodecProfile, ColorRange,
-    FrameIndex, HardwarePreference, Limits, PixelFormat, Plane,
-    SampleRange, VideoDimensions, VideoEncoderConfig, VideoEncoderFactory, VideoFrame, WebmMuxer,
+    FrameIndex, HardwarePreference, Limits, PixelFormat, Plane, SampleRange, VideoDimensions,
+    VideoEncoderConfig, VideoEncoderFactory, VideoFrame, WebmMuxer,
     native_opus_audio_encoder_factory, native_vp9_video_encoder_factory,
 };
 

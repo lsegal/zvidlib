@@ -1,27 +1,30 @@
 //! `ExactFrameReader` built from an on-demand [`Mp4SampleProvider`] decodes
-//! the same frames, through the real native HEVC decoder, that it does from
-//! an eagerly read `Vec<EncodedVideoSample>` (issue #669).
+//! the same frames, through the real native HEVC and VP9 decoders, that it
+//! does from an eagerly read `Vec<EncodedVideoSample>`, from an MP4 (issue
+//! #669) and a WebM (issue #685) alike.
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::future::Future;
-use std::task::{Context, Poll, Waker};
+mod common;
 
+use common::{WEBM_FRAMES, block_on, vp9_opus_webm};
 use zvidlib::io::{CachingByteSource, MemorySource};
 use zvidlib::{
     CancellationToken, Codec, CodecProfile, ColorRange, ExactFrameReader, FrameIndex,
-    HardwarePreference, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4SampleProvider, Mp4Track,
-    PixelFormat, TrackKind, VideoDecoderConfig, native_hevc_video_decoder_factory,
+    HardwarePreference, Limits, Mp4SampleProvider, Mp4Track, PixelFormat, TrackKind,
+    VideoDecoderConfig, VideoDecoderFactory, native_hevc_video_decoder_factory,
+    native_vp9_video_decoder_factory,
 };
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    let mut boxed = Box::pin(future);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
-    match boxed.as_mut().poll(&mut context) {
-        Poll::Ready(value) => value,
-        Poll::Pending => panic!("unexpected pending future"),
-    }
+/// The first video track of `bytes`, opened through the container-agnostic
+/// entry point on-demand playback uses.
+fn video_track(bytes: &[u8]) -> Mp4Track {
+    let source = MemorySource::new(bytes.to_vec());
+    block_on(zvidlib::container::open_media(&source, &Limits::default()))
+        .unwrap()
+        .first_track(TrackKind::Video)
+        .expect("the input has a video track")
+        .clone()
 }
 
 fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
@@ -30,20 +33,13 @@ fn bundled_track_and_bytes() -> (Mp4Track, Vec<u8>) {
         "/examples/media/BigBuckBunny.mp4"
     ))
     .to_vec();
-    let source = MemorySource::new(bytes.clone());
-    let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
-    let track = demuxer
-        .tracks
-        .into_iter()
-        .find(|track| track.kind == TrackKind::Video)
-        .expect("sample video has a video track");
-    (track, bytes)
+    (video_track(&bytes), bytes)
 }
 
-fn configuration(track: &Mp4Track) -> VideoDecoderConfig {
+fn configuration(track: &Mp4Track, profile: CodecProfile) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: track.codec,
-        profile: CodecProfile::HevcMain,
+        profile,
         coded_dimensions: track.dimensions.unwrap(),
         output_format: PixelFormat::Rgba8,
         color_range: ColorRange::Limited,
@@ -61,16 +57,63 @@ fn configuration(track: &Mp4Track) -> VideoDecoderConfig {
 fn on_demand_reader_matches_the_eager_reader_and_stays_within_its_cache_budget() {
     let (track, bytes) = bundled_track_and_bytes();
     assert_eq!(track.codec, Codec::Hevc);
+    // A few nearby positions, including a backward seek back to the start -
+    // the same positions answered by both readers must agree exactly. Kept
+    // close together deliberately: the bundled sample is one group of
+    // pictures with a single random-access point at frame 0 (see
+    // `ARCHITECTURE.md` section 3.2), so walking far into it, or resetting
+    // and walking again, decodes everything behind the target. This test's
+    // job is proving the two readers agree on real decoder output, not
+    // re-measuring a full-track walk, which the other on-demand-provider
+    // tests already cover without paying for a decode.
+    assert!(
+        track.presentation_order.len() > 20,
+        "the bundled sample is too short for this test"
+    );
+    assert_on_demand_matches_eager(
+        track,
+        bytes,
+        &native_hevc_video_decoder_factory(),
+        CodecProfile::HevcMain,
+        &[0, 5, 12, 20, 5, 0],
+    );
+}
+
+/// The same over a WebM's VP9 track, indexed from its block headers rather
+/// than an MP4 sample table, walking across its second key frame and back.
+#[test]
+fn on_demand_reader_matches_the_eager_reader_over_a_webm() {
+    let bytes = vp9_opus_webm(true);
+    let track = video_track(&bytes);
+    assert_eq!(track.codec, Codec::Vp9);
+    assert_eq!(track.presentation_order.len() as u64, WEBM_FRAMES);
+    assert_on_demand_matches_eager(
+        track,
+        bytes,
+        &native_vp9_video_decoder_factory(),
+        CodecProfile::Vp9Profile0,
+        &[0, 5, 30, 59, 60, 75, 119, 12, 0],
+    );
+}
+
+/// Decodes `positions` of `track` through an eager reader and through one
+/// built over an on-demand provider whose compressed bytes stay within a
+/// tenth of the track's, and requires the two to agree exactly.
+fn assert_on_demand_matches_eager(
+    track: Mp4Track,
+    bytes: Vec<u8>,
+    factory: &dyn VideoDecoderFactory,
+    profile: CodecProfile,
+    positions: &[u64],
+) {
     let limits = Limits::default();
-    let factory = native_hevc_video_decoder_factory();
     let cancellation = CancellationToken::new();
-    let configuration_template = configuration(&track);
+    let configuration_template = configuration(&track, profile);
 
     let eager_source = MemorySource::new(bytes.clone());
     let eager_samples = block_on(track.to_encoded_video_samples(&eager_source, &limits)).unwrap();
-    let frame_count = eager_samples.len() as u64;
     let mut eager_reader = ExactFrameReader::new(
-        &factory,
+        factory,
         configuration_template.clone(),
         eager_samples,
         limits,
@@ -83,33 +126,19 @@ fn on_demand_reader_matches_the_eager_reader_and_stays_within_its_cache_budget()
         .map(|sample| u64::from(sample.size))
         .sum();
     let budget = total_track_bytes / 10;
-    assert!(budget > 0, "the bundled sample is too small for this test");
+    assert!(budget > 0, "the sample is too small for this test");
     let source = MemorySource::new(bytes);
     let cache = CachingByteSource::new(source, 64 * 1024, budget).unwrap();
     let provider = Mp4SampleProvider::new(track, cache).unwrap();
     let mut on_demand_reader = ExactFrameReader::from_provider(
-        &factory,
+        factory,
         configuration_template,
         Box::new(provider),
         limits,
     )
     .unwrap();
 
-    // A few nearby positions, including a backward seek back to the start -
-    // the same positions answered by both readers must agree exactly. Kept
-    // close together deliberately: the bundled sample is one group of
-    // pictures with a single random-access point at frame 0 (see
-    // `ARCHITECTURE.md` section 3.2), so walking far into it, or resetting
-    // and walking again, decodes everything behind the target. This test's
-    // job is proving the two readers agree on real decoder output, not
-    // re-measuring a full-track walk, which the other on-demand-provider
-    // tests already cover without paying for a decode.
-    assert!(
-        frame_count > 20,
-        "the bundled sample is too short for this test"
-    );
-    let positions: Vec<u64> = vec![0, 5, 12, 20, 5, 0];
-    for frame in positions {
+    for &frame in positions {
         let expected = eager_reader
             .get(FrameIndex(frame), &cancellation)
             .unwrap_or_else(|error| panic!("eager reader failed at frame {frame}: {error}"));
