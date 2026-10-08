@@ -33,15 +33,17 @@
 //! is usually in hardware (issue #680), and otherwise on the crate's software
 //! decoders, which are synchronous and so sit behind the reads directly. AAC
 //! audio has no software decoder in the browser build, so it always decodes
-//! through `WebCodecs`. Opus audio decodes through `WebCodecs` where the
-//! browser supports it, and on the crate's software decoder otherwise.
+//! through `WebCodecs`. Opus and Vorbis audio decode through `WebCodecs` where
+//! the browser supports them, and on the crate's software decoders otherwise.
 //!
 //! An input with no audio track plays on a clock of its own (issue #681): the
 //! `AudioContext`'s when the page gives one, with nothing scheduled on it, and
 //! the page's `performance.now()` otherwise. [`SilentAudioSource`] stands in
 //! for the audio the controller schedules against it.
 
-use crate::audio::{AudioDecoder, AudioPacketProvider, AudioSampleReader, EncodedAudioSample};
+use crate::audio::{
+    AudioDecoder, AudioPacketProvider, AudioSampleReader, AudioTrackTiming, EncodedAudioSample,
+};
 use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
@@ -66,7 +68,7 @@ use crate::web_decoder::{
 };
 use crate::{
     Error, ErrorKind, Limits, Mp4SampleLoader, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider,
-    Result, TrackKind,
+    Result, TrackKind, VORBIS_PREROLL_PACKETS,
 };
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
@@ -325,16 +327,16 @@ impl AudioOutputBackend for AudioContextBackend {
     }
 }
 
-/// An AAC or Opus track's presentation samples, decoded from packets an
-/// [`Mp4SampleLoader`] loads on demand.
+/// An AAC, Opus or Vorbis track's presentation samples, decoded from packets
+/// an [`Mp4SampleLoader`] loads on demand.
 ///
 /// `WebCodecs` decodes asynchronously, so it cannot sit behind the
 /// controller's synchronous reads. [`PrefetchAudioSource::prefetch`] decodes
 /// the range it is asked for and a readahead past it instead, and
 /// [`PlaybackAudioSource::read`] answers from those samples, reporting
-/// [`ErrorKind::WouldBlock`] for anything not decoded yet. An Opus track the
-/// browser cannot decode, or decodes out of line with its packets, goes
-/// through the crate's software decoder instead, as
+/// [`ErrorKind::WouldBlock`] for anything not decoded yet. An Opus or Vorbis
+/// track the browser cannot decode, or decodes out of line with its packets,
+/// goes through the crate's software decoder instead, as
 /// [`crate::web_audio_decoder`] arranges for `MediaInput`.
 pub(crate) struct BrowserAudioSource {
     reader: AudioSampleReader<Box<dyn AudioDecoder>>,
@@ -352,19 +354,23 @@ pub(crate) struct BrowserAudioSource {
 
 impl BrowserAudioSource {
     /// Fails with [`ErrorKind::Unsupported`] unless `audio` is an AAC track
-    /// this browser decodes through `WebCodecs`, or an Opus track. Reads no
-    /// packet but an Opus track's last, whose first two bytes give its length.
+    /// this browser decodes through `WebCodecs`, or an Opus or Vorbis track.
+    /// `timing` is the track's on its decoded sample clock: an MP4 track's
+    /// [`Mp4Track::audio_timing`], or a WebM track's
+    /// [`crate::WebmDemuxer::audio_timing`]. Reads no packet but an Opus
+    /// track's last, whose first two bytes give its length; a Vorbis track's
+    /// intervals come from the first bytes the WebM demuxer recorded.
     async fn open(
         audio: Mp4Track,
-        movie_timescale: u32,
+        timing: AudioTrackTiming,
         source: RangeSource,
         budget_bytes: u64,
         limits: Limits,
     ) -> Result<Self> {
-        if !matches!(audio.codec, Codec::Aac | Codec::Opus) {
+        if !matches!(audio.codec, Codec::Aac | Codec::Opus | Codec::Vorbis) {
             return Err(Error::new(
                 ErrorKind::Unsupported,
-                "on-demand playback supports AAC and Opus audio tracks",
+                "on-demand playback supports AAC, Opus and Vorbis audio tracks",
             ));
         }
         let config = WebAudioDecoderConfig::for_track(&audio)?;
@@ -387,15 +393,16 @@ impl BrowserAudioSource {
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
-        let timing = audio.audio_timing(movie_timescale)?;
         let codec = audio.codec;
         let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
-        let (packets, preroll) = if codec == Codec::Opus {
-            let packets = loader.opus_packet_provider().await?;
-            let preroll = opus_preroll_packets(&packets);
-            (packets, preroll)
-        } else {
-            (loader.aac_packet_provider()?, AAC_PREROLL_PACKETS)
+        let (packets, preroll) = match codec {
+            Codec::Opus => {
+                let packets = loader.opus_packet_provider().await?;
+                let preroll = opus_preroll_packets(&packets);
+                (packets, preroll)
+            }
+            Codec::Vorbis => (loader.vorbis_packet_provider()?, VORBIS_PREROLL_PACKETS),
+            _ => (loader.aac_packet_provider()?, AAC_PREROLL_PACKETS),
         };
         let has_software = software.is_some();
         let reader = AudioSampleReader::from_provider(
@@ -492,7 +499,8 @@ impl BrowserAudioSource {
 }
 
 /// The crate's software decoder for `track`, if the browser build has one:
-/// Opus has one when the `opus-decoder` feature is on, and AAC never does.
+/// Opus has one when the `opus-decoder` feature is on, Vorbis when the
+/// `vorbis-decoder` feature is, and AAC never does.
 fn software_audio_decoder(
     track: &Mp4Track,
     limits: Limits,
@@ -501,6 +509,11 @@ fn software_audio_decoder(
         #[cfg(feature = "opus-decoder")]
         Codec::Opus => Ok(Some(Box::new(crate::NativeOpusDecoder::new(
             &track.opus_config()?,
+            limits,
+        )?))),
+        #[cfg(feature = "vorbis-decoder")]
+        Codec::Vorbis => Ok(Some(Box::new(crate::NativeVorbisDecoder::new(
+            &track.vorbis_config()?,
             limits,
         )?))),
         _ => {
@@ -1119,17 +1132,22 @@ impl WasmOnDemandPlayback {
         let frame_count = video.presentation_order.len() as u64;
 
         let audio_source = match audio {
-            Some(audio) => Some(
-                BrowserAudioSource::open(
-                    audio,
-                    demuxer.movie_timescale,
-                    source.clone(),
-                    options.audio_budget_bytes,
-                    limits,
+            Some(audio) => {
+                let timing = audio
+                    .audio_timing(demuxer.movie_timescale)
+                    .map_err(core_error)?;
+                Some(
+                    BrowserAudioSource::open(
+                        audio,
+                        timing,
+                        source.clone(),
+                        options.audio_budget_bytes,
+                        limits,
+                    )
+                    .await
+                    .map_err(core_error)?,
                 )
-                .await
-                .map_err(core_error)?,
-            ),
+            }
             None => None,
         };
         let sample_rate = audio_source.as_ref().map(BrowserAudioSource::sample_rate);
@@ -1231,8 +1249,8 @@ impl WasmOnDemandPlayback {
     /// track's last packet. The video decodes through `WebCodecs` when the
     /// browser supports the track, and on the crate's software decoder
     /// otherwise; `videoDecoder` says which. AAC audio decodes through
-    /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
-    /// supports it and the crate's software decoder otherwise.
+    /// `WebCodecs`, and Opus and Vorbis audio through `WebCodecs` where the
+    /// browser supports them and the crate's software decoders otherwise.
     pub fn open(source: JsValue, options: Option<JsValue>) -> Promise {
         future_to_promise(async move { Ok(Self::open_inner(source, options).await?.into()) })
     }
@@ -1912,9 +1930,10 @@ mod tests {
         let source = RangeSource::open(make_suspending_reader(SAMPLE))
             .await
             .unwrap();
+        let track = first_track(&demuxer, TrackKind::Audio).unwrap().clone();
         let mut audio = BrowserAudioSource::open(
-            first_track(&demuxer, TrackKind::Audio).unwrap().clone(),
-            demuxer.movie_timescale,
+            track.clone(),
+            track.audio_timing(demuxer.movie_timescale).unwrap(),
             source,
             256 * 1024,
             limits,
@@ -2217,7 +2236,7 @@ mod tests {
             let reader = make_suspending_reader(&bytes);
             let mut audio = BrowserAudioSource::open(
                 track.clone(),
-                demuxer.movie_timescale,
+                track.audio_timing(demuxer.movie_timescale).unwrap(),
                 RangeSource::open(reader.clone()).await.unwrap(),
                 64 * 1024,
                 limits,
@@ -2278,6 +2297,179 @@ mod tests {
             );
             assert!(audio.loader.resident_bytes() <= audio.loader.budget_bytes());
         }
+    }
+
+    /// Three seconds of 44.1 kHz stereo encoded by the native Vorbis encoder
+    /// into a WebM, with its end trimmed.
+    async fn vorbis_webm() -> Vec<u8> {
+        use crate::codec::{AudioEncoderConfig, AudioEncoderFactory};
+        use crate::io::MemorySink;
+        use crate::mp4::{Mp4TrackConfig, Mp4TrackFormat};
+        use crate::{AudioBuffer, CodecProfile, WebmMuxer};
+
+        const RATE: u32 = 44_100;
+        let frames = 3 * u64::from(RATE);
+        let input: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let t = i as f32 / RATE as f32;
+                [
+                    0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin(),
+                    0.3 * (2.0 * std::f32::consts::PI * 660.0 * t).sin(),
+                ]
+            })
+            .collect();
+        let limits = Limits::default();
+        let mut encoder = crate::native_vorbis_audio_encoder_factory()
+            .create(
+                &AudioEncoderConfig {
+                    codec: Codec::Vorbis,
+                    profile: CodecProfile::Vorbis,
+                    sample_rate: RATE,
+                    channels: 2,
+                    timescale: RATE,
+                    configuration: Vec::new(),
+                },
+                &limits,
+            )
+            .unwrap();
+        let mut muxer = WebmMuxer::new(
+            MemorySink::new(),
+            vec![Mp4TrackConfig {
+                encoder: encoder.config().clone(),
+                format: Mp4TrackFormat::Audio { channels: 2 },
+            }],
+            1_000_000,
+        )
+        .await
+        .unwrap();
+        let buffer = AudioBuffer::new(
+            SampleRange::new(0, frames).unwrap(),
+            RATE,
+            2,
+            input,
+            &limits,
+        )
+        .unwrap();
+        let mut samples = encoder.encode(FrameIndex(0), buffer).await.unwrap();
+        let drain = encoder.finish().await.unwrap();
+        samples.extend(drain.samples);
+        for sample in samples {
+            muxer.write_sample(0, sample).await.unwrap();
+        }
+        muxer.set_audio_gapless(0, drain.gapless).unwrap();
+        muxer.finish().await.unwrap().into_inner()
+    }
+
+    /// Issue #686: a WebM's Vorbis track opens without a packet being read,
+    /// since its packets' intervals come from the first bytes the demuxer
+    /// recorded; its reads come from packets loaded as playback reaches them,
+    /// within the audio budget, and they are the samples an eager decode of
+    /// the whole track gives, through `WebCodecs` where the browser decodes
+    /// Vorbis and through the software decoder either way.
+    #[wasm_bindgen_test(async)]
+    async fn vorbis_audio_reads_load_packets_on_demand_and_match_an_eager_decode() {
+        let bytes = vorbis_webm().await;
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = crate::WebmDemuxer::open(&source, crate::WebmDemuxerOptions::default())
+            .await
+            .unwrap();
+        let track = demuxer
+            .tracks
+            .iter()
+            .find(|track| track.kind == TrackKind::Audio)
+            .cloned()
+            .unwrap();
+        assert_eq!(track.codec, Codec::Vorbis);
+        let packets = track.samples.len();
+        let limits = Limits::default();
+        let mut eager = WebAudioDecodeSession::open(&bytes, 0, &limits)
+            .await
+            .unwrap();
+        let length = eager.presentation_length();
+        assert_eq!(length, 3 * 44_100);
+        let range = |start: u64, end: u64| SampleRange::new(start, end).unwrap();
+        let cancellation = CancellationToken::new();
+        let budget = 64 * 1024;
+
+        for software in [false, true] {
+            let reader = make_suspending_reader(&bytes);
+            let mut audio = BrowserAudioSource::open(
+                track.clone(),
+                demuxer.audio_timing(track.id).unwrap(),
+                RangeSource::open(reader.clone()).await.unwrap(),
+                budget,
+                limits,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                field(&reader, "reads").as_f64().unwrap(),
+                0.0,
+                "opening read a packet"
+            );
+            if software {
+                audio.use_software();
+            }
+            assert_eq!(audio.presentation_length(), length);
+            assert_eq!(audio.sample_rate(), 44_100);
+
+            // From the start, near the end, then back.
+            for wanted in [
+                range(0, 8_820),
+                range(120_000, 130_000),
+                range(30_000, 30_001),
+                range(1_000, 9_000),
+            ] {
+                audio.reset().unwrap();
+                assert_eq!(
+                    audio.read(wanted, &cancellation).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
+                audio.prefetch(wanted).await.unwrap();
+                if wanted.start == 0 {
+                    // The first second and a readahead, not the whole track.
+                    assert!(!audio.loader.is_loaded(packets - 1));
+                    assert!(field(&reader, "reads").as_f64().unwrap() > 0.0);
+                }
+                let got = audio.read(wanted, &cancellation).unwrap().samples;
+                let expected = eager
+                    .get_range(wanted, &cancellation)
+                    .await
+                    .unwrap()
+                    .samples;
+                let largest = largest_difference(&got, &expected);
+                assert!(
+                    largest < 1e-3,
+                    "[{}, {}) differs by {largest} (software: {software})",
+                    wanted.start,
+                    wanted.end
+                );
+                assert!(audio.loader.resident_bytes() <= budget);
+            }
+            assert_eq!(
+                audio.is_software(),
+                software || !browser_decodes_vorbis().await
+            );
+        }
+    }
+
+    /// Whether this browser decodes stereo 44.1 kHz Vorbis through
+    /// `WebCodecs`.
+    async fn browser_decodes_vorbis() -> bool {
+        let bytes = vorbis_webm().await;
+        let source = MemorySource::new(bytes);
+        let demuxer = crate::WebmDemuxer::open(&source, crate::WebmDemuxerOptions::default())
+            .await
+            .unwrap();
+        let config = WebAudioDecoderConfig::for_track(&demuxer.tracks[0])
+            .unwrap()
+            .to_js();
+        let support: AudioDecoderSupport =
+            JsFuture::from(js_to_promise(JsAudioDecoder::is_config_supported(&config)))
+                .await
+                .unwrap()
+                .unchecked_into();
+        support.get_supported().unwrap_or(false)
     }
 
     /// Whether this browser decodes stereo Opus through `WebCodecs`.
