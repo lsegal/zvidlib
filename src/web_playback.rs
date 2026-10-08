@@ -1247,10 +1247,10 @@ impl WasmOnDemandPlayback {
     /// 1 MiB.
     ///
     /// Only the container's header and sample index are read here, and the
-    /// first bytes of an Opus track's last packet. The video decodes through `WebCodecs` when the
-    /// browser supports the track, and on the crate's software decoder
-    /// otherwise; `videoDecoder` says which. AAC audio decodes through
-    /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
+    /// first bytes of an Opus track's last packet. The video decodes through
+    /// `WebCodecs` when the browser supports the track, and on the crate's
+    /// software decoder otherwise; `videoDecoder` says which. AAC audio decodes
+    /// through `WebCodecs`, and Opus audio through `WebCodecs` where the browser
     /// supports it and the crate's software decoder otherwise.
     pub fn open(source: JsValue, options: Option<JsValue>) -> Promise {
         future_to_promise(async move { Ok(Self::open_inner(source, options).await?.into()) })

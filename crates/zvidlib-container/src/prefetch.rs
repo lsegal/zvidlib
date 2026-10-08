@@ -227,8 +227,8 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     ///
     /// `required` is clamped to the track. Adjacent samples stored together,
     /// or separated only by a few kilobytes such as a WebM's block headers,
-    /// are read together. The samples loaded here are the most
-    /// recently used, so making room for them evicts other samples first.
+    /// are read together. The samples loaded here are the most recently used,
+    /// so making room for them evicts other samples first.
     ///
     /// A `required` run larger than the whole budget - the walk to a frame
     /// deep inside a long group of pictures - is loaded from its start for as
