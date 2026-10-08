@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+## 0.5.0 - 2026-10-08
+
 - **Breaking:** spell everything in American English, including public names (issue #657). The repository mixed British and American spellings; it now uses American spellings throughout, and `AGENTS.md` gives the rule. This renames these public items, with no deprecated aliases for the old names:
   - `zvidlib-core`: `ErrorKind::Cancelled` is now `ErrorKind::Canceled`, `CancellationToken::is_cancelled` is now `is_canceled`, and `Vp9CodecConfig::colour_primaries` is now `color_primaries`. In JavaScript, the error code for a canceled operation is now `"CANCELED"` instead of `"CANCELLED"`.
   - `zvidlib-hevc-syntax`: `vui::ColourDescription` is now `ColorDescription` (its `colour_primaries` field is now `color_primaries`), `VideoSignalType::colour_description` is now `color_description`, `sei::MasteringDisplayColourVolume` (the struct and the `SeiPayload` variant) is now `MasteringDisplayColorVolume`, `SeqParameterSet::separate_colour_plane_flag` is now `separate_color_plane_flag`, `PpsSccExtension::residual_adaptive_colour_transform_enabled_flag` is now `residual_adaptive_color_transform_enabled_flag`, and `SliceSegmentHeader::colour_plane_id` is now `color_plane_id`. These HEVC syntax elements keep their specification meaning; only the spelling changed.
