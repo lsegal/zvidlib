@@ -297,6 +297,57 @@ pub(crate) struct BrowserAudioSource {
 }
 
 impl BrowserAudioSource {
+    /// Fails with [`ErrorKind::Unsupported`] unless `audio` is an AAC track
+    /// this browser decodes through `WebCodecs`. Reads no packet.
+    async fn open(
+        audio: Mp4Track,
+        movie_timescale: u32,
+        source: RangeSource,
+        budget_bytes: u64,
+        limits: Limits,
+    ) -> Result<Self> {
+        if audio.codec != Codec::Aac {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "on-demand playback supports AAC audio tracks",
+            ));
+        }
+        let config = WebAudioDecoderConfig::for_track(&audio)?;
+        let support: AudioDecoderSupport = JsFuture::from(js_to_promise(
+            JsAudioDecoder::is_config_supported(&config.to_js()),
+        ))
+        .await
+        .map_err(|error| normalize_js_error(error, "querying WebCodecs audio decoder support"))?
+        .unchecked_into();
+        if !support.get_supported().unwrap_or(false) {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("this browser cannot decode {} via WebCodecs", config.codec),
+            ));
+        }
+        let sample_rate = audio.audio_sample_rate()?;
+        let decoded_ranges = audio.aac_decoded_ranges(sample_rate)?;
+        let timing = audio.audio_timing(movie_timescale)?;
+        let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
+        let reader = AudioSampleReader::from_provider(
+            NoSoftwareDecoder,
+            Box::new(loader.audio_packet_provider(decoded_ranges)?),
+            sample_rate,
+            config.channels,
+            timing,
+            AAC_PREROLL_PACKETS,
+            limits,
+        )?;
+        Ok(Self {
+            reader,
+            loader,
+            decoder: WebCodecsAudioDecoder::open(config, limits)?,
+            readahead_samples: u64::from(sample_rate),
+            decoded: None,
+            limits,
+        })
+    }
+
     /// Decodes `range` from a fresh decoder, loading the packets it needs
     /// first, and those a decode reports missing.
     async fn decode(&mut self, range: SampleRange) -> Result<AudioBuffer> {
@@ -561,59 +612,16 @@ impl WasmOnDemandPlayback {
         .map_err(core_error)?;
         let frame_count = video.presentation_order.len() as u64;
 
-        if audio.codec != Codec::Aac {
-            return Err(js_error(
-                ErrorKind::Unsupported,
-                "on-demand playback supports AAC audio tracks",
-            ));
-        }
-        let config = WebAudioDecoderConfig::for_track(&audio).map_err(core_error)?;
-        let support: AudioDecoderSupport = JsFuture::from(js_to_promise(
-            JsAudioDecoder::is_config_supported(&config.to_js()),
-        ))
-        .await
-        .map_err(|error| {
-            core_error(normalize_js_error(
-                error,
-                "querying WebCodecs audio decoder support",
-            ))
-        })?
-        .unchecked_into();
-        if !support.get_supported().unwrap_or(false) {
-            return Err(js_error(
-                ErrorKind::Unsupported,
-                format!("this browser cannot decode {} via WebCodecs", config.codec),
-            ));
-        }
-        let sample_rate = audio.audio_sample_rate().map_err(core_error)?;
-        let decoded_ranges = audio.aac_decoded_ranges(sample_rate).map_err(core_error)?;
-        let audio_loader =
-            Mp4SampleLoader::new(audio.clone(), source.clone(), options.audio_budget_bytes)
-                .map_err(core_error)?;
-        let audio_reader = AudioSampleReader::from_provider(
-            NoSoftwareDecoder,
-            Box::new(
-                audio_loader
-                    .audio_packet_provider(decoded_ranges)
-                    .map_err(core_error)?,
-            ),
-            sample_rate,
-            config.channels,
-            audio
-                .audio_timing(demuxer.movie_timescale)
-                .map_err(core_error)?,
-            AAC_PREROLL_PACKETS,
+        let audio_source = BrowserAudioSource::open(
+            audio,
+            demuxer.movie_timescale,
+            source.clone(),
+            options.audio_budget_bytes,
             limits,
         )
+        .await
         .map_err(core_error)?;
-        let audio_source = BrowserAudioSource {
-            reader: audio_reader,
-            loader: audio_loader,
-            decoder: WebCodecsAudioDecoder::open(config, limits).map_err(core_error)?,
-            readahead_samples: u64::from(sample_rate),
-            decoded: None,
-            limits,
-        };
+        let sample_rate = audio_source.sample_rate();
 
         let timeline = IndexedPresentationTimeline::from_mp4_track(&video, sample_rate, &limits)
             .map_err(core_error)?;
@@ -804,27 +812,31 @@ impl WasmOnDemandPlayback {
         if let Some(pending) = self.pending_prefetch.borrow().as_ref() {
             return pending.clone();
         }
+        // The controller is taken now rather than when the promise first
+        // runs, so every call from here until it settles reports the prefetch.
+        let held = ensure_open(&self.state).and_then(|()| {
+            self.controller
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| js_error(ErrorKind::InvalidState, "the playback is not available"))
+        });
+        let mut held = match held {
+            Ok(held) => held,
+            Err(error) => return Promise::reject(&error),
+        };
         let controller = Rc::clone(&self.controller);
         let pending = Rc::clone(&self.pending_prefetch);
         let state = Rc::clone(&self.state);
         let promise = future_to_promise(async move {
-            let result = async {
-                ensure_open(&state)?;
-                let mut held = controller.borrow_mut().take().ok_or_else(|| {
-                    js_error(ErrorKind::InvalidState, "a prefetch is already running")
-                })?;
-                let result = held.prefetch().await;
-                if state.get() {
-                    let _ = held.stop();
-                } else {
-                    *controller.borrow_mut() = Some(held);
-                }
-                result.map_err(core_error)?;
-                Ok(JsValue::UNDEFINED)
+            let result = held.prefetch().await;
+            if state.get() {
+                let _ = held.stop();
+            } else {
+                *controller.borrow_mut() = Some(held);
             }
-            .await;
             pending.borrow_mut().take();
-            result
+            result.map_err(core_error)?;
+            Ok(JsValue::UNDEFINED)
         });
         *self.pending_prefetch.borrow_mut() = Some(promise.clone());
         promise
@@ -853,6 +865,7 @@ mod tests {
     use super::*;
     use crate::io::MemorySource;
     use crate::wasm_api::error_code;
+    use crate::web_audio_decoder::WebAudioDecodeSession;
     use js_sys::BigInt;
     use wasm_bindgen_test::*;
     use web_sys::OfflineAudioContext;
@@ -1088,6 +1101,117 @@ mod tests {
                 SAMPLE.len()
             );
         }
+    }
+
+    /// The samples of `range` from an eager decode of the track that starts
+    /// at `from`.
+    async fn eager_from(
+        eager: &mut WebAudioDecodeSession,
+        from: u64,
+        range: SampleRange,
+    ) -> Vec<f32> {
+        let decoded = eager
+            .get_range(
+                SampleRange::new(from, range.end).unwrap(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let channels = usize::from(decoded.channels);
+        decoded.samples[(range.start - from) as usize * channels..].to_vec()
+    }
+
+    /// The audio source decodes a readahead past each range it is asked to
+    /// prefetch, continues that run rather than decoding it again, drops what
+    /// playback has moved past, and starts over at a seek.
+    ///
+    /// Every read is exactly what the eager session decodes from the same
+    /// starting point. An AAC decode that starts from its preroll differs
+    /// slightly from one that ran through it, so each read is checked against
+    /// an eager decode that starts where the run it comes from did.
+    #[wasm_bindgen_test(async)]
+    async fn audio_reads_come_from_decoded_readahead_and_match_an_eager_decode() {
+        if !browser_decodes_sample_audio().await {
+            return;
+        }
+        let (demuxer, _) = sample_tracks().await;
+        let limits = Limits::default();
+        let source = RangeSource::open(make_suspending_reader(SAMPLE))
+            .await
+            .unwrap();
+        let mut audio = BrowserAudioSource::open(
+            first_track(&demuxer, TrackKind::Audio).unwrap().clone(),
+            demuxer.movie_timescale,
+            source,
+            256 * 1024,
+            limits,
+        )
+        .await
+        .unwrap();
+        let mut eager = WebAudioDecodeSession::open(SAMPLE, 0, &limits)
+            .await
+            .unwrap();
+        let rate = u64::from(audio.sample_rate());
+        let window = rate / 5;
+        let cancellation = CancellationToken::new();
+        let range = |start: u64, end: u64| SampleRange::new(start, end).unwrap();
+        let read =
+            |audio: &mut BrowserAudioSource, range: SampleRange| audio.read(range, &cancellation);
+
+        let first = range(0, window);
+        assert_eq!(
+            read(&mut audio, first).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        audio.prefetch(first).await.unwrap();
+        assert_eq!(
+            read(&mut audio, first).unwrap().samples,
+            eager_from(&mut eager, 0, first).await
+        );
+        // A readahead of a second was decoded with it.
+        let ahead = range(rate, rate + window / 2);
+        assert_eq!(
+            read(&mut audio, ahead).unwrap().samples,
+            eager_from(&mut eager, 0, ahead).await
+        );
+
+        // Most of the readahead played: the run is continued past its end,
+        // and what came before the range asked for is dropped.
+        let continued_from = audio.decoded.as_ref().unwrap().range.end;
+        let later = range(rate - window, rate);
+        audio.prefetch(later).await.unwrap();
+        let decoded = audio.decoded.as_ref().unwrap().range;
+        assert_eq!(decoded.start, later.start);
+        assert!(decoded.end >= later.end + rate);
+        assert_eq!(
+            read(&mut audio, first).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            read(&mut audio, later).unwrap().samples,
+            eager_from(&mut eager, 0, later).await,
+            "the samples decoded before the continuation are kept"
+        );
+        let past = range(decoded.end - window, decoded.end);
+        assert_eq!(
+            read(&mut audio, past).unwrap().samples,
+            eager_from(&mut eager, continued_from, past).await
+        );
+
+        // A seek far ahead starts a new run there.
+        audio.reset().unwrap();
+        let seeked = range(10 * rate, 10 * rate + window);
+        assert_eq!(
+            read(&mut audio, seeked).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        audio.prefetch(seeked).await.unwrap();
+        assert_eq!(
+            read(&mut audio, seeked).unwrap().samples,
+            eager_from(&mut eager, seeked.start, seeked).await
+        );
+        assert_eq!(audio.decoded.as_ref().unwrap().range.start, seeked.start);
+        assert!(audio.loader.resident_bytes() <= audio.loader.budget_bytes());
     }
 
     #[wasm_bindgen_test(async)]
