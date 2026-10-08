@@ -137,6 +137,10 @@ async function startScrubber() {
   let playing = false;
   let playStartedAt = 0;
   let playStartFrame = 0;
+  let tickRequest = 0;
+  // Whether a timeline drag is under way, and whether the clip was playing when it began.
+  let dragging = false;
+  let resumeAfterDrag = false;
 
   function show(kind, frame, detail) {
     badge.className = `badge ${kind}`;
@@ -289,7 +293,7 @@ async function startScrubber() {
       timeline.value = String(frame);
       pump();
     }
-    requestAnimationFrame(tick);
+    tickRequest = requestAnimationFrame(tick);
   }
 
   function setPlaying(next) {
@@ -304,10 +308,12 @@ async function startScrubber() {
         audioGain.connect(audioContext.destination);
       }
       audioContext?.resume();
-      beginPlayback(shown < 0 || shown >= last ? 0 : shown, performance.now());
-      requestAnimationFrame(tick);
-    } else if (sound) {
-      stopSound();
+      beginPlayback(wanted >= last ? 0 : wanted, performance.now());
+      cancelAnimationFrame(tickRequest);
+      tickRequest = requestAnimationFrame(tick);
+    } else {
+      cancelAnimationFrame(tickRequest);
+      if (sound) stopSound();
     }
   }
 
@@ -327,7 +333,29 @@ async function startScrubber() {
   $("#scrub-prev").addEventListener("click", () => (setPlaying(false), seek(shown - 1)));
   $("#scrub-next").addEventListener("click", () => (setPlaying(false), seek(shown + 1)));
   $("#scrub-random").addEventListener("click", () => (setPlaying(false), seek(Math.floor(Math.random() * frameCount))));
-  timeline.addEventListener("input", () => (setPlaying(false), seek(Number(timeline.value))));
+  // A drag holds playback and its sound while it shows previews and exact frames, and picks
+  // playback back up from the frame it ends on if the clip was playing when it began.
+  timeline.addEventListener("pointerdown", () => {
+    dragging = true;
+    resumeAfterDrag ||= playing;
+    if (playing) setPlaying(false);
+  });
+  const endDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    if (resumeAfterDrag) {
+      resumeAfterDrag = false;
+      seek(Number(timeline.value));
+      setPlaying(true);
+    }
+  };
+  addEventListener("pointerup", endDrag);
+  addEventListener("pointercancel", endDrag);
+  timeline.addEventListener("input", () => {
+    seek(Number(timeline.value));
+    // A keyboard change has no drag to wait for, so playback carries on from the new frame now.
+    if (playing) beginPlayback(wanted, performance.now());
+  });
   canvas.addEventListener("keydown", (event) => {
     if (event.key === "ArrowLeft") seek(shown - 1);
     if (event.key === "ArrowRight") seek(shown + 1);
