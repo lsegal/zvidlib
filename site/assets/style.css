@@ -144,6 +144,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .controls { display: grid; grid-template-columns: auto auto auto 1fr auto auto; gap: 0.6rem; align-items: center; margin: 0.9rem 0; }
 .controls.wrap { display: flex; flex-wrap: wrap; }
+#scrub-play { min-width: 5.5rem; justify-content: center; }
 #scrub-mute { min-width: 8.5rem; }
 .controls label { display: inline-flex; align-items: center; gap: 0.45rem; color: var(--muted); font-size: 0.9rem; }
 .controls label.check { cursor: pointer; }
