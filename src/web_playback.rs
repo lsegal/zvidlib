@@ -25,13 +25,16 @@
 //! }
 //! ```
 //!
-//! Video decodes on the crate's software decoders, which are synchronous and
-//! so can sit behind the controller's synchronous reads. AAC audio has no
-//! software decoder in the browser build, so [`BrowserAudioSource`] decodes it
-//! through `WebCodecs` during the prefetch instead, a readahead at a time, and
-//! answers the controller's reads from the decoded samples. Opus audio decodes
-//! the same way, through `WebCodecs` where the browser supports it and the
-//! crate's software decoder otherwise.
+//! `WebCodecs` decodes asynchronously, so it cannot sit behind the
+//! controller's synchronous reads. [`WebCodecsVideoSource`] and
+//! [`BrowserAudioSource`] decode during the prefetch instead, a readahead at a
+//! time, and answer the controller's reads from what they decoded. Video
+//! decodes through `WebCodecs` whenever the browser supports the track, which
+//! is usually in hardware (issue #680), and otherwise on the crate's software
+//! decoders, which are synchronous and so sit behind the reads directly. AAC
+//! audio has no software decoder in the browser build, so it always decodes
+//! through `WebCodecs`. Opus audio decodes through `WebCodecs` where the
+//! browser supports it, and on the crate's software decoder otherwise.
 //!
 //! An input with no audio track plays on a clock of its own (issue #681): the
 //! `AudioContext`'s when the page gives one, with nothing scheduled on it, and
@@ -42,11 +45,12 @@ use crate::audio::{AudioDecoder, AudioPacketProvider, AudioSampleReader, Encoded
 use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
 use crate::codec_config::derive_codec_string;
 use crate::io::{ByteSource, IoFuture};
-use crate::media::{AudioBuffer, Codec};
+use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
 use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
 use crate::playback::{
     AudioOutputBackend, IndexedPresentationTimeline, OnDemandVideoSource, PlaybackAudioSource,
-    PlaybackController, PlaybackOptions, PrefetchAudioSource, WebAudioOutput,
+    PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
+    PrefetchVideoSource, WebAudioOutput,
 };
 use crate::timeline::{FrameIndex, SampleRange};
 use crate::wasm_api::{
@@ -56,13 +60,17 @@ use crate::wasm_api::{
 use crate::web_audio_decoder::{
     AAC_PREROLL_PACKETS, NoSoftwareDecoder, WebAudioDecoderConfig, WebCodecsAudioDecoder,
 };
-use crate::web_decoder::{js_to_promise, normalize_js_error, packed_rgba, software_video_decoder};
+use crate::web_decoder::{
+    WebCodecsDecoder, js_to_promise, normalize_js_error, packed_rgba, software_video_decoder,
+    webcodecs_config, webcodecs_supports,
+};
 use crate::{
     Error, ErrorKind, Limits, Mp4SampleLoader, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider,
     Result, TrackKind,
 };
 use js_sys::{Object, Promise, Reflect, Uint8Array};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -99,6 +107,11 @@ const DEFAULT_AUDIO_BUDGET_BYTES: u64 = 1024 * 1024;
 /// Decode-order video samples a prefetch loads past the ones the current frame
 /// needs, so the frames after it play without reporting anything missing.
 const VIDEO_READAHEAD_SAMPLES: usize = 24;
+
+/// Presentation frames a `WebCodecs` prefetch decodes from the one it is
+/// asked for, and so the most decoded pictures a playback holds at once: a
+/// third of a second at 24 frames a second.
+const DECODED_VIDEO_FRAMES: u64 = 8;
 
 /// Audio packets a prefetch loads past the ones it decodes.
 const AUDIO_READAHEAD_PACKETS: usize = 16;
@@ -604,6 +617,157 @@ impl PrefetchAudioSource for BrowserAudioSource {
     }
 }
 
+/// A video track's pictures, decoded through `WebCodecs` from samples an
+/// [`Mp4SampleLoader`] loads on demand (issue #680).
+///
+/// [`PrefetchVideoSource::prefetch`] decodes the frame it is asked for and the
+/// [`DECODED_VIDEO_FRAMES`] after it, loading the samples the decode reaches
+/// as it goes, and [`PlaybackVideoSource::get_exact`] answers from those
+/// pictures, reporting [`ErrorKind::WouldBlock`] for anything not decoded yet.
+/// The pictures are RGBA copies, so holding them keeps none of the decoder's
+/// output buffers; the `VideoFrame`s it emits stay within
+/// [`WebCodecsDecoder`]'s own bounded cache, which closes them as it evicts
+/// them.
+pub(crate) struct WebCodecsVideoSource {
+    decoder: WebCodecsDecoder,
+    loader: Mp4SampleLoader<RangeSource>,
+    frame_count: u64,
+    /// Decoded pictures by presentation index, never more than
+    /// [`DECODED_VIDEO_FRAMES`].
+    decoded: BTreeMap<FrameIndex, VideoFrame>,
+    limits: Limits,
+}
+
+impl WebCodecsVideoSource {
+    /// `config` must be a configuration the browser supports for the
+    /// loader's track. Reads no sample.
+    fn new(
+        config: web_sys::VideoDecoderConfig,
+        loader: Mp4SampleLoader<RangeSource>,
+        limits: Limits,
+    ) -> Result<Self> {
+        let decoder = WebCodecsDecoder::open(config, Box::new(loader.sample_provider()?), &limits)?;
+        Ok(Self {
+            decoder,
+            frame_count: loader.track().presentation_order.len() as u64,
+            loader,
+            decoded: BTreeMap::new(),
+            limits,
+        })
+    }
+
+    /// Decodes `frame`, loading the samples the decode reaches that are not
+    /// loaded yet, each with a readahead.
+    async fn decode(&mut self, frame: FrameIndex) -> Result<VideoFrame> {
+        let loader = &self.loader;
+        let (dimensions, rgba) = self
+            .decoder
+            .get_with(frame, &CancellationToken::new(), async |position| {
+                // The decode loads what it misses itself, so the provider's
+                // record of it is not worth keeping.
+                loader.clear_missing();
+                loader
+                    .load(position..position + 1, VIDEO_READAHEAD_SAMPLES)
+                    .await
+            })
+            .await?;
+        VideoFrame::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorRange::Full,
+            vec![Plane {
+                data: rgba,
+                stride: dimensions.width as usize * 4,
+            }],
+            &self.limits,
+        )
+    }
+}
+
+impl PlaybackVideoSource for WebCodecsVideoSource {
+    fn get_exact(&mut self, frame: FrameIndex, _: &CancellationToken) -> Result<VideoFrame> {
+        self.decoded.get(&frame).cloned().ok_or_else(|| {
+            Error::new(
+                ErrorKind::WouldBlock,
+                "the video frame has not been decoded yet",
+            )
+        })
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        // The decoded pictures are the presentation's own, so they stay valid
+        // across a seek, and the next prefetch drops those it moved away from.
+        self.loader.clear_missing();
+        Ok(())
+    }
+}
+
+impl PrefetchVideoSource for WebCodecsVideoSource {
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()> {
+        Box::pin(async move {
+            let end = frame
+                .0
+                .saturating_add(DECODED_VIDEO_FRAMES)
+                .min(self.frame_count);
+            self.decoded
+                .retain(|&index, _| frame <= index && index.0 < end);
+            // Pictures that already cover the frame and half the readahead
+            // are enough; topping them up at every call would wait on the
+            // decoder every frame.
+            let covered = (frame.0..end)
+                .take_while(|&index| self.decoded.contains_key(&FrameIndex(index)))
+                .count() as u64;
+            if covered >= (DECODED_VIDEO_FRAMES / 2).min(end.saturating_sub(frame.0)) {
+                return Ok(());
+            }
+            for index in frame.0 + covered..end {
+                let index = FrameIndex(index);
+                if !self.decoded.contains_key(&index) {
+                    let picture = self.decode(index).await?;
+                    self.decoded.insert(index, picture);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// On-demand video, decoded through `WebCodecs` when the browser supports the
+/// track and on the crate's software decoder otherwise.
+pub(crate) enum BrowserVideoSource {
+    WebCodecs(WebCodecsVideoSource),
+    Software(OnDemandVideoSource<RangeSource>),
+}
+
+impl PlaybackVideoSource for BrowserVideoSource {
+    fn get_exact(
+        &mut self,
+        frame: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        match self {
+            Self::WebCodecs(source) => source.get_exact(frame, cancellation),
+            Self::Software(source) => source.get_exact(frame, cancellation),
+        }
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::WebCodecs(source) => source.reset(),
+            Self::Software(source) => source.reset(),
+        }
+    }
+}
+
+impl PrefetchVideoSource for BrowserVideoSource {
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()> {
+        match self {
+            Self::WebCodecs(source) => source.prefetch(frame),
+            Self::Software(source) => source.prefetch(frame),
+        }
+    }
+}
+
 /// Silence for as long as the video lasts, standing in for the audio of an
 /// input that has none, so the controller's clock runs over the whole video.
 pub(crate) struct SilentAudioSource {
@@ -780,11 +944,8 @@ impl AudioOutputBackend for BrowserOutput {
     }
 }
 
-type Controller = PlaybackController<
-    OnDemandVideoSource<RangeSource>,
-    PlaybackAudio,
-    WebAudioOutput<BrowserOutput>,
->;
+type Controller =
+    PlaybackController<BrowserVideoSource, PlaybackAudio, WebAudioOutput<BrowserOutput>>;
 
 /// The budgets and audio context a playback is opened with.
 struct OnDemandOptions {
@@ -833,8 +994,20 @@ fn first_track(demuxer: &Mp4Demuxer, kind: TrackKind) -> Option<&Mp4Track> {
     demuxer.tracks.iter().find(|track| track.kind == kind)
 }
 
+/// Which video decoders [`WasmOnDemandPlayback::open_with`] may choose between.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoBackend {
+    /// `WebCodecs` when the browser supports the track, software otherwise.
+    Automatic,
+    /// Software whatever the browser supports, so a test covers it even in a
+    /// browser that decodes the codec itself.
+    #[cfg(all(test, feature = "all"))]
+    SoftwareOnly,
+}
+
 /// Playback of an MP4 read on demand through a URL, `Blob` or range reader,
-/// timed by a Web Audio context.
+/// timed by a Web Audio context, or by the page's clock for a video with no
+/// audio track and no context.
 ///
 /// `play`, `pause`, `seek`, `present` and `currentFrame` never wait on the
 /// network. When one needs a sample that has not been loaded, it throws an
@@ -852,6 +1025,7 @@ pub struct WasmOnDemandPlayback {
     height: u32,
     /// The audio track's sample rate, or `None` for an input with no audio.
     sample_rate: Option<u32>,
+    webcodecs_video: bool,
     video_budget_bytes: u64,
     audio_budget_bytes: u64,
 }
@@ -860,6 +1034,14 @@ impl WasmOnDemandPlayback {
     pub(crate) async fn open_inner(
         source: JsValue,
         options: Option<JsValue>,
+    ) -> std::result::Result<Self, JsValue> {
+        Self::open_with(source, options, VideoBackend::Automatic).await
+    }
+
+    async fn open_with(
+        source: JsValue,
+        options: Option<JsValue>,
+        backend: VideoBackend,
     ) -> std::result::Result<Self, JsValue> {
         let options = parse_on_demand_options(options)?;
         let limits = Limits::default();
@@ -881,36 +1063,59 @@ impl WasmOnDemandPlayback {
             .ok_or_else(|| js_error(ErrorKind::MalformedMedia, "video track has no dimensions"))?;
         let derived =
             derive_codec_string(video.codec, &video.decoder_config).map_err(core_error)?;
-        // An AV1 or VP9 track's color range may be read from its first sample.
-        let mut leading = Vec::new();
-        if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
-            let first = video.samples.first().ok_or_else(|| {
-                js_error(ErrorKind::MalformedMedia, "video track contains no samples")
-            })?;
-            let mut data = vec![0_u8; first.size as usize];
-            video
-                .read_sample_into(&source, 0, &mut data)
-                .await
-                .map_err(core_error)?;
-            leading.push(EncodedVideoSample {
-                presentation_index: FrameIndex(0),
-                random_access: first.is_sync,
-                data,
-            });
-        }
-        let (factory, configuration) =
-            software_video_decoder(&video, derived.profile, dimensions, &leading, &limits)
-                .map_err(core_error)?;
         let video_loader =
             Mp4SampleLoader::new(video.clone(), source.clone(), options.video_budget_bytes)
                 .map_err(core_error)?;
-        let video_reader = ExactFrameReader::from_provider(
-            factory.as_ref(),
-            configuration,
-            Box::new(video_loader.sample_provider().map_err(core_error)?),
-            limits,
-        )
-        .map_err(core_error)?;
+        // A codec `WebCodecs` has no registration for here falls to the
+        // software decoder, which reports it if it cannot decode it either.
+        let webcodecs = match webcodecs_config(&video, &derived, dimensions) {
+            Ok(config) if backend == VideoBackend::Automatic => webcodecs_supports(&config)
+                .await
+                .map_err(core_error)?
+                .then_some(config),
+            _ => None,
+        };
+        let video_source = match webcodecs {
+            Some(config) => BrowserVideoSource::WebCodecs(
+                WebCodecsVideoSource::new(config, video_loader, limits).map_err(core_error)?,
+            ),
+            None => {
+                // An AV1 or VP9 track's color range may be read from its
+                // first sample.
+                let mut leading = Vec::new();
+                if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
+                    let first = video.samples.first().ok_or_else(|| {
+                        js_error(ErrorKind::MalformedMedia, "video track contains no samples")
+                    })?;
+                    let mut data = vec![0_u8; first.size as usize];
+                    video
+                        .read_sample_into(&source, 0, &mut data)
+                        .await
+                        .map_err(core_error)?;
+                    leading.push(EncodedVideoSample {
+                        presentation_index: FrameIndex(0),
+                        random_access: first.is_sync,
+                        data,
+                    });
+                }
+                let (factory, configuration) =
+                    software_video_decoder(&video, derived.profile, dimensions, &leading, &limits)
+                        .map_err(core_error)?;
+                let video_reader = ExactFrameReader::from_provider(
+                    factory.as_ref(),
+                    configuration,
+                    Box::new(video_loader.sample_provider().map_err(core_error)?),
+                    limits,
+                )
+                .map_err(core_error)?;
+                BrowserVideoSource::Software(OnDemandVideoSource::new(
+                    video_reader,
+                    video_loader,
+                    VIDEO_READAHEAD_SAMPLES,
+                ))
+            }
+        };
+        let webcodecs_video = matches!(video_source, BrowserVideoSource::WebCodecs(_));
         let frame_count = video.presentation_order.len() as u64;
 
         let audio_source = match audio {
@@ -955,7 +1160,7 @@ impl WasmOnDemandPlayback {
             ),
         };
         let controller = PlaybackController::new_with_indexed_timeline(
-            OnDemandVideoSource::new(video_reader, video_loader, VIDEO_READAHEAD_SAMPLES),
+            video_source,
             audio_source,
             WebAudioOutput(output),
             timeline,
@@ -971,6 +1176,7 @@ impl WasmOnDemandPlayback {
             width: dimensions.width,
             height: dimensions.height,
             sample_rate,
+            webcodecs_video,
             video_budget_bytes: options.video_budget_bytes,
             audio_budget_bytes: options.audio_budget_bytes,
         })
@@ -1021,10 +1227,12 @@ impl WasmOnDemandPlayback {
     /// bound the compressed samples held at once, and default to 16 MiB and
     /// 1 MiB.
     ///
-    /// Only the movie header is read here, and an Opus track's last packet.
-    /// The video plays on the crate's software decoder. AAC audio plays
-    /// through `WebCodecs`, and Opus audio through `WebCodecs` where the
-    /// browser supports it and the crate's software decoder otherwise.
+    /// Only the movie header is read here, and the first bytes of an Opus
+    /// track's last packet. The video decodes through `WebCodecs` when the
+    /// browser supports the track, and on the crate's software decoder
+    /// otherwise; `videoDecoder` says which. AAC audio decodes through
+    /// `WebCodecs`, and Opus audio through `WebCodecs` where the browser
+    /// supports it and the crate's software decoder otherwise.
     pub fn open(source: JsValue, options: Option<JsValue>) -> Promise {
         future_to_promise(async move { Ok(Self::open_inner(source, options).await?.into()) })
     }
@@ -1054,6 +1262,17 @@ impl WasmOnDemandPlayback {
     #[wasm_bindgen(getter, js_name = hasAudio)]
     pub fn has_audio(&self) -> bool {
         self.sample_rate.is_some()
+    }
+
+    /// `"webcodecs"` when the video decodes through the browser's `WebCodecs`
+    /// decoder, or `"software"` when it decodes on the crate's own.
+    #[wasm_bindgen(getter, js_name = videoDecoder)]
+    pub fn video_decoder(&self) -> String {
+        if self.webcodecs_video {
+            "webcodecs".to_owned()
+        } else {
+            "software".to_owned()
+        }
     }
 
     #[wasm_bindgen(getter, js_name = videoBudgetBytes)]
@@ -1199,22 +1418,27 @@ impl WasmOnDemandPlayback {
     }
 }
 
-// The browser tests decode the bundled HEVC sample, so they build with the
-// whole codec matrix, as the other browser tests do.
+// The browser tests decode the bundled HEVC and AV1 samples, so they build
+// with the whole codec matrix, as the other browser tests do.
 #[cfg(all(test, feature = "all"))]
 mod tests {
     use super::*;
     use crate::io::MemorySource;
     use crate::wasm_api::error_code;
     use crate::web_audio_decoder::WebAudioDecodeSession;
-    use crate::web_decoder::schedule_event_loop_tick;
+    use crate::web_decoder::{WebVideoDecodeSession, schedule_event_loop_tick};
     use js_sys::BigInt;
+    use std::collections::HashMap;
     use wasm_bindgen_test::*;
     use web_sys::{AudioDecoderConfig as JsAudioDecoderConfig, OfflineAudioContext};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     const SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.mp4");
+
+    /// A track `WebCodecs` decodes in the test browser, unlike the HEVC
+    /// [`SAMPLE`], so the tests of the `WebCodecs` video path use it.
+    const AV1_SAMPLE: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
 
     #[wasm_bindgen(module = "/js/browser.js")]
     extern "C" {
@@ -1255,17 +1479,37 @@ mod tests {
     }
 
     async fn sample_tracks() -> (Mp4Demuxer, MemorySource) {
-        let source = MemorySource::new(SAMPLE.to_vec());
+        tracks_of(SAMPLE).await
+    }
+
+    async fn tracks_of(bytes: &[u8]) -> (Mp4Demuxer, MemorySource) {
+        let source = MemorySource::new(bytes.to_vec());
         let demuxer = Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())
             .await
             .unwrap();
         (demuxer, source)
     }
 
+    /// Opens `source` with its video on the software decoder, whatever this
+    /// browser decodes through `WebCodecs`, so a test of that path compares
+    /// against a software decode in every browser.
+    async fn open_software(source: JsValue, options: JsValue) -> WasmOnDemandPlayback {
+        let playback =
+            WasmOnDemandPlayback::open_with(source, Some(options), VideoBackend::SoftwareOnly)
+                .await
+                .unwrap();
+        assert_eq!(playback.video_decoder(), "software");
+        playback
+    }
+
     /// Whether this browser decodes the sample's AAC track through
     /// `WebCodecs`, which on-demand playback needs for its audio.
     async fn browser_decodes_sample_audio() -> bool {
-        let (demuxer, _) = sample_tracks().await;
+        browser_decodes_audio_of(SAMPLE).await
+    }
+
+    async fn browser_decodes_audio_of(bytes: &[u8]) -> bool {
+        let (demuxer, _) = tracks_of(bytes).await;
         let audio = first_track(&demuxer, TrackKind::Audio).unwrap();
         let config = WebAudioDecoderConfig::for_track(audio).unwrap();
         let support: AudioDecoderSupport = JsFuture::from(js_to_promise(
@@ -1377,9 +1621,7 @@ mod tests {
             return;
         }
         let reader = make_suspending_reader(SAMPLE);
-        let mut playback = WasmOnDemandPlayback::open_inner(reader.clone(), Some(options(1 << 20)))
-            .await
-            .unwrap();
+        let mut playback = open_software(reader.clone(), options(1 << 20)).await;
         assert_eq!((playback.width(), playback.height()), (1920, 1080));
         assert_eq!(parse_u64(&playback.frame_count(), "frames").unwrap(), 768);
         assert!(
@@ -1446,6 +1688,170 @@ mod tests {
         assert_error_code(&playback.play().unwrap_err(), "INVALID_STATE");
     }
 
+    /// Whether this browser decodes both of [`AV1_SAMPLE`]'s tracks through
+    /// `WebCodecs`, which the tests of the `WebCodecs` video path need.
+    async fn browser_decodes_av1_sample() -> bool {
+        if !browser_decodes_audio_of(AV1_SAMPLE).await {
+            return false;
+        }
+        let supported = WebVideoDecodeSession::decodes_through_webcodecs(AV1_SAMPLE, 0).await;
+        if !supported {
+            console_log!("skipped: this browser cannot decode the AV1 sample through WebCodecs");
+        }
+        supported
+    }
+
+    /// `frames` of [`AV1_SAMPLE`], decoded through `WebCodecs` from every
+    /// sample held in memory: what on-demand playback must reproduce.
+    async fn webcodecs_frames(frames: &[u64]) -> HashMap<u64, Vec<u8>> {
+        let mut session = WebVideoDecodeSession::open(AV1_SAMPLE, 0, &Limits::default())
+            .await
+            .unwrap();
+        let mut decoded = HashMap::new();
+        for &frame in frames {
+            let (_, rgba) = session
+                .get(FrameIndex(frame), &CancellationToken::new())
+                .await
+                .unwrap();
+            decoded.insert(frame, rgba);
+        }
+        decoded
+    }
+
+    /// Where the browser decodes the track, on-demand playback decodes its
+    /// video through `WebCodecs` (issue #680): over a source whose every read
+    /// suspends, no call waits on the decoder or the network, a frame not
+    /// decoded yet reports `WOULD_BLOCK`, the prefetch decodes it along with
+    /// the frames after it, and every frame is exactly the one `WebCodecs`
+    /// decodes from the whole file in memory.
+    #[wasm_bindgen_test(async)]
+    async fn plays_and_seeks_through_webcodecs_over_a_suspending_source() {
+        if !browser_decodes_av1_sample().await {
+            return;
+        }
+        let reader = make_suspending_reader(AV1_SAMPLE);
+        let mut playback = WasmOnDemandPlayback::open_inner(reader, Some(options(1 << 20)))
+            .await
+            .unwrap();
+        assert_eq!(playback.video_decoder(), "webcodecs");
+        let expected = webcodecs_frames(&[0, 1, 5, 40, 41]).await;
+
+        assert_error_code(&playback.play().unwrap_err(), "WOULD_BLOCK");
+        until_loaded(&playback, WasmOnDemandPlayback::play).await;
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 0);
+        assert_eq!(pixels(&field(&presentation, "picture")), expected[&0]);
+
+        // The prefetch decoded the frames after it too, so one of those plays
+        // without another.
+        playback.seek(JsValue::from_f64(5.0)).unwrap();
+        let presentation = playback.present().unwrap();
+        assert_eq!(frame_of(&presentation), 5);
+        assert_eq!(pixels(&field(&presentation, "picture")), expected[&5]);
+
+        // Past the decoded frames, the frame is decoded on demand.
+        playback.seek(JsValue::from_f64(40.0)).unwrap();
+        assert_error_code(&playback.present().unwrap_err(), "WOULD_BLOCK");
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 40);
+        assert_eq!(pixels(&field(&presentation, "picture")), expected[&40]);
+
+        // Backwards to a frame the decoder already emitted, which takes a
+        // fresh decode from the random-access point.
+        playback.seek(JsValue::from_f64(1.0)).unwrap();
+        let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
+        assert_eq!(frame_of(&presentation), 1);
+        assert_eq!(pixels(&field(&presentation, "picture")), expected[&1]);
+
+        playback.pause().unwrap();
+        playback.seek(JsValue::from_f64(41.0)).unwrap();
+        let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
+        assert_eq!(pixels(&picture), expected[&41]);
+        assert!(
+            playback.fetched_bytes() < AV1_SAMPLE.len() as f64 / 2.0,
+            "fetched {} of {} bytes",
+            playback.fetched_bytes(),
+            AV1_SAMPLE.len()
+        );
+        playback.close();
+    }
+
+    /// The `WebCodecs` video source holds at most [`DECODED_VIDEO_FRAMES`]
+    /// decoded pictures, from the frame it was last asked to prefetch, and
+    /// plays sequentially through more frames than the decoder has output
+    /// buffers for, as it would stall if the frames it emits were held open.
+    #[wasm_bindgen_test(async)]
+    async fn webcodecs_video_holds_a_bounded_run_of_decoded_frames() {
+        if !browser_decodes_av1_sample().await {
+            return;
+        }
+        let (demuxer, _) = tracks_of(AV1_SAMPLE).await;
+        let video = first_track(&demuxer, TrackKind::Video).unwrap().clone();
+        let derived = derive_codec_string(video.codec, &video.decoder_config).unwrap();
+        let config = webcodecs_config(&video, &derived, video.dimensions.unwrap()).unwrap();
+        let source = RangeSource::open(make_suspending_reader(AV1_SAMPLE))
+            .await
+            .unwrap();
+        let loader = Mp4SampleLoader::new(video, source, 512 * 1024).unwrap();
+        let mut video = WebCodecsVideoSource::new(config, loader, Limits::default()).unwrap();
+        let expected = webcodecs_frames(&[0, 2, 7, 47]).await;
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(
+            video
+                .get_exact(FrameIndex(0), &cancellation)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+        video.prefetch(FrameIndex(0)).await.unwrap();
+        assert_eq!(video.decoded.len() as u64, DECODED_VIDEO_FRAMES);
+        for frame in 0..DECODED_VIDEO_FRAMES {
+            video.get_exact(FrameIndex(frame), &cancellation).unwrap();
+        }
+        assert_eq!(
+            video
+                .get_exact(FrameIndex(DECODED_VIDEO_FRAMES), &cancellation)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WouldBlock
+        );
+
+        let mut prefetches = 0;
+        for frame in 0..48 {
+            let frame = FrameIndex(frame);
+            let picture = loop {
+                match video.get_exact(frame, &cancellation) {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        prefetches += 1;
+                        video.prefetch(frame).await.unwrap();
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            if let Some(expected) = expected.get(&frame.0) {
+                assert_eq!(&packed_rgba(&picture), expected, "frame {}", frame.0);
+            }
+            // A page prefetches ahead between frames, as a paced playback
+            // does.
+            video.prefetch(frame).await.unwrap();
+            assert!(video.decoded.len() as u64 <= DECODED_VIDEO_FRAMES);
+            assert!(video.decoded.keys().all(|&index| index >= frame));
+            assert!(video.loader.resident_bytes() <= video.loader.budget_bytes());
+        }
+        assert!(
+            prefetches < 48 / 4,
+            "{prefetches} frames had to wait for a prefetch"
+        );
+
+        // Back to a frame the decoder already emitted and dropped.
+        video.reset().unwrap();
+        video.prefetch(FrameIndex(2)).await.unwrap();
+        let picture = video.get_exact(FrameIndex(2), &cancellation).unwrap();
+        assert_eq!(packed_rgba(&picture), expected[&2]);
+        assert!(video.decoded.keys().all(|&index| index >= FrameIndex(2)));
+    }
+
     /// A URL is read with HTTP range requests, and a `Blob` by slicing it; a
     /// `blob:` URL answers range requests as an HTTP server does.
     #[wasm_bindgen_test(async)]
@@ -1457,9 +1863,7 @@ mod tests {
         let url = make_object_url(SAMPLE, "video/mp4").unwrap();
         let blob = make_blob(SAMPLE, "video/mp4").unwrap();
         for source in [JsValue::from_str(&url), blob.into()] {
-            let playback = WasmOnDemandPlayback::open_inner(source, Some(options(1 << 20)))
-                .await
-                .unwrap();
+            let playback = open_software(source, options(1 << 20)).await;
             assert_eq!(parse_u64(&playback.frame_count(), "frames").unwrap(), 768);
             let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
             assert_eq!(pixels(&picture), expected[0]);
@@ -1751,6 +2155,17 @@ mod tests {
         muxer.finish().await.unwrap().into_inner()
     }
 
+    /// Opens one of [`small_mp4`]'s files on the software video decoder,
+    /// which decodes it back to exactly the gray levels it was encoded from;
+    /// these tests are about its audio and its clock, not how its video
+    /// decodes.
+    async fn open_small(
+        source: JsValue,
+        options: Option<JsValue>,
+    ) -> std::result::Result<WasmOnDemandPlayback, JsValue> {
+        WasmOnDemandPlayback::open_with(source, options, VideoBackend::SoftwareOnly).await
+    }
+
     /// Resolves after `milliseconds` of real time.
     async fn sleep(milliseconds: f64) {
         let promise = Promise::new(&mut |resolve, _| {
@@ -1882,9 +2297,7 @@ mod tests {
     async fn plays_an_mp4_with_opus_audio_over_a_suspending_source() {
         let bytes = small_mp4(true).await;
         let reader = make_suspending_reader(&bytes);
-        let playback = WasmOnDemandPlayback::open_inner(reader, Some(options(1 << 20)))
-            .await
-            .unwrap();
+        let playback = open_small(reader, Some(options(1 << 20))).await.unwrap();
         assert!(playback.has_audio());
         assert_eq!(playback.sample_rate(), 48_000);
         assert_eq!(
@@ -1916,7 +2329,7 @@ mod tests {
     async fn plays_a_video_only_mp4_on_an_audio_contexts_clock() {
         let bytes = small_mp4(false).await;
         let reader = make_suspending_reader(&bytes);
-        let playback = WasmOnDemandPlayback::open_inner(reader.clone(), Some(options(1 << 20)))
+        let playback = open_small(reader.clone(), Some(options(1 << 20)))
             .await
             .unwrap();
         assert!(!playback.has_audio());
@@ -1947,6 +2360,22 @@ mod tests {
         let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
         assert_eq!(pixels(&picture), small_rgba(89));
         assert!(field(&reader, "reads").as_f64().unwrap() > 0.0);
+
+        // Whichever video decoder the browser picks, the clock and seeks
+        // behave the same.
+        let automatic = WasmOnDemandPlayback::open_inner(
+            make_suspending_reader(&bytes),
+            Some(options(1 << 20)),
+        )
+        .await
+        .unwrap();
+        until_loaded(&automatic, WasmOnDemandPlayback::play).await;
+        for frame in [0_u64, 30] {
+            automatic.seek(JsValue::from_f64(frame as f64)).unwrap();
+            let presentation = until_loaded(&automatic, WasmOnDemandPlayback::present).await;
+            assert_eq!(frame_of(&presentation), frame);
+            assert_eq!(pixels(&field(&presentation, "picture")).len(), 32 * 18 * 4);
+        }
     }
 
     /// Issue #681: given no audio context, an input with no audio track plays
@@ -1955,7 +2384,7 @@ mod tests {
     #[wasm_bindgen_test(async)]
     async fn plays_a_video_only_mp4_on_the_page_clock_in_real_time() {
         let bytes = small_mp4(false).await;
-        let playback = WasmOnDemandPlayback::open_inner(make_suspending_reader(&bytes), None)
+        let playback = open_small(make_suspending_reader(&bytes), None)
             .await
             .unwrap();
         assert!(!playback.has_audio());
