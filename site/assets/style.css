@@ -181,11 +181,10 @@ td { color: #c9cdea; line-height: 1.9; }
   background: linear-gradient(135deg, rgba(139, 92, 246, 0.18), rgba(34, 211, 238, 0.08)), var(--panel);
   border: 1px solid var(--line);
 }
-.showcase-mark {
-  width: 4.5rem; height: 4.5rem; border-radius: 18px; display: grid; place-items: center;
-  font: 800 2.4rem/1 system-ui, sans-serif; color: #0b0d17;
-  background: linear-gradient(135deg, var(--pink), var(--violet) 55%, var(--cyan));
-}
+/* zvid's own mark, in zvid's brand colour. */
+.showcase-mark { width: 4.5rem; height: 4.5rem; display: grid; place-items: center; }
+.showcase-mark svg { width: 100%; height: auto; display: block; }
+.showcase-mark path { fill: rgb(178, 130, 255); }
 .showcase-card h3 { margin: 0 0 0.5rem; font-size: 1.5rem; }
 .showcase-card h3 a { color: var(--text); }
 .showcase-card p { color: #c9cdea; margin: 0 0 1.2rem; max-width: 50rem; }

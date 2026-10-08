@@ -2,20 +2,20 @@
 // Docs workflow with `wasm-pack build --target web --features web`).
 //
 // Two panels: a frame-exact scrubber over the bundled Big Buck Bunny AV1 sample, which plays the
-// clip's AAC track in sync through Web Audio, and a recorder that encodes an animated canvas to MP4
-// or WebM and reads a frame back out of the file it wrote.
+// clip's AAC soundtrack alongside it, and a recorder that encodes an animated canvas to MP4 or WebM
+// and reads a frame back out of the file it wrote.
 
 const SAMPLE_URL = "media/BigBuckBunny.av1.mp4";
 const RECORD_FRAMES = 90;
 const RECORD_FPS = 30;
 const SAMPLE_RATE = 48_000;
 const READBACK_FRAME = 45;
-// How much audio each `getRange()` read decodes, and how far ahead of the clock playback keeps
-// audio scheduled, in seconds.
-const AUDIO_CHUNK_SECONDS = 0.5;
-const AUDIO_AHEAD_SECONDS = 1.5;
-// The delay between pressing Play and the first scheduled sample, so the first chunk can decode.
-const AUDIO_START_SECONDS = 0.15;
+// How much of the soundtrack each audio read decodes, and how far ahead of the clock playback
+// keeps it scheduled.
+const AUDIO_SLICE_SECONDS = 0.5;
+const AUDIO_LEAD_SECONDS = 1;
+// The Web Audio clock starts this far after Play, so the first slice is decoded before it is due.
+const AUDIO_START_DELAY_SECONDS = 0.15;
 
 // What each encoder is asked about before it is offered, so a codec this browser cannot encode
 // is shown as unavailable instead of failing halfway through a recording.
@@ -63,104 +63,6 @@ const idle = (callback) =>
   typeof requestIdleCallback === "function" ? requestIdleCallback(callback, { timeout: 200 }) : setTimeout(callback, 16);
 
 // ---------------------------------------------------------------------------------------------
-// Synchronized audio
-// ---------------------------------------------------------------------------------------------
-
-// Plays an input's first audio track through Web Audio from any point, reading it with zvidlib's
-// `AudioStream.getRange()`. The `AudioContext` is created and resumed only by `start()`, which the
-// scrubber calls from its Play button, so nothing plays before the visitor asks for it.
-async function openAudio(input) {
-  if (!globalThis.AudioContext) throw new Error("this browser has no Web Audio");
-  const stream = input.audio(0);
-  const config = await stream.decoderConfig();
-  if (globalThis.AudioDecoder) {
-    const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
-    if (!support.supported) throw new Error(`this browser cannot decode ${config.codec}`);
-  }
-  const total = Number(await stream.sampleCount());
-  const rate = config.sampleRate;
-  const chunk = Math.round(rate * AUDIO_CHUNK_SECONDS);
-  // Decoding the first chunk up front proves the track plays here before the button is offered.
-  (await stream.getRange(0n, BigInt(Math.min(total, chunk)))).free();
-
-  let context = null;
-  let gain = null;
-  let muted = false;
-  let session = 0;
-  let sources = [];
-
-  function stop() {
-    session++;
-    for (const source of sources) source.stop();
-    sources = [];
-  }
-
-  // Schedules the track from sample `first` so that it is heard at context time `at`, one chunk
-  // at a time, staying AUDIO_AHEAD_SECONDS ahead of what is playing.
-  async function feed(id, first, at) {
-    for (let next = first; id === session && next < total; ) {
-      const when = at + (next - first) / rate;
-      const ahead = when - context.currentTime;
-      if (ahead > AUDIO_AHEAD_SECONDS) {
-        await new Promise((resolve) => setTimeout(resolve, 1000 * (ahead - AUDIO_AHEAD_SECONDS / 2)));
-        continue;
-      }
-      const end = Math.min(total, next + chunk);
-      const decoded = await stream.getRange(BigInt(next), BigInt(end));
-      const channels = decoded.channels;
-      const interleaved = decoded.samples;
-      decoded.free();
-      if (id !== session) return;
-      const length = interleaved.length / channels;
-      const buffer = context.createBuffer(channels, length, rate);
-      for (let channel = 0; channel < channels; channel++) {
-        const plane = buffer.getChannelData(channel);
-        for (let i = 0; i < length; i++) plane[i] = interleaved[i * channels + channel];
-      }
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(gain);
-      // A chunk that decoded late starts partway in, so the audio never drifts behind the video.
-      const late = context.currentTime - when;
-      if (late > 0) source.start(0, Math.min(late, buffer.duration));
-      else source.start(when);
-      source.onended = () => (sources = sources.filter((other) => other !== source));
-      sources.push(source);
-      next = end;
-    }
-  }
-
-  return {
-    // Starts the track `seconds` in and resolves to the context time, in seconds, at which that
-    // point is heard. The video clock follows it.
-    async start(seconds) {
-      stop();
-      const id = session;
-      if (!context) {
-        context = new AudioContext({ latencyHint: "playback" });
-        gain = context.createGain();
-        gain.gain.value = muted ? 0 : 1;
-        gain.connect(context.destination);
-      }
-      if (context.state !== "running") await context.resume();
-      if (id !== session) throw new Error("stopped");
-      const at = context.currentTime + AUDIO_START_SECONDS;
-      feed(id, Math.min(total, Math.round(seconds * rate)), at).catch(() => id === session && stop());
-      return at;
-    },
-    stop,
-    now: () => context.currentTime,
-    get muted() {
-      return muted;
-    },
-    set muted(value) {
-      muted = value;
-      if (gain) gain.gain.setTargetAtTime(muted ? 0 : 1, context.currentTime, 0.01);
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------------------------
 // Frame-exact scrubbing
 // ---------------------------------------------------------------------------------------------
 
@@ -197,42 +99,44 @@ async function startScrubber() {
   timeline.max = String(last);
   const formatTime = (ms) => `${Math.floor(ms / 60000)}:${((ms / 1000) % 60).toFixed(3).padStart(6, "0")}`;
 
+  // The clip's soundtrack, read through zvidlib's exact sample ranges and scheduled on the Web Audio
+  // clock. The picture runs on the page's clock from the moment the first sample is heard.
+  // Without one, the picture still plays and the mute button says why there is no sound.
+  let sound = null;
+  let silentReason = "";
+  try {
+    if (!globalThis.AudioContext) throw new Error("this browser has no Web Audio");
+    const track = input.audio(0);
+    const config = await track.decoderConfig();
+    if (globalThis.AudioDecoder) {
+      const support = await AudioDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      if (!support.supported) throw new Error(`this browser cannot decode ${config.codec}`);
+    }
+    sound = {
+      track,
+      codec: config.codec.startsWith("mp4a") ? "AAC" : config.codec.startsWith("opus") ? "Opus" : config.codec,
+      rate: config.sampleRate,
+      channels: config.numberOfChannels,
+      length: Number(await track.sampleCount()),
+    };
+  } catch (error) {
+    sound = null;
+    silentReason = errorText(zvid, error);
+  }
+  let audioContext = null;
+  // Every source plays through this gain, which the mute button turns down without stopping them.
+  let audioGain = null;
+  let muted = false;
+  let audioSources = [];
+  let audioOrigin = 0;
+  let audioRun = 0;
+
   let shown = -1;
   let wanted = 0;
   let decoding = false;
   let playing = false;
   let playStartedAt = 0;
   let playStartFrame = 0;
-  // While audio plays, the video follows the audio context's clock, so the two stay in sync;
-  // otherwise it follows `performance.now()`. Both are in milliseconds here.
-  let audio = null;
-  let audioUnavailable = "";
-  let audioClock = false;
-  const clock = () => (audioClock ? audio.now() * 1000 : performance.now());
-
-  let playSession = 0;
-
-  // Starts playing from `frame`. With audio, the video holds that frame until the audio's first
-  // sample is heard, then follows the audio clock; without it, the video runs on the wall clock.
-  async function playFrom(frame) {
-    const id = ++playSession;
-    playStartFrame = frame;
-    audioClock = false;
-    if (!audio) {
-      playStartedAt = performance.now();
-      return;
-    }
-    playStartedAt = Infinity;
-    try {
-      const at = await audio.start(starts[frame] / 1000);
-      if (id !== playSession) return;
-      playStartedAt = at * 1000;
-      audioClock = true;
-    } catch {
-      // Playback carries on silently on the wall clock.
-      if (id === playSession) playStartedAt = performance.now();
-    }
-  }
 
   function show(kind, frame, detail) {
     badge.className = `badge ${kind}`;
@@ -307,13 +211,77 @@ async function startScrubber() {
     pump();
   }
 
-  function tick() {
+  // Decodes the soundtrack from startMs in slices and schedules each one to be heard at the moment
+  // its first sample is due on the audio clock, a little ahead of time. A newer run (a pause, seek
+  // or loop) ends this one.
+  async function playSound(startMs, run) {
+    const first = Math.round((startMs / 1000) * sound.rate);
+    const slice = Math.round(AUDIO_SLICE_SECONDS * sound.rate);
+    let next = first;
+    try {
+      while (run === audioRun && next < sound.length) {
+        const at = audioOrigin + (next - first) / sound.rate;
+        if (at - audioContext.currentTime > AUDIO_LEAD_SECONDS) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        const end = Math.min(sound.length, next + slice);
+        const decoded = await sound.track.getRange(BigInt(next), BigInt(end));
+        const samples = decoded.samples;
+        const channels = decoded.channels;
+        const frames = samples.length / channels;
+        decoded.free();
+        if (run !== audioRun) return;
+        const buffer = audioContext.createBuffer(channels, frames, sound.rate);
+        for (let channel = 0; channel < channels; channel++) {
+          const data = buffer.getChannelData(channel);
+          for (let i = 0; i < frames; i++) data[i] = samples[i * channels + channel];
+        }
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioGain);
+        // A slice that arrives late starts part-way through, and one that arrives too late is skipped.
+        const late = audioContext.currentTime - at;
+        if (late < buffer.duration) {
+          source.start(Math.max(at, audioContext.currentTime), Math.max(0, late));
+          source.onended = () => (audioSources = audioSources.filter((playing) => playing !== source));
+          audioSources.push(source);
+        }
+        next = end;
+      }
+    } catch (error) {
+      if (run === audioRun) status.textContent = `audio.getRange() rejected: ${errorText(zvid, error)}`;
+    }
+  }
+
+  function stopSound() {
+    audioRun++;
+    for (const source of audioSources) source.stop();
+    audioSources = [];
+  }
+
+  function beginPlayback(frame, now) {
+    playStartFrame = frame;
+    playStartedAt = now;
+    if (!sound || !audioContext) return;
+    stopSound();
+    audioOrigin = audioContext.currentTime + AUDIO_START_DELAY_SECONDS;
+    // When the first sample reaches the speakers, on the page's clock. A context that is still
+    // starting up has no output timestamp yet.
+    const output = audioContext.getOutputTimestamp?.();
+    playStartedAt = output?.performanceTime
+      ? output.performanceTime + (audioOrigin - output.contextTime) * 1000
+      : now + AUDIO_START_DELAY_SECONDS * 1000;
+    playSound(starts[frame], audioRun);
+  }
+
+  function tick(now) {
     if (!playing) return;
-    const ms = starts[playStartFrame] + Math.max(0, clock() - playStartedAt);
+    const ms = starts[playStartFrame] + (now - playStartedAt);
     let frame = playStartFrame;
     while (frame < last && starts[frame + 1] <= ms) frame++;
     if (frame >= last) {
-      playFrom(0);
+      beginPlayback(0, now);
       frame = 0;
     }
     if (frame !== wanted) {
@@ -325,30 +293,35 @@ async function startScrubber() {
   }
 
   function setPlaying(next) {
-    if (playing === next) return;
     playing = next;
     play.textContent = playing ? "Pause" : "Play";
     if (playing) {
-      playFrom(shown < 0 || shown >= last ? 0 : shown);
+      // Created on the click itself, so the browser lets it make sound.
+      if (sound && !audioContext) {
+        audioContext = new AudioContext();
+        audioGain = audioContext.createGain();
+        audioGain.gain.value = muted ? 0 : 1;
+        audioGain.connect(audioContext.destination);
+      }
+      audioContext?.resume();
+      beginPlayback(shown < 0 || shown >= last ? 0 : shown, performance.now());
       requestAnimationFrame(tick);
-    } else {
-      playSession++;
-      audioClock = false;
-      audio?.stop();
+    } else if (sound) {
+      stopSound();
     }
   }
 
   function showMute() {
-    mute.disabled = !audio;
-    mute.setAttribute("aria-pressed", String(!!audio?.muted));
-    mute.textContent = !audio ? "No audio" : audio.muted ? "🔇 Muted" : "🔊 Sound on";
-    mute.title = !audio ? `No audio: ${audioUnavailable}` : audio.muted ? "Unmute" : "Mute";
+    mute.disabled = !sound;
+    mute.setAttribute("aria-pressed", String(muted));
+    mute.textContent = !sound ? "No audio" : muted ? "🔇 Muted" : "🔊 Sound on";
+    mute.title = !sound ? `No audio: ${silentReason}` : muted ? "Unmute" : "Mute";
   }
 
   play.addEventListener("click", () => setPlaying(!playing));
   mute.addEventListener("click", () => {
-    if (!audio) return;
-    audio.muted = !audio.muted;
+    muted = !muted;
+    audioGain?.gain.setTargetAtTime(muted ? 0 : 1, audioContext.currentTime, 0.01);
     showMute();
   });
   $("#scrub-prev").addEventListener("click", () => (setPlaying(false), seek(shown - 1)));
@@ -360,19 +333,13 @@ async function startScrubber() {
     if (event.key === "ArrowRight") seek(shown + 1);
   });
 
-  try {
-    audio = await openAudio(input);
-  } catch (error) {
-    audioUnavailable = errorText(zvid, error);
-  }
-  showMute();
-
   status.textContent =
     `Opened ${(Number(input.byteLength) / 1048576).toFixed(1)} MiB ${input.container?.toUpperCase()} · ` +
     `${frameCount} frames · AV1 ${canvas.width}x${canvas.height}` +
-    (audio ? " · audio plays in sync on Play" : ` · no audio (${audioUnavailable})`) +
+    (sound ? ` · ${sound.channels}-channel ${sound.rate / 1000} kHz ${sound.codec} soundtrack, played with Play` : ` · no audio (${silentReason})`) +
     (previews ? ` · seek previews every ${previews.stride} frames, filling in the background` : "");
   for (const control of buttons) control.disabled = false;
+  showMute();
   seek(0);
 }
 
