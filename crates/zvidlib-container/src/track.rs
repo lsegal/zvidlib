@@ -52,6 +52,11 @@ pub struct Track {
     pub dimensions: Option<VideoDimensions>,
     pub channels: Option<u16>,
     pub sample_rate: Option<u32>,
+    /// The track's ISO 639-2/T language code, such as `"eng"` or `"fra"`,
+    /// from an MP4 track's `mdhd` box: `"und"` when the file marks the
+    /// language undetermined, and `None` when the box holds no valid code. A
+    /// WebM track's is always `None`.
+    pub language: Option<String>,
     /// Complete codec configuration box, including its header, in the form an
     /// MP4 sample entry carries it whichever container the track came from.
     pub decoder_config: Vec<u8>,

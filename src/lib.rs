@@ -97,6 +97,12 @@ pub use vp9_encoder::bench as vp9_encoder_bench;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_audio;
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
+mod on_demand;
+
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
+pub mod on_demand_player;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod wasm_api;
 
@@ -296,6 +302,9 @@ pub use av1_decoder::native_av1_video_decoder_factory;
 pub use native_audio::DefaultAudioOutput;
 #[cfg(all(feature = "aac-decoder", not(target_arch = "wasm32")))]
 pub use native_audio::NativeAacDecoder;
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
+#[doc(no_inline)]
+pub use on_demand_player::{AudioOutputOpener, OnDemandOptions, OnDemandPlayer};
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(no_inline)]
 pub use previews::PreviewIndex;

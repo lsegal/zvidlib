@@ -35,10 +35,7 @@ use web_sys::{
     AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 
-/// How many packets an AAC read decodes ahead of the first one it needs. An
-/// AAC frame overlaps the one before it, so one is enough; the second covers
-/// the decoder's own start-up.
-pub(crate) const AAC_PREROLL_PACKETS: usize = 2;
+pub(crate) use crate::on_demand::AAC_PREROLL_PACKETS;
 
 /// The `WebCodecs` decoder configuration for an input audio track: its codec
 /// string, sample rate and channel count, and the `description` the codec
