@@ -37,7 +37,7 @@
 
 use crate::codec::HardwarePreference;
 use crate::io::{ByteSource, FileSource, IoFuture};
-use crate::media::{Codec, VideoDimensions, VideoFrame};
+use crate::media::{VideoDimensions, VideoFrame};
 use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track};
 use crate::on_demand::{
     AUDIO_READAHEAD_PACKETS, DEFAULT_AUDIO_BUDGET_BYTES, DEFAULT_VIDEO_BUDGET_BYTES,
@@ -101,7 +101,7 @@ type TrackAudio<S> = OnDemandAudioSource<Box<dyn AudioDecoder>, S>;
 /// What the player's audio comes from: the selected audio track, or silence
 /// when the input has none.
 enum PlayerAudio<S> {
-    Track(TrackAudio<S>),
+    Track(Box<TrackAudio<S>>),
     Silent(SilentAudioSource),
 }
 
@@ -207,6 +207,7 @@ struct Input<S> {
     movie_timescale: u32,
     options: OnDemandOptions,
     limits: Limits,
+    dimensions: VideoDimensions,
 }
 
 type PlayerAudioParts<S> = (
@@ -261,11 +262,11 @@ impl<S: ByteSource + Clone> Input<S> {
             preroll,
             self.limits,
         )?;
-        let audio = PlayerAudio::Track(OnDemandAudioSource::new(
+        let audio = PlayerAudio::Track(Box::new(OnDemandAudioSource::new(
             reader,
             loader,
             AUDIO_READAHEAD_PACKETS,
-        ));
+        )));
         let timeline =
             IndexedPresentationTimeline::from_mp4_track(&self.video, sample_rate, &self.limits)?;
         let output = open_output(sample_rate, channels)?;
@@ -328,6 +329,9 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
         } else {
             return Err(no_audio_track(options.audio_track, audio_tracks.len()));
         };
+        let dimensions = video.dimensions.ok_or_else(|| {
+            Error::new(ErrorKind::MalformedMedia, "video track has no dimensions")
+        })?;
         let video_source = block_on(crate_video_source(
             &video,
             source.clone(),
@@ -336,6 +340,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
             limits,
         ))?;
         let input = Input {
+            dimensions,
             source,
             video,
             audio_tracks,
@@ -475,8 +480,8 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
         self.input.video.presentation_order.len() as u64
     }
 
-    pub fn dimensions(&self) -> Option<VideoDimensions> {
-        self.input.video.dimensions
+    pub fn dimensions(&self) -> VideoDimensions {
+        self.input.dimensions
     }
 
     /// The selected audio track's sample rate, or `None` for an input with no
@@ -507,7 +512,7 @@ impl<S: ByteSource + Clone> OnDemandPlayer<S> {
 fn audio_decoder(track: &Mp4Track, limits: Limits) -> Result<(Box<dyn AudioDecoder>, u16)> {
     match track.codec {
         #[cfg(feature = "aac-decoder")]
-        Codec::Aac => {
+        crate::Codec::Aac => {
             let config = track.aac_config()?;
             Ok((
                 Box::new(crate::NativeAacDecoder::new(&config, limits)?),
@@ -515,7 +520,7 @@ fn audio_decoder(track: &Mp4Track, limits: Limits) -> Result<(Box<dyn AudioDecod
             ))
         }
         #[cfg(feature = "opus-decoder")]
-        Codec::Opus => {
+        crate::Codec::Opus => {
             let head = track.opus_config()?;
             Ok((
                 Box::new(crate::NativeOpusDecoder::new(&head, limits)?),

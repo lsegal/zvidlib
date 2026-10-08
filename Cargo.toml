@@ -95,6 +95,11 @@ path = "examples/hevc_decode_profile.rs"
 required-features = ["native", "hevc-decoder"]
 
 [[example]]
+name = "on_demand_player"
+path = "examples/on_demand_player.rs"
+required-features = ["native", "av1-decoder", "aac-decoder", "opus-decoder"]
+
+[[example]]
 name = "native_encode"
 path = "examples/native_encode.rs"
 required-features = ["native", "av1-encoder"]

@@ -2394,6 +2394,17 @@ mod tests {
         }
     }
 
+    /// Issue #689: `mdhd` packs a track's ISO 639-2 code five bits a letter,
+    /// and anything but three lowercase letters is no code at all.
+    #[test]
+    fn mdhd_languages_unpack_to_their_codes() {
+        assert_eq!(iso_639_language(0x15c7).as_deref(), Some("eng"));
+        assert_eq!(iso_639_language(0x55c4).as_deref(), Some("und"));
+        assert_eq!(iso_639_language(0x1a41).as_deref(), Some("fra"));
+        assert_eq!(iso_639_language(0), None);
+        assert_eq!(iso_639_language(0x7fff), None);
+    }
+
     #[test]
     fn fragmented_mp4_expands_decode_and_presentation_indexes_incrementally() {
         block_on(async {

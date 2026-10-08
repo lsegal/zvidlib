@@ -224,7 +224,10 @@ impl AudioOutputBackend for Backend {
 }
 
 /// Outputs on one hand-moved clock, recording each one the player opens.
-fn outputs(clock: &Clock) -> (AudioOutputOpener, Arc<Mutex<Vec<Arc<Mutex<Opened>>>>>) {
+/// Every output an opener has opened, in order.
+type OpenedOutputs = Arc<Mutex<Vec<Arc<Mutex<Opened>>>>>;
+
+fn outputs(clock: &Clock) -> (AudioOutputOpener, OpenedOutputs) {
     let all = Arc::new(Mutex::new(Vec::new()));
     let (clock, recorded) = (clock.clone(), Arc::clone(&all));
     let opener: AudioOutputOpener = Box::new(move |sample_rate, channels| {
@@ -303,7 +306,7 @@ fn opens_a_file_and_plays_it_without_the_caller_loading_anything() {
     player.play().unwrap();
     let mut presented = Vec::new();
     for _ in 0..20 {
-        clock.advance(48_000 / RATE as u64);
+        clock.advance(48_000 / RATE);
         if let (_, Some(frame)) = player.present().unwrap() {
             let index = player.current_frame_index().unwrap();
             assert_gray(&frame, index.0);
@@ -347,7 +350,7 @@ fn switching_audio_tracks_keeps_the_frame_and_releases_the_old_tracks_packets() 
 
     player.seek(FrameIndex(10)).unwrap();
     player.play().unwrap();
-    clock.advance(48_000 / RATE as u64);
+    clock.advance(48_000 / RATE);
     let (presentation, _) = player.present().unwrap();
     assert_eq!(presentation.frame, Some(FrameIndex(11)));
     assert!(player.audio_resident_bytes() > 0);
@@ -370,7 +373,7 @@ fn switching_audio_tracks_keeps_the_frame_and_releases_the_old_tracks_packets() 
         let scheduled = &opened[1].lock().unwrap().scheduled;
         assert_eq!(scheduled.first().unwrap().start, 11 * 48_000 / RATE);
     }
-    clock.advance(48_000 / RATE as u64);
+    clock.advance(48_000 / RATE);
     let (_, frame) = player.present().unwrap();
     assert_gray(&frame.unwrap(), 12);
 
@@ -485,7 +488,7 @@ fn waits_on_a_source_whose_reads_suspend() {
         OnDemandPlayer::with_output(source.clone(), OnDemandOptions::default(), opener).unwrap();
     player.play().unwrap();
     for index in 1..=5 {
-        clock.advance(48_000 / RATE as u64);
+        clock.advance(48_000 / RATE);
         let (_, frame) = player.present().unwrap();
         assert_gray(&frame.unwrap(), index);
     }
