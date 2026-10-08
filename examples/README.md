@@ -17,7 +17,7 @@ that can decode it gets. The native example uses only the HEVC copy.
 
 ## Compressed decoding
 
-As documented in the main [README](../README.md#implemented-browser-boundary), the browser
+As documented in the [backend and API reference](../ARCHITECTURE.md#a1-browser-api-boundary), the browser
 (`web`) build now decodes the sample's real video track through the browser's native `WebCodecs`
 `VideoDecoder`, so `web_canvas/` renders real decoded pixels instead of a synthetic gradient.
 Which of the two bundled samples it decodes depends on the browser and platform: the page probes
