@@ -332,7 +332,10 @@ impl WebCodecsAudioDecoder {
 
     /// Decodes `packets` in order from a freshly configured decoder, returning
     /// one buffer per packet.
-    pub(crate) async fn decode(&mut self, packets: &[EncodedAudioSample]) -> Result<Vec<AudioBuffer>> {
+    pub(crate) async fn decode(
+        &mut self,
+        packets: &[EncodedAudioSample],
+    ) -> Result<Vec<AudioBuffer>> {
         let rate = f64::from(self.config.sample_rate);
         self.close_outputs();
         *self.error.borrow_mut() = None;
