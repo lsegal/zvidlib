@@ -40,6 +40,7 @@
 use crate::audio::AudioPacketProvider;
 use crate::codec::{SampleProvider, TrackKind};
 use crate::io::ByteSource;
+use crate::media::Codec;
 use crate::mp4_demux::{Mp4Track, read_exact};
 use crate::timeline::{FrameIndex, SampleRange};
 use crate::{Error, ErrorKind, Result};
@@ -129,9 +130,11 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     ///
     /// The intervals are the caller's because whether they can be known
     /// without reading every packet depends on the codec, as
-    /// [`AudioPacketProvider`] explains: an AAC packet's comes from the
-    /// track's sample durations. Fails if the track is not an audio track or
-    /// `decoded_ranges` does not have one interval per sample.
+    /// [`AudioPacketProvider`] explains. An Opus or Vorbis packet's depends
+    /// on packet bytes; an AAC track should use [`Self::aac_packet_provider`],
+    /// which derives them from the track's index. Fails if the track is not
+    /// an audio track or `decoded_ranges` does not have one interval per
+    /// sample.
     pub fn audio_packet_provider(
         &self,
         decoded_ranges: Vec<SampleRange>,
@@ -150,6 +153,29 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
             decoded_ranges,
             cache: self.cache.clone(),
         })
+    }
+
+    /// An [`AudioPacketProvider`] for an AAC track, answering from this
+    /// loader's cache, with each packet's decoded interval taken from the
+    /// track's sample durations.
+    ///
+    /// The intervals are the ones [`Mp4AudioPacketProvider`] and
+    /// [`Mp4Track::to_encoded_audio_samples`] give the same track, and
+    /// building them reads no packet data. Fails if the track is not an AAC
+    /// audio track: Opus and Vorbis tracks use [`Self::audio_packet_provider`]
+    /// with intervals the caller supplies.
+    ///
+    /// [`Mp4AudioPacketProvider`]: crate::mp4_demux::Mp4AudioPacketProvider
+    pub fn aac_packet_provider(&self) -> Result<PrefetchedAudioPacketProvider> {
+        if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Aac {
+            return Err(unsupported(
+                "an AAC audio packet provider requires an AAC audio track",
+            ));
+        }
+        let decoded_ranges = self
+            .track
+            .aac_decoded_ranges(self.track.audio_sample_rate()?)?;
+        self.audio_packet_provider(decoded_ranges)
     }
 
     /// Loads every sample in `required` that is not already loaded, then up
@@ -428,7 +454,6 @@ mod tests {
     use super::*;
     use crate::codec::SampleDependency;
     use crate::io::{IoFuture, MemorySource};
-    use crate::media::Codec;
     use crate::mp4_demux::Mp4Sample;
     use std::cell::Cell;
     use std::future::Future;
