@@ -57,8 +57,10 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
-use web_sys::BaseAudioContext;
-use web_sys::{AudioBufferSourceNode, AudioDecoder as JsAudioDecoder, AudioDecoderSupport};
+use web_sys::{
+    AudioBufferSourceNode, AudioDecoder as JsAudioDecoder, AudioDecoderSupport,
+    AudioScheduledSourceNode, BaseAudioContext,
+};
 
 #[wasm_bindgen(module = "/js/browser.js")]
 extern "C" {
@@ -96,13 +98,26 @@ fn core_error(error: Error) -> JsValue {
     js_error(error.kind(), error.message())
 }
 
-fn io_error(error: JsValue, context: &str) -> Error {
+/// A failed source read as an [`Error`], keeping the kind its `ZvidError`
+/// code names - a URL that does not answer range requests is `UNSUPPORTED`,
+/// not an I/O failure - and treating anything else as I/O.
+fn source_error(error: JsValue, context: &str) -> Error {
     let detail = Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
         .and_then(|value| value.as_string())
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "browser read failed".to_owned());
-    Error::new(ErrorKind::Io, format!("{context}: {detail}"))
+    let code = Reflect::get(&error, &JsValue::from_str("code"))
+        .ok()
+        .and_then(|value| value.as_string());
+    let kind = match code.as_deref() {
+        Some("UNSUPPORTED") => ErrorKind::Unsupported,
+        Some("INVALID_INPUT") => ErrorKind::InvalidInput,
+        Some("RESOURCE_LIMIT") => ErrorKind::ResourceLimit,
+        Some("CANCELED") => ErrorKind::Canceled,
+        _ => ErrorKind::Io,
+    };
+    Error::new(kind, format!("{context}: {detail}"))
 }
 
 /// A [`ByteSource`] over a URL, `Blob` or range reader, whose reads resolve
@@ -119,10 +134,11 @@ pub(crate) struct RangeSource {
 
 impl RangeSource {
     async fn open(source: JsValue) -> Result<Self> {
-        let promise = range_source_size(&source).map_err(|error| io_error(error, "sizing"))?;
+        let promise =
+            range_source_size(&source).map_err(|error| source_error(error, "sizing the source"))?;
         let size = JsFuture::from(promise)
             .await
-            .map_err(|error| io_error(error, "sizing the source"))?
+            .map_err(|error| source_error(error, "sizing the source"))?
             .as_f64()
             .filter(|size| size.fract() == 0.0 && *size >= 0.0 && *size <= MAX_SAFE_INTEGER as f64)
             .ok_or_else(|| {
@@ -156,10 +172,10 @@ impl ByteSource for RangeSource {
             }
             let length = (destination.len() as u64).min(self.len - offset);
             let promise = read_range_source(&self.source, offset as f64, length as f64)
-                .map_err(|error| io_error(error, "reading the source"))?;
+                .map_err(|error| source_error(error, "reading the source"))?;
             let bytes: Uint8Array = JsFuture::from(promise)
                 .await
-                .map_err(|error| io_error(error, "reading the source"))?
+                .map_err(|error| source_error(error, "reading the source"))?
                 .dyn_into()
                 .map_err(|_| Error::new(ErrorKind::Io, "a source read returned no bytes"))?;
             let count = (bytes.length() as usize).min(length as usize);
@@ -201,8 +217,10 @@ impl AudioContextBackend {
             if keep(*generation) {
                 return true;
             }
-            #[allow(deprecated)]
-            let _ = node.stop();
+            // `AudioBufferSourceNode::stop` itself is deprecated in favor of
+            // the scheduled-source method it inherits.
+            let scheduled: &AudioScheduledSourceNode = node;
+            let _ = scheduled.stop();
             node.disconnect().ok();
             false
         });
@@ -259,7 +277,6 @@ impl AudioOutputBackend for AudioContextBackend {
             .map_err(context)?;
         // A buffer that arrives after its start time plays from where the
         // clock is now rather than late.
-        #[allow(deprecated)]
         node.start_with_when_and_grain_offset(when.max(now), (now - when).max(0.0))
             .map_err(context)?;
         self.nodes.push((generation, end, node));
@@ -866,6 +883,7 @@ mod tests {
     use crate::io::MemorySource;
     use crate::wasm_api::error_code;
     use crate::web_audio_decoder::WebAudioDecodeSession;
+    use crate::web_decoder::schedule_event_loop_tick;
     use js_sys::BigInt;
     use wasm_bindgen_test::*;
     use web_sys::OfflineAudioContext;
@@ -960,10 +978,21 @@ mod tests {
         let mut reader =
             ExactFrameReader::new(factory.as_ref(), configuration, samples, limits).unwrap();
         let cancellation = CancellationToken::new();
-        frames
-            .iter()
-            .map(|&frame| packed_rgba(&reader.get(FrameIndex(frame), &cancellation).unwrap()))
-            .collect()
+        let mut decoded = Vec::with_capacity(frames.len());
+        for &frame in frames {
+            next_tick().await;
+            decoded.push(packed_rgba(
+                &reader.get(FrameIndex(frame), &cancellation).unwrap(),
+            ));
+        }
+        decoded
+    }
+
+    /// Lets the event loop run, so the test driver's polling is answered
+    /// between software decodes rather than timing out behind them.
+    async fn next_tick() {
+        let promise = Promise::new(&mut |resolve, _| schedule_event_loop_tick(&resolve));
+        JsFuture::from(promise).await.unwrap();
     }
 
     fn pixels(picture: &JsValue) -> Vec<u8> {
@@ -988,6 +1017,7 @@ mod tests {
         step: impl Fn(&WasmOnDemandPlayback) -> std::result::Result<T, JsValue>,
     ) -> T {
         for _ in 0..32 {
+            next_tick().await;
             match step(playback) {
                 Err(error) if error_code(&error).as_deref() == Some("WOULD_BLOCK") => {
                     JsFuture::from(playback.prefetch()).await.unwrap();
@@ -1018,7 +1048,7 @@ mod tests {
             "opening reads the movie header, not the media"
         );
 
-        let expected = eager_frames(&[0, 5, 9, 12]).await;
+        let expected = eager_frames(&[0, 2, 3, 6]).await;
 
         // Nothing is loaded yet, so starting playback says so rather than
         // waiting for its audio.
@@ -1034,9 +1064,9 @@ mod tests {
         assert!(field(&again, "frame").is_null());
         assert!(field(&again, "picture").is_null());
 
-        playback.seek(JsValue::from_f64(12.0)).unwrap();
+        playback.seek(JsValue::from_f64(6.0)).unwrap();
         let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
-        assert_eq!(frame_of(&presentation), 12);
+        assert_eq!(frame_of(&presentation), 6);
         assert_eq!(pixels(&field(&presentation, "picture")), expected[3]);
 
         // While a prefetch is loading, playback calls report it instead of
@@ -1048,17 +1078,17 @@ mod tests {
         JsFuture::from(first).await.unwrap();
 
         // Backwards, so the decode restarts from the random-access point.
-        playback.seek(JsValue::from_f64(5.0)).unwrap();
+        playback.seek(JsValue::from_f64(2.0)).unwrap();
         let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
-        assert_eq!(frame_of(&presentation), 5);
+        assert_eq!(frame_of(&presentation), 2);
         assert_eq!(pixels(&field(&presentation, "picture")), expected[1]);
 
         // Paused, the current frame comes through the same loop.
         playback.pause().unwrap();
-        playback.seek(BigInt::from(9_u64).into()).unwrap();
+        playback.seek(BigInt::from(3_u64).into()).unwrap();
         assert_eq!(
             parse_u64(&playback.current_frame_index().unwrap(), "frame").unwrap(),
-            9
+            3
         );
         let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
         assert_eq!(pixels(&picture), expected[2]);
@@ -1212,6 +1242,54 @@ mod tests {
         );
         assert_eq!(audio.decoded.as_ref().unwrap().range.start, seeked.start);
         assert!(audio.loader.resident_bytes() <= audio.loader.budget_bytes());
+    }
+
+    /// The Web Audio backend plays each buffer at the context time its media
+    /// position falls on, relative to the last `start`, and a seek's
+    /// `cancel_queued` silences what the old position scheduled.
+    #[wasm_bindgen_test(async)]
+    async fn audio_buffers_play_at_their_media_position_until_canceled() {
+        const RATE: u32 = 48_000;
+        let render = |cancel: bool| async move {
+            let context =
+                OfflineAudioContext::new_with_number_of_channels_and_length_and_sample_rate(
+                    1,
+                    RATE,
+                    RATE as f32,
+                )
+                .unwrap();
+            let mut backend = AudioContextBackend::new((*context).clone(), RATE);
+            // Media sample 9_600 starts now, at context time zero, so media
+            // sample 14_400 plays 4_800 samples in.
+            backend.start(9_600).unwrap();
+            let range = SampleRange::new(14_400, 16_800).unwrap();
+            let samples = (0..range.len())
+                .map(|index| index as f32 / 4_096.0)
+                .collect();
+            let buffer = AudioBuffer::new(range, RATE, 1, samples, &Limits::default()).unwrap();
+            backend.schedule(buffer, 0).unwrap();
+            if cancel {
+                backend.cancel_queued(1).unwrap();
+            }
+            let rendered: web_sys::AudioBuffer = JsFuture::from(context.start_rendering().unwrap())
+                .await
+                .unwrap()
+                .unchecked_into();
+            rendered.get_channel_data(0).unwrap()
+        };
+
+        let played = render(false).await;
+        assert!(played[..4_800].iter().all(|&sample| sample == 0.0));
+        for (index, &sample) in played[4_800..7_200].iter().enumerate() {
+            assert!(
+                (sample - index as f32 / 4_096.0).abs() < 1e-4,
+                "sample {index} of the buffer played as {sample}"
+            );
+        }
+        assert!(played[7_200..].iter().all(|&sample| sample == 0.0));
+
+        let canceled = render(true).await;
+        assert!(canceled.iter().all(|&sample| sample == 0.0));
     }
 
     #[wasm_bindgen_test(async)]
