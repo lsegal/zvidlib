@@ -19,7 +19,7 @@ pub use zvidlib_av1::{
 pub use zvidlib_av1_syntax as av1;
 #[doc(inline)]
 pub use zvidlib_container::{
-    codec_config, conformance, container, cover, mp4, mp4_demux, webm, webm_demux,
+    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, webm, webm_demux,
 };
 #[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
@@ -219,9 +219,12 @@ pub use output::{MediaOutput, OutputOptions};
 #[doc(no_inline)]
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
-    PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
-    PlaybackVideoSource, Presentation, WebAudioOutput,
+    OnDemandAudioSource, OnDemandVideoSource, PlaybackAudioOutput, PlaybackAudioSource,
+    PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
+    PrefetchVideoSource, Presentation, WebAudioOutput,
 };
+#[doc(no_inline)]
+pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 #[doc(no_inline)]
 pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
 #[doc(no_inline)]

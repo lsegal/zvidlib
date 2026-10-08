@@ -367,6 +367,28 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         self.get_range(timeline.audio_interval_for_frame(frame)?, cancellation)
     }
 
+    /// The packets whose compressed bytes [`Self::get_range`] of `range` reads from the provider,
+    /// as runs of packet indexes, so a caller can load them before asking.
+    ///
+    /// Each run is what one of the request's media ranges decodes from the reader's current
+    /// state: nothing when its packets are already decoded, the packets after the decoded run
+    /// when the request continues it, and the preroll packets onwards when it resets. A request
+    /// whose provider reports [`ErrorKind::WouldBlock`] for a packet keeps what it decoded before
+    /// it, so asking again once that packet is loaded carries on from there.
+    pub fn packets_for_range(&self, range: SampleRange) -> Result<Vec<std::ops::Range<usize>>> {
+        if range.end > self.presentation_length {
+            return Err(invalid("audio request exceeds the presentation duration"));
+        }
+        let mut runs = Vec::new();
+        for mapping in self.mappings(range)? {
+            let Some(media) = mapping.media else { continue };
+            if let Planned::Decode(plan) = self.plan(media)? {
+                runs.push(plan.from..plan.last + 1);
+            }
+        }
+        Ok(runs)
+    }
+
     /// Cancels are caller-owned; reset drops queued decode state before a seek.
     pub fn reset(&mut self) -> Result<()> {
         self.decoder.reset()?;
@@ -457,6 +479,22 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
     /// cold, backwards, or separated by a gap - takes the reset path, which is
     /// what a real seek needs, and discards the resident run.
     fn plan_decode(&mut self, range: SampleRange) -> Result<Option<DecodePlan>> {
+        match self.plan(range)? {
+            Planned::Resident { first } => {
+                self.evict_behind(first);
+                Ok(None)
+            }
+            Planned::Decode(plan) => {
+                if plan.reset {
+                    self.discard_resident();
+                }
+                Ok(Some(plan))
+            }
+        }
+    }
+
+    /// [`Self::plan_decode`]'s decision, without acting on it.
+    fn plan(&self, range: SampleRange) -> Result<Planned> {
         let first = (0..self.packets.len())
             .find(|&index| self.packets.decoded_range(index).end > range.start)
             .ok_or_else(|| invalid("audio edit maps beyond decoded samples"))?;
@@ -474,10 +512,9 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
                 if first >= resident_start && first <= resident_end + 1 =>
             {
                 if last <= resident_end {
-                    self.evict_behind(first);
-                    return Ok(None);
+                    return Ok(Planned::Resident { first });
                 }
-                Ok(Some(DecodePlan {
+                Ok(Planned::Decode(DecodePlan {
                     reset: false,
                     from: resident_end + 1,
                     last,
@@ -485,16 +522,13 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
                     preroll_end: resident_end + 1,
                 }))
             }
-            _ => {
-                self.discard_resident();
-                Ok(Some(DecodePlan {
-                    reset: true,
-                    from: seek_start,
-                    last,
-                    first,
-                    preroll_end: first,
-                }))
-            }
+            _ => Ok(Planned::Decode(DecodePlan {
+                reset: true,
+                from: seek_start,
+                last,
+                first,
+                preroll_end: first,
+            })),
         }
     }
 
@@ -569,6 +603,15 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
 struct Mapping {
     media: Option<SampleRange>,
     output_offset: u64,
+}
+
+/// What one media range of a request needs.
+enum Planned {
+    /// Every packet it covers is resident; `first` is the first of them.
+    Resident {
+        first: usize,
+    },
+    Decode(DecodePlan),
 }
 
 /// The packets one media range of a request needs decoded.
@@ -744,6 +787,87 @@ mod tests {
         )
         .unwrap();
         (reader, counts)
+    }
+
+    /// Packets that answer only once the test has marked them loaded, and report
+    /// [`ErrorKind::WouldBlock`] until then, the way a provider over a network source does.
+    struct LoadOnDemand {
+        packets: Vec<EncodedAudioSample>,
+        loaded: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<usize>>>,
+    }
+
+    impl AudioPacketProvider for LoadOnDemand {
+        fn len(&self) -> usize {
+            self.packets.len()
+        }
+
+        fn decoded_range(&self, index: usize) -> SampleRange {
+            self.packets[index].decoded_range
+        }
+
+        fn read(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+            if self.loaded.lock().unwrap().contains(&index) {
+                Ok(Cow::Borrowed(&self.packets[index].data))
+            } else {
+                Err(Error::new(ErrorKind::WouldBlock, "not loaded yet"))
+            }
+        }
+    }
+
+    /// Issue #672: a request whose provider has not loaded a packet yet reports `WouldBlock`,
+    /// keeps what it decoded before it, and carries on from that packet once it is loaded.
+    #[test]
+    fn a_request_waiting_on_an_unloaded_packet_resumes_where_it_stopped() {
+        let loaded = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let decoder = FixtureDecoder::default();
+        let counts = decoder.counts.clone();
+        let mut reader = AudioSampleReader::from_provider(
+            decoder,
+            Box::new(LoadOnDemand {
+                packets: packets_of(10),
+                loaded: loaded.clone(),
+            }),
+            48_000,
+            1,
+            AudioTrackTiming::default(),
+            1,
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let range = SampleRange::new(9, 20).unwrap();
+
+        // Packets 2..=4 hold samples 8..20, and one packet of preroll comes before them.
+        assert_eq!(reader.packets_for_range(range).unwrap(), vec![1..5]);
+        let error = reader.get_range(range, &cancellation).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+
+        loaded.lock().unwrap().extend([1, 2, 3]);
+        let error = reader.get_range(range, &cancellation).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert_eq!(counts.decodes.get(), 3);
+        // Packets 2 and 3 were kept, so only packet 4 is still needed.
+        assert_eq!(reader.packets_for_range(range).unwrap(), vec![4..5]);
+
+        loaded.lock().unwrap().insert(4);
+        let buffer = reader.get_range(range, &cancellation).unwrap();
+        let expected: Vec<f32> = (9..20).map(|value| value as f32).collect();
+        assert_eq!(buffer.samples, expected);
+        assert_eq!(counts.decodes.get(), 4);
+
+        // Already decoded: nothing to load. Continuing: just the next packet.
+        assert!(reader.packets_for_range(range).unwrap().is_empty());
+        assert_eq!(
+            reader
+                .packets_for_range(SampleRange::new(16, 24).unwrap())
+                .unwrap(),
+            vec![5..6]
+        );
+        assert!(
+            reader
+                .packets_for_range(SampleRange::new(0, 41).unwrap())
+                .is_err()
+        );
     }
 
     fn packets() -> Vec<EncodedAudioSample> {

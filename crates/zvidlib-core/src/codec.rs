@@ -776,15 +776,7 @@ impl ExactFrameReader {
         // submitted the target at all, however far it has since walked. On a track whose frames
         // are all random-access points, a request for frame 2 opens the session at 2, and a
         // request for frame 0 after it would otherwise walk on from 3 to the end of the track.
-        let can_reuse = self
-            .next_decode_position
-            .is_some_and(|position| position >= random_access_position)
-            && self
-                .session_start
-                .is_some_and(|start| start <= random_access_position)
-            && !self.published_since_reset.contains(&presentation_index)
-            && !self.suppressed_since_reset.contains(&presentation_index);
-        if !can_reuse {
+        if !self.session_reaches(presentation_index, random_access_position) {
             self.decoder.reset()?;
             self.statistics.resets = self.statistics.resets.saturating_add(1);
             self.published_since_reset.clear();
@@ -808,6 +800,10 @@ impl ExactFrameReader {
                 self.drain_internal(cancellation)?;
                 break;
             }
+            // The sample is read before the decoder is told anything, so a provider that reports
+            // `WouldBlock` for it leaves the session exactly where it was, and asking again once
+            // the sample is loaded carries on from here (issue #672).
+            let sample = self.sample_at(position)?;
             // Nothing looks at a picture decoded on the way to the target, and skipping the
             // color conversion it would otherwise pay is most of what a long walk costs. Two
             // kinds of frame are kept anyway, both because the request after this one is very
@@ -832,11 +828,9 @@ impl ExactFrameReader {
             // bundled sample's 768 pictures (issue #402).
             let cache_tail = request.cache_tail(&self.limits);
             let wanted = position >= target_position
-                || self.samples.presentation_index(position).0
-                    >= presentation_index.0.saturating_sub(cache_tail);
+                || sample.presentation_index.0 >= presentation_index.0.saturating_sub(cache_tail);
             self.set_output_wanted(wanted);
             let suppressed = !self.output_wanted;
-            let sample = self.sample_at(position)?;
             let outputs = self.decoder.submit(&sample, cancellation)?;
             self.statistics.samples_submitted = self.statistics.samples_submitted.saturating_add(1);
             if suppressed {
@@ -863,6 +857,72 @@ impl ExactFrameReader {
                 "decoder did not produce the requested presentation frame",
             ))
         }
+    }
+
+    /// The decode-order positions whose samples [`Self::get`] of `presentation_index` reads from
+    /// the provider, as far as the index can tell, so a caller can load them before asking.
+    ///
+    /// This is empty for a cached frame. Otherwise it runs from where the walk starts - the open
+    /// session's next position when the walk continues it, or the frame's random-access point
+    /// when it resets - through the last sample of the frame's group of pictures presented no
+    /// later than the frame, since a reordering decoder holds the frame back until those have
+    /// been submitted. A decoder may still want a sample or two past that before it releases the
+    /// frame; a provider reports [`ErrorKind::WouldBlock`] for any it does not have, and the
+    /// request is resumable, so this is a prefetch hint rather than a guarantee.
+    pub fn decode_positions_for(
+        &self,
+        presentation_index: FrameIndex,
+    ) -> Result<std::ops::Range<usize>> {
+        if self.cache.contains_key(&presentation_index) {
+            return Ok(0..0);
+        }
+        let target_position = *self
+            .decode_position_by_presentation
+            .get(&presentation_index)
+            .ok_or_else(|| {
+                Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed")
+            })?;
+        let random_access_position = self.nearest_random_access(target_position);
+        let start = match self.next_decode_position {
+            Some(next) if self.session_reaches(presentation_index, random_access_position) => next,
+            _ => random_access_position,
+        };
+        let len = self.samples.len();
+        let scan_end = target_position
+            .saturating_add(1)
+            .saturating_add(self.limits.max_decode_samples_per_seek as usize)
+            .min(len);
+        let mut end = target_position + 1;
+        for position in target_position + 1..scan_end {
+            let presented = self.samples.presentation_index(position);
+            if presented <= presentation_index {
+                end = position + 1;
+            } else if self.samples.is_random_access(position) {
+                break;
+            }
+        }
+        Ok(start..end.max((start + 1).min(len)))
+    }
+
+    /// Whether continuing the open decode session reaches `presentation_index`, whose walk would
+    /// otherwise start from `random_access_position`.
+    ///
+    /// A decoder with output reordering (e.g. hierarchical B-frames) may need to be fed samples
+    /// *past* the target before the reordered frame at the target is actually emitted, so a
+    /// session that has walked past the target does not by itself need a reset: the frame may
+    /// still be buffered inside the decoder. See [`Self::get_request`] for the cases that do.
+    fn session_reaches(
+        &self,
+        presentation_index: FrameIndex,
+        random_access_position: usize,
+    ) -> bool {
+        self.next_decode_position
+            .is_some_and(|position| position >= random_access_position)
+            && self
+                .session_start
+                .is_some_and(|start| start <= random_access_position)
+            && !self.published_since_reset.contains(&presentation_index)
+            && !self.suppressed_since_reset.contains(&presentation_index)
     }
 
     /// Drains delayed output into the bounded presentation cache.
@@ -1172,6 +1232,111 @@ mod tests {
 
     fn value(frame: &VideoFrame) -> u8 {
         frame.planes[0].data[0]
+    }
+
+    /// Samples that answer only once the test has marked them loaded, and report
+    /// [`ErrorKind::WouldBlock`] until then, the way a provider over a network source does.
+    struct LoadOnDemand {
+        samples: Vec<EncodedVideoSample>,
+        loaded: Arc<Mutex<HashSet<usize>>>,
+    }
+
+    impl SampleProvider for LoadOnDemand {
+        fn len(&self) -> usize {
+            self.samples.len()
+        }
+
+        fn is_random_access(&self, decode_index: usize) -> bool {
+            self.samples[decode_index].random_access
+        }
+
+        fn presentation_index(&self, decode_index: usize) -> FrameIndex {
+            self.samples[decode_index].presentation_index
+        }
+
+        fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>> {
+            if self.loaded.lock().unwrap().contains(&decode_index) {
+                Ok(Cow::Borrowed(&self.samples[decode_index].data))
+            } else {
+                Err(Error::new(ErrorKind::WouldBlock, "not loaded yet"))
+            }
+        }
+    }
+
+    /// Issue #672: a request whose provider has not loaded a sample yet reports `WouldBlock`
+    /// rather than failing or blocking, and asking again once it is loaded carries the same walk
+    /// on from that sample instead of starting over from the random-access point.
+    #[test]
+    fn a_request_waiting_on_an_unloaded_sample_resumes_where_it_stopped() {
+        let loaded = Arc::new(Mutex::new(HashSet::new()));
+        let samples = (0..12)
+            .map(|index| sample(index, index as u8, index % 4 == 0))
+            .collect();
+        let mut reader = ExactFrameReader::from_provider(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            Box::new(LoadOnDemand {
+                samples,
+                loaded: loaded.clone(),
+            }),
+            Limits::default(),
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+
+        assert_eq!(reader.decode_positions_for(FrameIndex(6)).unwrap(), 4..7);
+        let error = reader.get(FrameIndex(6), &cancellation).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert_eq!(reader.statistics().samples_submitted, 0);
+
+        loaded.lock().unwrap().extend([4, 5]);
+        let error = reader.get(FrameIndex(6), &cancellation).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        assert_eq!(reader.statistics().samples_submitted, 2);
+        // The walk continues, so only what is left of it is still needed.
+        assert_eq!(reader.decode_positions_for(FrameIndex(6)).unwrap(), 6..7);
+
+        loaded.lock().unwrap().insert(6);
+        assert_eq!(value(&reader.get(FrameIndex(6), &cancellation).unwrap()), 6);
+        assert_eq!(reader.statistics().samples_submitted, 3);
+        assert_eq!(reader.statistics().resets, 1);
+
+        // A cached frame needs nothing; the next one needs only its own sample; a frame in
+        // another group needs the run from its random-access point.
+        assert!(
+            reader
+                .decode_positions_for(FrameIndex(6))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(reader.decode_positions_for(FrameIndex(7)).unwrap(), 7..8);
+        assert_eq!(reader.decode_positions_for(FrameIndex(10)).unwrap(), 8..11);
+        assert_eq!(reader.decode_positions_for(FrameIndex(1)).unwrap(), 0..2);
+    }
+
+    /// With reordering, a frame's group can present it after samples that come later in decode
+    /// order, and those have to be submitted before a reordering decoder releases it.
+    #[test]
+    fn decode_positions_for_a_reordered_frame_reach_the_samples_presented_before_it() {
+        // Decode order I0 P3 B1 B2 I4: frame 1 needs P3 (decode position 1) and itself.
+        let samples = vec![
+            sample(0, 0, true),
+            sample(3, 3, false),
+            sample(1, 1, false),
+            sample(2, 2, false),
+            sample(4, 4, true),
+        ];
+        let reader = ExactFrameReader::new(
+            &uncompressed_video_decoder_factory(),
+            config(),
+            samples,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(reader.decode_positions_for(FrameIndex(1)).unwrap(), 0..3);
+        assert_eq!(reader.decode_positions_for(FrameIndex(2)).unwrap(), 0..4);
+        assert_eq!(reader.decode_positions_for(FrameIndex(3)).unwrap(), 0..4);
+        assert_eq!(reader.decode_positions_for(FrameIndex(4)).unwrap(), 4..5);
     }
 
     /// A reader over a single-group track: one random-access point at frame zero, so reaching

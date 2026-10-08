@@ -1,8 +1,26 @@
 //! Audio-clock-driven playback shared by native and browser adapters.
+//!
+//! Natively, a [`PlaybackController`] reads its sources synchronously: an
+//! [`crate::ExactFrameReader`] and [`crate::AudioSampleReader`] over owned samples, or over an
+//! on-demand [`crate::Mp4SampleProvider`] whose source answers immediately. The browser's main
+//! thread cannot wait for a `fetch`, so there the sources are an [`OnDemandVideoSource`] and an
+//! [`OnDemandAudioSource`], which read compressed samples only from what their
+//! [`Mp4SampleLoader`] has already loaded and report [`ErrorKind::WouldBlock`] for anything else.
+//! The controller passes that error up without losing its place, and the caller awaits
+//! [`PlaybackController::prefetch`] - which loads the run the current frame and the scheduling
+//! window need, plus a readahead - before trying again (issue #672):
+//!
+//! ```ignore
+//! match controller.present() {
+//!     Err(error) if error.kind() == ErrorKind::WouldBlock => controller.prefetch().await?,
+//!     result => draw(result?),
+//! }
+//! ```
 
+use crate::io::{ByteSource, IoFuture};
 use crate::{
-    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Result, SampleRange, Timeline,
-    VideoFrame,
+    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Mp4SampleLoader, Result,
+    SampleRange, Timeline, VideoFrame,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +100,166 @@ pub trait PlaybackVideoSource {
         cancellation: &CancellationToken,
     ) -> Result<VideoFrame>;
     fn reset(&mut self) -> Result<()>;
+}
+
+/// A [`PlaybackVideoSource`] whose reads report [`ErrorKind::WouldBlock`] until what they need
+/// has been loaded, and which can load it without blocking.
+pub trait PrefetchVideoSource: PlaybackVideoSource {
+    /// Loads what [`PlaybackVideoSource::get_exact`] of `frame` reads, along with whatever an
+    /// earlier read reported missing and a readahead for playing on from `frame`.
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()>;
+}
+
+/// A [`PlaybackAudioSource`] whose reads report [`ErrorKind::WouldBlock`] until what they need
+/// has been loaded, and which can load it without blocking.
+pub trait PrefetchAudioSource: PlaybackAudioSource {
+    /// Loads what [`PlaybackAudioSource::read`] of `range` reads, along with whatever an earlier
+    /// read reported missing and a readahead for playing on past `range`.
+    fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()>;
+}
+
+/// Exact video frames decoded from compressed samples an [`Mp4SampleLoader`] loads on demand,
+/// for a byte source whose reads suspend, such as a browser `fetch`.
+///
+/// [`PlaybackVideoSource::get_exact`] never waits on the source: it reports
+/// [`ErrorKind::WouldBlock`] when a sample it needs is not loaded yet, and
+/// [`PrefetchVideoSource::prefetch`] loads it.
+pub struct OnDemandVideoSource<S> {
+    reader: crate::ExactFrameReader,
+    loader: Mp4SampleLoader<S>,
+    readahead_samples: usize,
+}
+
+impl<S: ByteSource> OnDemandVideoSource<S> {
+    /// `reader` must have been built with [`crate::ExactFrameReader::from_provider`] over
+    /// `loader`'s [`Mp4SampleLoader::sample_provider`]. A prefetch loads up to
+    /// `readahead_samples` decode-order samples past the run the requested frame needs, as far
+    /// as the loader's budget allows.
+    pub fn new(
+        reader: crate::ExactFrameReader,
+        loader: Mp4SampleLoader<S>,
+        readahead_samples: usize,
+    ) -> Self {
+        Self {
+            reader,
+            loader,
+            readahead_samples,
+        }
+    }
+
+    pub fn reader(&self) -> &crate::ExactFrameReader {
+        &self.reader
+    }
+
+    pub fn reader_mut(&mut self) -> &mut crate::ExactFrameReader {
+        &mut self.reader
+    }
+
+    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+        &self.loader
+    }
+}
+
+impl<S: ByteSource> PlaybackVideoSource for OnDemandVideoSource<S> {
+    fn get_exact(
+        &mut self,
+        frame: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.reader.get(frame, cancellation)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.loader.clear_missing();
+        self.reader.reset()
+    }
+}
+
+impl<S: ByteSource> PrefetchVideoSource for OnDemandVideoSource<S> {
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()> {
+        Box::pin(async move {
+            self.loader.load_missing().await?;
+            let positions = self.reader.decode_positions_for(frame)?;
+            self.loader.load(positions, self.readahead_samples).await
+        })
+    }
+}
+
+/// Exact audio ranges decoded from compressed packets an [`Mp4SampleLoader`] loads on demand,
+/// for a byte source whose reads suspend, such as a browser `fetch`.
+///
+/// [`PlaybackAudioSource::read`] never waits on the source: it reports
+/// [`ErrorKind::WouldBlock`] when a packet it needs is not loaded yet, and
+/// [`PrefetchAudioSource::prefetch`] loads it.
+pub struct OnDemandAudioSource<D, S> {
+    reader: crate::AudioSampleReader<D>,
+    loader: Mp4SampleLoader<S>,
+    readahead_packets: usize,
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> OnDemandAudioSource<D, S> {
+    /// `reader` must have been built with [`crate::AudioSampleReader::from_provider`] over
+    /// `loader`'s [`Mp4SampleLoader::audio_packet_provider`]. A prefetch loads up to
+    /// `readahead_packets` packets past the run the requested range needs, as far as the
+    /// loader's budget allows.
+    pub fn new(
+        reader: crate::AudioSampleReader<D>,
+        loader: Mp4SampleLoader<S>,
+        readahead_packets: usize,
+    ) -> Self {
+        Self {
+            reader,
+            loader,
+            readahead_packets,
+        }
+    }
+
+    pub fn reader(&self) -> &crate::AudioSampleReader<D> {
+        &self.reader
+    }
+
+    pub fn reader_mut(&mut self) -> &mut crate::AudioSampleReader<D> {
+        &mut self.reader
+    }
+
+    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+        &self.loader
+    }
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> PlaybackAudioSource for OnDemandAudioSource<D, S> {
+    fn sample_rate(&self) -> u32 {
+        self.reader.sample_rate()
+    }
+
+    fn presentation_length(&self) -> u64 {
+        self.reader.presentation_length()
+    }
+
+    fn read(
+        &mut self,
+        range: SampleRange,
+        cancellation: &CancellationToken,
+    ) -> Result<AudioBuffer> {
+        self.reader.get_range(range, cancellation)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.loader.clear_missing();
+        self.reader.reset()
+    }
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> PrefetchAudioSource for OnDemandAudioSource<D, S> {
+    fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()> {
+        Box::pin(async move {
+            self.loader.load_missing().await?;
+            for run in self.reader.packets_for_range(range)? {
+                self.loader.load(run, self.readahead_packets).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,13 +533,25 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         let preroll_start = target.saturating_sub(self.options.preroll_samples);
         if preroll_start < target {
             let preroll = crate::SampleRange::new(preroll_start, target)?;
-            let _ = self.audio.read(preroll, &self.cancellation)?;
+            match self.audio.read(preroll, &self.cancellation) {
+                // The preroll only warms the decoder up, and an audio reader decodes its own
+                // preroll packets after a reset anyway, so an on-demand source that has not
+                // loaded it yet does not hold the seek up.
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
         }
         self.queued_until = target;
         self.last_presented = None;
         if self.playing {
             self.output.start(target)?;
-            self.fill_audio()?;
+            match self.fill_audio() {
+                // The seek itself is complete, and the next `present` or `pump_audio` tops the
+                // queue up from where this stopped once the source has loaded it.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                result => result?,
+            }
         }
         Ok(())
     }
@@ -483,6 +673,35 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
             let buffer = self.audio.read(range, &self.cancellation)?;
             self.output.schedule(buffer, self.generation)?;
             self.queued_until = end;
+        }
+        Ok(())
+    }
+}
+
+impl<V: PrefetchVideoSource, A: PrefetchAudioSource, O: PlaybackAudioOutput>
+    PlaybackController<V, A, O>
+{
+    /// Loads what the next [`Self::present`] reads - the frame the audio clock calls for now and
+    /// the audio that tops the scheduling window up - or, while paused, what
+    /// [`Self::current_frame`] and [`Self::play`] read, along with each source's readahead.
+    ///
+    /// This is the browser's way through playback: with on-demand sources, `present`, `play`
+    /// and `current_frame` report [`ErrorKind::WouldBlock`] instead of waiting for a sample to
+    /// arrive, leave the controller where it was, and succeed once this has loaded what they
+    /// were missing. Calling it ahead of time, between frames, keeps them from reporting it at
+    /// all. [`Self::seek`] itself never needs it: the only thing it reads is a preroll it can
+    /// skip.
+    pub async fn prefetch(&mut self) -> Result<()> {
+        let now = self.current_sample();
+        let frame = self.timeline.frame_for_audio_sample(now)?;
+        self.video.prefetch(frame).await?;
+        let length = self.audio.presentation_length();
+        let start = self.queued_until.max(now).min(length);
+        let end = now
+            .saturating_add(self.options.schedule_ahead_samples)
+            .min(length);
+        if start < end {
+            self.audio.prefetch(SampleRange::new(start, end)?).await?;
         }
         Ok(())
     }
@@ -928,5 +1147,273 @@ mod tests {
 
         assert_eq!(presentation.requested_frame, FrameIndex(1));
         assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(1)]);
+    }
+
+    /// Issue #672: `PlaybackController` plays and seeks through on-demand
+    /// sources whose byte source suspends on every read, and never waits on it.
+    /// The same scenario runs natively and in the browser, where it is driven by
+    /// the browser's own event loop on its single thread.
+    mod on_demand {
+        use super::*;
+        use crate::io::MemorySource;
+        use crate::{
+            AudioSampleReader, AudioTrackTiming, Codec, CodecProfile, ColorRange,
+            EncodedAudioSample, ExactFrameReader, HardwarePreference, Mp4Sample, Mp4Track,
+            PixelFormat, SampleDependency, TrackKind, VideoDecoderConfig,
+            uncompressed_video_decoder_factory,
+        };
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context, Poll};
+
+        const FRAMES: usize = 24;
+        const GROUP: usize = 8;
+        const SAMPLE_RATE: u32 = 48_000;
+        const SAMPLES_PER_FRAME: u64 = 2_000;
+        const SAMPLES_PER_PACKET: u64 = 1_000;
+
+        /// A source whose every read suspends once before completing, the way
+        /// a `fetch` does.
+        struct SuspendingSource {
+            inner: MemorySource,
+            reads: Rc<Cell<usize>>,
+        }
+
+        impl ByteSource for SuspendingSource {
+            fn len(&self) -> Option<u64> {
+                self.inner.len()
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                destination: &'a mut [u8],
+            ) -> IoFuture<'a, usize> {
+                self.reads.set(self.reads.get() + 1);
+                Box::pin(async move {
+                    YieldOnce(false).await;
+                    self.inner.read_at(offset, destination).await
+                })
+            }
+        }
+
+        struct YieldOnce(bool);
+
+        impl Future for YieldOnce {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        /// Each packet decodes to its first byte, its packet index, held for
+        /// its whole interval.
+        struct PacketIndexAudio;
+
+        impl crate::AudioDecoder for PacketIndexAudio {
+            fn decode(
+                &mut self,
+                sample: &EncodedAudioSample,
+                _: &CancellationToken,
+            ) -> Result<AudioBuffer> {
+                AudioBuffer::new(
+                    sample.decoded_range,
+                    SAMPLE_RATE,
+                    1,
+                    vec![f32::from(sample.data[0]); sample.decoded_range.len() as usize],
+                    &Limits::default(),
+                )
+            }
+
+            fn reset(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn track(kind: TrackKind, codec: Codec, samples: Vec<Mp4Sample>) -> Mp4Track {
+            Mp4Track {
+                id: 1,
+                kind,
+                codec,
+                timescale: SAMPLE_RATE,
+                duration: FRAMES as u64 * SAMPLES_PER_FRAME,
+                dimensions: None,
+                channels: Some(1),
+                sample_rate: Some(SAMPLE_RATE),
+                decoder_config: Vec::new(),
+                edits: Vec::new(),
+                presentation_order: (0..samples.len()).collect(),
+                samples,
+            }
+        }
+
+        fn sample(offset: usize, size: u32, index: usize, is_sync: bool) -> Mp4Sample {
+            Mp4Sample {
+                offset: offset as u64,
+                size,
+                dts: index as u64,
+                pts: index as i64,
+                duration: 1,
+                dependency: SampleDependency::INDEPENDENT,
+                is_sync,
+            }
+        }
+
+        /// A file interleaving 1x1 Gray8 video frames, each holding its own
+        /// index, with the two audio packets that play under each.
+        fn media() -> (Vec<u8>, Mp4Track, Mp4Track) {
+            let mut bytes = Vec::new();
+            let mut video = Vec::new();
+            let mut audio = Vec::new();
+            for frame in 0..FRAMES {
+                video.push(sample(bytes.len(), 1, frame, frame % GROUP == 0));
+                bytes.push(frame as u8);
+                for _ in 0..SAMPLES_PER_FRAME / SAMPLES_PER_PACKET {
+                    let packet = audio.len();
+                    audio.push(sample(bytes.len(), 2, packet, true));
+                    bytes.extend([packet as u8, 0]);
+                }
+            }
+            (
+                bytes,
+                track(TrackKind::Video, Codec::UncompressedVideo, video),
+                track(TrackKind::Audio, Codec::Aac, audio),
+            )
+        }
+
+        async fn until_loaded<T, V, A, O>(
+            playback: &mut PlaybackController<V, A, O>,
+            mut step: impl FnMut(&mut PlaybackController<V, A, O>) -> Result<T>,
+        ) -> T
+        where
+            V: PrefetchVideoSource,
+            A: PrefetchAudioSource,
+            O: PlaybackAudioOutput,
+        {
+            for _ in 0..64 {
+                match step(playback) {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        playback.prefetch().await.unwrap();
+                    }
+                    result => return result.unwrap(),
+                }
+            }
+            panic!("playback still had not loaded what it needed");
+        }
+
+        async fn plays_and_seeks_without_blocking() {
+            let (bytes, video_track, audio_track) = media();
+            let reads = Rc::new(Cell::new(0));
+            let source = || SuspendingSource {
+                inner: MemorySource::new(bytes.clone()),
+                reads: reads.clone(),
+            };
+            // Budgets smaller than one group of pictures and one scheduling
+            // window, so both are streamed through over several prefetches.
+            let video_loader = Mp4SampleLoader::new(video_track, source(), 4).unwrap();
+            let video_reader = ExactFrameReader::from_provider(
+                &uncompressed_video_decoder_factory(),
+                VideoDecoderConfig {
+                    codec: Codec::UncompressedVideo,
+                    profile: CodecProfile::UncompressedGray8,
+                    coded_dimensions: VideoDimensions::new(1, 1, &Limits::default()).unwrap(),
+                    output_format: PixelFormat::Gray8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    configuration: Vec::new(),
+                },
+                Box::new(video_loader.sample_provider().unwrap()),
+                Limits::default(),
+            )
+            .unwrap();
+            let audio_loader = Mp4SampleLoader::new(audio_track, source(), 8).unwrap();
+            let decoded_ranges = (0..FRAMES as u64 * 2)
+                .map(|packet| {
+                    SampleRange::new(
+                        packet * SAMPLES_PER_PACKET,
+                        (packet + 1) * SAMPLES_PER_PACKET,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let audio_reader = AudioSampleReader::from_provider(
+                PacketIndexAudio,
+                Box::new(audio_loader.audio_packet_provider(decoded_ranges).unwrap()),
+                SAMPLE_RATE,
+                1,
+                AudioTrackTiming::default(),
+                1,
+                Limits::default(),
+            )
+            .unwrap();
+            let clock = Arc::new(Mutex::new(0));
+            let scheduled = Arc::new(Mutex::new(Vec::new()));
+            let backend = FixtureBackend {
+                clock: clock.clone(),
+                scheduled: scheduled.clone(),
+                canceled: Arc::new(Mutex::new(Vec::new())),
+            };
+            let timeline =
+                Timeline::new(crate::FrameRate::new(24, 1).unwrap(), SAMPLE_RATE).unwrap();
+            let mut playback = PlaybackController::new(
+                OnDemandVideoSource::new(video_reader, video_loader, 2),
+                OnDemandAudioSource::new(audio_reader, audio_loader, 2),
+                WebAudioOutput(backend),
+                timeline,
+                PlaybackOptions {
+                    schedule_ahead_samples: 4_000,
+                    preroll_samples: 1_000,
+                },
+            )
+            .unwrap();
+
+            let error = playback.play().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WouldBlock);
+            assert_eq!(reads.get(), 0, "a synchronous call read the source");
+            until_loaded(&mut playback, |playback| playback.play()).await;
+
+            // The clock reading and media sample at the last seek, which the
+            // controller measures media time from.
+            let mut anchor = (0, 0);
+            for frame in [0, 1, 2, 5, 9, 20, 3, 4] {
+                if frame == 20 || frame == 3 {
+                    playback.seek(FrameIndex(frame)).unwrap();
+                    anchor = (*clock.lock().unwrap(), frame * SAMPLES_PER_FRAME);
+                }
+                *clock.lock().unwrap() = anchor.0 + frame * SAMPLES_PER_FRAME - anchor.1;
+                let (presentation, picture) =
+                    until_loaded(&mut playback, |playback| playback.present()).await;
+                assert_eq!(presentation.frame, Some(FrameIndex(frame)));
+                assert_eq!(picture.unwrap().planes[0].data, [frame as u8]);
+            }
+            assert!(reads.get() > 0);
+            assert!(!scheduled.lock().unwrap().is_empty());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn natively() {
+            let mut future = std::pin::pin!(plays_and_seeks_without_blocking());
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            while future.as_mut().poll(&mut context).is_pending() {}
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+        #[cfg(target_arch = "wasm32")]
+        #[wasm_bindgen_test::wasm_bindgen_test(async)]
+        async fn in_the_browser() {
+            plays_and_seeks_without_blocking().await;
+        }
     }
 }
