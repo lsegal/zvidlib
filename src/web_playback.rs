@@ -1151,7 +1151,9 @@ impl WasmOnDemandPlayback {
     /// context's clock when one is given, and by `performance.now()`
     /// otherwise. `options.videoBudgetBytes` and `options.audioBudgetBytes`
     /// bound the compressed samples held at once, and default to 16 MiB and
-    /// 1 MiB.
+    /// 1 MiB. An audio budget too small to hold a packet together with the
+    /// packets decoded ahead of it after a seek is refused with
+    /// `RESOURCE_LIMIT`.
     ///
     /// Only the container's header and sample index are read here, and the
     /// first bytes of an Opus track's last packet. The video decodes through `WebCodecs` when the

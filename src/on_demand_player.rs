@@ -71,7 +71,10 @@ pub struct OnDemandOptions {
     /// hold the track's largest sample.
     pub video_budget_bytes: u64,
     /// The most compressed audio the player holds at once, in bytes, counting
-    /// only the selected track's packets. It must hold the largest one.
+    /// only the selected track's packets. It must hold the largest one
+    /// together with the packets decoded ahead of it after a seek, or opening
+    /// the track fails with [`crate::ErrorKind::ResourceLimit`] (see
+    /// [`crate::TrackSampleLoader::audio_budget_floor`]).
     pub audio_budget_bytes: u64,
     /// The audio track to play first, by its position among the input's
     /// audio tracks. Ignored for an input with no audio track.

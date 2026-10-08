@@ -394,6 +394,82 @@ fn an_on_demand_audio_source_loads_packets_as_reads_reach_them() {
     }
 }
 
+/// A loader over `fixture` with `budget`, checked for a reader that decodes
+/// [`VORBIS_PREROLL_PACKETS`] ahead of what it needs.
+fn checked_loader(
+    fixture: &Fixture,
+    budget: u64,
+) -> Result<(
+    TrackSampleLoader<SuspendingSource>,
+    zvidlib::PrefetchedAudioPacketProvider,
+)> {
+    let loader = TrackSampleLoader::new(
+        fixture.track.clone(),
+        SuspendingSource::new(fixture.bytes.clone()),
+        budget,
+    )?;
+    let provider = loader.vorbis_packet_provider()?;
+    loader.check_audio_budget(&provider, VORBIS_PREROLL_PACKETS)?;
+    Ok((loader, provider))
+}
+
+/// Issue #694: a budget too small for a packet and its preroll is refused,
+/// rather than prefetching the same packets forever, and at the smallest
+/// budget the loader accepts every read completes, a packet's worth of
+/// prefetches at a time at worst. The first packet decodes no samples, so
+/// `[0, 500)` resets onto the second with the first as its preroll.
+#[test]
+fn an_on_demand_audio_source_at_the_smallest_accepted_budget_completes_its_reads() {
+    for fixture in fixtures() {
+        let name = fixture.name;
+        let (loader, provider) = checked_loader(&fixture, u64::MAX).unwrap();
+        let floor = loader.audio_budget_floor(&provider, VORBIS_PREROLL_PACKETS);
+        let largest = fixture
+            .track
+            .samples
+            .iter()
+            .map(|sample| u64::from(sample.size))
+            .max()
+            .unwrap();
+        assert!(
+            floor > largest,
+            "{name}: the floor is only the largest packet"
+        );
+        for budget in [largest, floor - 1] {
+            let error = checked_loader(&fixture, budget).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::ResourceLimit, "{name}: {budget}");
+        }
+
+        let (loader, provider) = checked_loader(&fixture, floor).unwrap();
+        let mut audio = OnDemandAudioSource::new(fixture.reader(Box::new(provider)), loader, 8);
+        let mut eager = fixture.eager_reader();
+        let length = audio.presentation_length();
+        let packets = fixture.track.samples.len();
+        let cancellation = CancellationToken::new();
+        let mut ranges = vec![SampleRange::new(0, 500).unwrap()];
+        ranges.extend(fixture.ranges(length));
+        for range in ranges {
+            let mut prefetches = 0;
+            let got = loop {
+                match audio.read(range, &cancellation) {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        prefetches += 1;
+                        assert!(
+                            prefetches <= packets,
+                            "{name}: {range:?} still had not loaded after {packets} prefetches"
+                        );
+                        block_on(audio.prefetch(range)).unwrap();
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            let expected = eager.get_range(range, &cancellation).unwrap();
+            assert_eq!(got.samples, expected.samples, "{name}: {range:?}");
+            assert!(audio.loader().resident_bytes() <= floor);
+        }
+    }
+}
+
 /// Stands in for a video track: every frame is the same small gray picture,
 /// so the controller's audio is all that is under test.
 struct GrayVideo;
