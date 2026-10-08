@@ -48,7 +48,7 @@ use crate::audio::{
 };
 use crate::codec::{CancellationToken, EncodedVideoSample, ExactFrameReader};
 use crate::codec_config::derive_codec_string;
-use crate::io::{ByteSource, IoFuture};
+use crate::io::{ByteSource, CachingByteSource, IoFuture};
 use crate::media::{AudioBuffer, Codec, ColorRange, PixelFormat, Plane, VideoFrame};
 use crate::mp4_demux::Mp4Track;
 use crate::playback::{
@@ -116,6 +116,16 @@ const VIDEO_READAHEAD_SAMPLES: usize = 24;
 /// asked for, and so the most decoded pictures a playback holds at once: a
 /// third of a second at 24 frames a second.
 const DECODED_VIDEO_FRAMES: u64 = 8;
+
+/// The page size opening an input reads its container's header and index
+/// through. A WebM's index is every block's header, a few bytes each across
+/// all of its clusters, so a page combines the headers of the blocks near each
+/// other into one request instead of two requests a block (issue #685).
+const INDEX_PAGE_BYTES: u64 = 4 * 1024;
+
+/// The index pages opening an input holds at once. The index is read front to
+/// back, so only the pages around the read in progress are worth keeping.
+const INDEX_CACHE_BYTES: u64 = 64 * 1024;
 
 /// Audio packets a prefetch loads past the ones it decodes.
 const AUDIO_READAHEAD_PACKETS: usize = 16;
@@ -1047,7 +1057,10 @@ impl WasmOnDemandPlayback {
         let options = parse_on_demand_options(options)?;
         let limits = Limits::default();
         let source = RangeSource::open(source).await.map_err(core_error)?;
-        let media = crate::container::open_media(&source, &limits)
+        let index_source =
+            CachingByteSource::new(source.clone(), INDEX_PAGE_BYTES, INDEX_CACHE_BYTES)
+                .map_err(core_error)?;
+        let media = crate::container::open_media(&index_source, &limits)
             .await
             .map_err(core_error)?;
         let video = media
@@ -2245,13 +2258,26 @@ mod tests {
             );
         }
         video.extend(encoder.finish().await.unwrap());
-        for sample in video {
-            muxer.write_sample(0, sample).await.unwrap();
+        // A WebM cluster interleaves its tracks, so the samples are written
+        // in presentation-time order across both.
+        let seconds = |pts: i64, timescale: u64| pts as f64 / timescale as f64;
+        let mut samples: Vec<_> = video
+            .into_iter()
+            .map(|sample| (seconds(sample.pts, SMALL_RATE), 0, sample))
+            .collect();
+        let gapless = audio.map(|(packets, gapless)| {
+            samples.extend(
+                packets
+                    .into_iter()
+                    .map(|packet| (seconds(packet.pts, 48_000), 1, packet)),
+            );
+            gapless
+        });
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, track, sample) in samples {
+            muxer.write_sample(track, sample).await.unwrap();
         }
-        if let Some((packets, gapless)) = audio {
-            for packet in packets {
-                muxer.write_sample(1, packet).await.unwrap();
-            }
+        if let Some(gapless) = gapless {
             muxer.set_audio_gapless(1, gapless).unwrap();
         }
         muxer.finish().await.unwrap().into_inner()
@@ -2577,8 +2603,9 @@ mod tests {
 
     /// Issue #685: a WebM plays, presents and seeks over a suspending source
     /// through the same path an MP4 does, with VP8 or VP9 video and Opus audio
-    /// or none, and fetches only part of the file. Its frames are the ones an
-    /// eager decode of the whole file gives.
+    /// or none. Its frames are the ones an eager decode of the whole file
+    /// gives. The file is a few kilobytes, smaller than the pages its index is
+    /// read through, so what opening fetches is measured natively instead.
     #[wasm_bindgen_test(async)]
     async fn plays_webm_inputs_over_a_suspending_source() {
         for (codec, opus) in [(Codec::Vp8, true), (Codec::Vp9, true), (Codec::Vp9, false)] {
@@ -2614,7 +2641,6 @@ mod tests {
             playback.seek(JsValue::from_f64(89.0)).unwrap();
             let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
             assert_eq!(pixels(&picture), eager[89]);
-            assert!(playback.fetched_bytes() < bytes.len() as f64);
 
             // Whichever video decoder the browser picks, the WebM opens and
             // seeks the same way.
