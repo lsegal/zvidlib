@@ -201,8 +201,8 @@ pub use media::{
 pub use mp4::{CoverArt, CoverArtFormat};
 #[doc(no_inline)]
 pub use mp4_demux::{
-    AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
-    Mp4Track, probe_mp4,
+    AacTrackConfig, EditMapping, Mp4AudioPacketProvider, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample,
+    Mp4SampleProvider, Mp4Track, probe_mp4,
 };
 #[cfg(feature = "opus-decoder")]
 #[doc(no_inline)]

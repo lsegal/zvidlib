@@ -151,6 +151,11 @@ path = "tests/native_aac_decoder.rs"
 required-features = ["aac-decoder"]
 
 [[test]]
+name = "on_demand_audio_packet_provider"
+path = "tests/on_demand_audio_packet_provider.rs"
+required-features = ["aac-decoder"]
+
+[[test]]
 name = "native_aac_encoder"
 path = "tests/native_aac_encoder.rs"
 required-features = ["aac-decoder", "aac-encoder", "av1-encoder"]

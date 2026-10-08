@@ -42,8 +42,8 @@ pub use container::{container_capabilities, probe_container};
 pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{
-    AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
-    Mp4Track, probe_mp4,
+    AacTrackConfig, EditMapping, Mp4AudioPacketProvider, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample,
+    Mp4SampleProvider, Mp4Track, probe_mp4,
 };
 pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 pub use webm::WebmMuxer;
