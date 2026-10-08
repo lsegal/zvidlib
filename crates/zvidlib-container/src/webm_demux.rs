@@ -1,9 +1,9 @@
 //! Bounded, read-only WebM (Matroska/EBML) probing and sample indexing.
 //!
 //! [`WebmDemuxer::open`] builds the same decode-order sample index
-//! [`crate::Mp4Demuxer`] does, as [`Mp4Track`] values, so everything that
-//! consumes an MP4 index - [`Mp4Track::to_encoded_video_samples`],
-//! [`Mp4Track::to_encoded_audio_samples`], [`crate::ExactFrameReader`],
+//! [`crate::Mp4Demuxer`] does, as [`Track`] values, so everything that
+//! consumes a track index - [`Track::to_encoded_video_samples`],
+//! [`Track::to_encoded_audio_samples`], [`crate::ExactFrameReader`],
 //! [`crate::AudioSampleReader`], the browser decoders - reads a WebM track the
 //! same way. Opus and Vorbis audio tracks are indexed alongside the video, and
 //! [`WebmDemuxer::audio_timing`] reads the trimming they declare. Only metadata elements are read whole; a block's payload is never
@@ -17,8 +17,8 @@ use crate::ebml::{
 };
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
-use crate::mp4_demux::{Mp4Sample, Mp4Track};
 use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
+use crate::track::{Track, TrackSample};
 use crate::vorbis::VorbisConfig;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::collections::BTreeMap;
@@ -63,7 +63,7 @@ impl Default for WebmDemuxerOptions {
 pub struct WebmCuePoint {
     /// Presentation time in the track's timescale ticks.
     pub time: i64,
-    /// The Matroska track number, which is also the [`Mp4Track::id`].
+    /// The Matroska track number, which is also the [`Track::id`].
     pub track: u32,
     /// Absolute byte offset of the Cluster holding the cued block.
     pub cluster_offset: u64,
@@ -98,14 +98,14 @@ pub struct WebmDemuxer {
     /// The segment's `Duration`, in seconds, when the file declares one.
     pub duration_seconds: Option<f64>,
     /// Indexed video and audio tracks, in `Tracks` order. Each track's
-    /// [`Mp4Track::timescale`] is derived from the segment's
+    /// [`Track::timescale`] is derived from the segment's
     /// `TimestampScale`. A V_AV1 track's `decoder_config` is its
     /// `CodecPrivate` wrapped in an `av1C` box, and an A_OPUS track's is its
     /// `OpusHead` rewritten as a `dOps` box, as an MP4 track's are. A V_VP9
     /// track's is the `vpcC` box its `CodecPrivate` describes (see
     /// [`crate::Vp9CodecConfig`]), a V_VP8 track has none, and an A_VORBIS
     /// track's is its Xiph-laced `CodecPrivate`.
-    pub tracks: Vec<Mp4Track>,
+    pub tracks: Vec<Track>,
     /// Cue points, in file order, for the indexed tracks. Empty when the file
     /// has no `Cues`, as a live `MediaRecorder` capture usually does.
     pub cues: Vec<WebmCuePoint>,
@@ -119,7 +119,7 @@ pub struct WebmDemuxer {
 /// stores it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WebmAudioTrim {
-    /// The Matroska track number, which is also the [`Mp4Track::id`].
+    /// The Matroska track number, which is also the [`Track::id`].
     pub track: u32,
     /// `CodecDelay`: decoded audio to discard from the start, an Opus
     /// stream's pre-skip. `None` when the track does not declare one.
@@ -241,13 +241,13 @@ impl WebmDemuxer {
         finish(doc_type, info, entries, cues, &options)
     }
 
-    pub fn track(&self, id: u32) -> Option<&Mp4Track> {
+    pub fn track(&self, id: u32) -> Option<&Track> {
         self.tracks.iter().find(|track| track.id == id)
     }
 
     /// An audio track's timing on the decoded sample clock
     /// [`crate::AudioSampleReader`] reads it on, the WebM counterpart of
-    /// [`Mp4Track::audio_timing`]: `CodecDelay` is the priming and the last
+    /// [`Track::audio_timing`]: `CodecDelay` is the priming and the last
     /// block's `DiscardPadding` the end padding, each converted to samples. An
     /// Opus track that declares no `CodecDelay` is primed by its `OpusHead`
     /// pre-skip instead.
@@ -351,7 +351,7 @@ struct IndexedTrack {
     frames: Vec<Frame>,
     blocks: Vec<Block>,
     /// A Vorbis track's frames' first bytes, in frame order; see
-    /// [`Mp4Track::vorbis_packet_heads`].
+    /// [`Track::vorbis_packet_heads`].
     vorbis_packet_heads: Vec<u8>,
 }
 
@@ -636,7 +636,7 @@ impl ParsedBlock {
         ensure_allocation(
             total,
             std::mem::size_of::<Frame>()
-                + std::mem::size_of::<Mp4Sample>()
+                + std::mem::size_of::<TrackSample>()
                 + usize::from(track.codec == Codec::Vorbis),
             options,
             "WebM sample index",
@@ -1006,8 +1006,8 @@ fn video_codec(codec_id: &str) -> Option<Codec> {
 /// The codec indexed for a Matroska audio `CodecID`, or `None` when zvidlib
 /// has no decoder for it. An Opus track's `decoder_config` is its `OpusHead`
 /// rewritten as the `dOps` box an MP4 Opus track carries, so
-/// [`Mp4Track::opus_config`] reads either; a Vorbis track's is its
-/// `CodecPrivate` as stored, which [`Mp4Track::vorbis_config`] reads.
+/// [`Track::opus_config`] reads either; a Vorbis track's is its
+/// `CodecPrivate` as stored, which [`Track::vorbis_config`] reads.
 fn audio_codec(codec_id: &str) -> Option<Codec> {
     match codec_id {
         "A_OPUS" => Some(Codec::Opus),
@@ -1016,7 +1016,7 @@ fn audio_codec(codec_id: &str) -> Option<Codec> {
     }
 }
 
-/// Wraps a track's `CodecPrivate` in the MP4 box an [`Mp4Track`] carries, so
+/// Wraps a track's `CodecPrivate` in the MP4 box a [`Track`] carries, so
 /// decoders configure from a WebM track exactly as from an MP4 one.
 fn decoder_config(
     codec: Codec,
@@ -1227,7 +1227,7 @@ fn finish(
                     frame_duration
                 };
                 dts = dts.max(u64::try_from(frame_pts.max(0)).expect("nonnegative"));
-                samples.push(Mp4Sample {
+                samples.push(TrackSample {
                     offset,
                     size,
                     dts,
@@ -1290,7 +1290,7 @@ fn finish(
                 (TrackKind::Audio, None, Some(channels), Some(sample_rate))
             }
         };
-        tracks.push(Mp4Track {
+        tracks.push(Track {
             id,
             kind,
             codec: track.codec,
@@ -1534,7 +1534,7 @@ mod tests {
         block_on(WebmDemuxer::open(&source, WebmDemuxerOptions::default()))
     }
 
-    fn summary(track: &Mp4Track) -> Vec<(i64, u32, bool)> {
+    fn summary(track: &Track) -> Vec<(i64, u32, bool)> {
         track
             .samples
             .iter()

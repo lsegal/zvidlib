@@ -56,9 +56,9 @@ pub use self::AudioDecoder as AacDecoder;
 /// packet's first byte names; the WebM demuxer records those bytes as it
 /// indexes the track. An Opus packet's own table of contents gives its
 /// interval, so an Opus provider takes it from the sample table and checks
-/// each packet as it reads it. `zvidlib-container`'s `Mp4AudioPacketProvider`
+/// each packet as it reads it. `zvidlib-container`'s `TrackAudioPacketProvider`
 /// is the on-demand provider for AAC and Vorbis tracks, and its
-/// `Mp4SampleLoader` builds non-blocking providers for all three codecs.
+/// `TrackSampleLoader` builds non-blocking providers for all three codecs.
 ///
 /// Implementations used from a decode thread must be `Send`.
 pub trait AudioPacketProvider: Send {

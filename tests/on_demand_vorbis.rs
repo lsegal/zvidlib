@@ -17,10 +17,10 @@ use zvidlib::mp4::{Mp4TrackConfig, Mp4TrackFormat};
 use zvidlib::{
     AudioBuffer, AudioGapless, AudioOutputBackend, AudioSampleReader, CancellationToken, Codec,
     ColorRange, EncodedSample, EncoderConfig, ErrorKind, FrameIndex, IndexedPresentationTimeline,
-    Limits, Mp4AudioPacketProvider, Mp4SampleLoader, Mp4Track, NativeVorbisDecoder,
-    OnDemandAudioSource, PixelFormat, Plane, PlaybackAudioSource, PlaybackController,
-    PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource, PrefetchVideoSource, Result,
-    SampleDependency, SampleRange, TrackKind, VORBIS_PREROLL_PACKETS, VideoDimensions, VideoFrame,
+    Limits, NativeVorbisDecoder, OnDemandAudioSource, PixelFormat, Plane, PlaybackAudioSource,
+    PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
+    PrefetchVideoSource, Result, SampleDependency, SampleRange, Track, TrackAudioPacketProvider,
+    TrackKind, TrackSampleLoader, VORBIS_PREROLL_PACKETS, VideoDimensions, VideoFrame,
     VorbisConfig, WebAudioOutput, WebmDemuxer, WebmDemuxerOptions,
 };
 
@@ -132,7 +132,7 @@ struct Fixture {
     name: &'static str,
     bytes: Vec<u8>,
     demuxer: WebmDemuxer,
-    track: Mp4Track,
+    track: Track,
     /// The stream's last granule position: its length once trimmed.
     granule: u64,
 }
@@ -239,7 +239,7 @@ fn a_synchronous_provider_reads_no_packet_until_decoding_and_matches_the_eager_p
         let name = fixture.name;
         let eager_packets = fixture.eager_packets();
         let bytes_read = Arc::new(Mutex::new(0));
-        let provider = Mp4AudioPacketProvider::new(
+        let provider = TrackAudioPacketProvider::new(
             fixture.track.clone(),
             CountingSource {
                 inner: MemorySource::new(fixture.bytes.clone()),
@@ -336,7 +336,7 @@ impl Future for YieldOnce {
 
 /// The budget a test's loader may hold: a quarter of the track's packets,
 /// and at least four of the largest, so it holds a packet with its preroll.
-fn budget(track: &Mp4Track) -> u64 {
+fn budget(track: &Track) -> u64 {
     let total: u64 = track
         .samples
         .iter()
@@ -360,7 +360,7 @@ fn an_on_demand_audio_source_loads_packets_as_reads_reach_them() {
     for fixture in fixtures() {
         let name = fixture.name;
         let budget = budget(&fixture.track);
-        let loader = Mp4SampleLoader::new(
+        let loader = TrackSampleLoader::new(
             fixture.track.clone(),
             SuspendingSource::new(fixture.bytes.clone()),
             budget,
@@ -478,7 +478,7 @@ where
 fn playback_plays_and_seeks_with_vorbis_audio_over_a_suspending_source() {
     for fixture in fixtures() {
         let name = fixture.name;
-        let loader = Mp4SampleLoader::new(
+        let loader = TrackSampleLoader::new(
             fixture.track.clone(),
             SuspendingSource::new(fixture.bytes.clone()),
             budget(&fixture.track),

@@ -16,8 +16,8 @@ use zvidlib::{
     AudioBuffer, AudioDecoder, AudioOutputBackend, AudioSampleReader, CancellationToken,
     CodecProfile, ColorRange, EncodedAudioSample, ErrorKind, ExactFrameReader, FrameIndex,
     HardwarePreference, IndexedPresentationTimeline, Limits, Mp4Demuxer, Mp4DemuxerOptions,
-    Mp4SampleLoader, Mp4SampleProvider, Mp4Track, NativeAudioOutput, OnDemandAudioSource,
-    OnDemandVideoSource, PixelFormat, PlaybackController, PlaybackOptions, Result, TrackKind,
+    NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PixelFormat, PlaybackController,
+    PlaybackOptions, Result, Track, TrackKind, TrackSampleLoader, TrackSampleProvider,
     VideoDecoderConfig, VideoFrame, WebAudioOutput, native_hevc_video_decoder_factory,
 };
 
@@ -138,8 +138,8 @@ impl AudioOutputBackend for Backend {
 struct Bundled {
     bytes: Vec<u8>,
     movie_timescale: u32,
-    video: Mp4Track,
-    audio: Mp4Track,
+    video: Track,
+    audio: Track,
 }
 
 fn bundled() -> Bundled {
@@ -175,7 +175,7 @@ fn video_limits() -> Limits {
     }
 }
 
-fn video_configuration(track: &Mp4Track) -> VideoDecoderConfig {
+fn video_configuration(track: &Track) -> VideoDecoderConfig {
     VideoDecoderConfig {
         codec: track.codec,
         profile: CodecProfile::HevcMain,
@@ -235,7 +235,7 @@ impl Bundled {
     }
 
     fn timeline(&self) -> IndexedPresentationTimeline {
-        IndexedPresentationTimeline::from_mp4_track(
+        IndexedPresentationTimeline::from_track(
             &self.video,
             self.audio.audio_sample_rate().unwrap(),
             &Limits::default(),
@@ -291,7 +291,7 @@ fn playback_plays_and_seeks_through_a_synchronous_on_demand_video_provider() {
     let video = ExactFrameReader::from_provider(
         &native_hevc_video_decoder_factory(),
         video_configuration(&bundled.video),
-        Box::new(Mp4SampleProvider::new(bundled.video.clone(), cache).unwrap()),
+        Box::new(TrackSampleProvider::new(bundled.video.clone(), cache).unwrap()),
         video_limits(),
     )
     .unwrap();
@@ -372,7 +372,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         .map(|sample| u64::from(sample.size))
         .sum();
     assert!(video_budget < total_video_bytes / 10);
-    let video_loader = Mp4SampleLoader::new(
+    let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         video_budget,
@@ -387,7 +387,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
     .unwrap();
     let video = OnDemandVideoSource::new(video_reader, video_loader, 16);
 
-    let audio_loader = Mp4SampleLoader::new(
+    let audio_loader = TrackSampleLoader::new(
         bundled.audio.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         256 * 1024,
@@ -465,7 +465,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
 #[test]
 fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
     let bundled = bundled();
-    let video_loader = Mp4SampleLoader::new(
+    let video_loader = TrackSampleLoader::new(
         bundled.video.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         8 * 1024 * 1024,
@@ -478,7 +478,7 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
         video_limits(),
     )
     .unwrap();
-    let audio_loader = Mp4SampleLoader::new(
+    let audio_loader = TrackSampleLoader::new(
         bundled.audio.clone(),
         SuspendingSource::new(bundled.bytes.clone()),
         256 * 1024,
