@@ -3459,30 +3459,34 @@ mod tests {
         }
     }
 
+    /// Issue #653: an HEVC output finishes with the `hvcC` the browser's
+    /// encoder described, and reads back frame-exactly. Each frame carries a
+    /// white bar six pixels further right than the last, so the bar's
+    /// position names the frame that decoded.
     #[wasm_bindgen_test(async)]
-    async fn put_encodes_hevc_through_webcodecs_into_a_playable_mp4() {
+    async fn put_encodes_hevc_through_webcodecs_into_a_frame_exact_mp4() {
+        const WIDTH: u32 = 640;
+        const HEIGHT: u32 = 360;
+        const FRAMES: u64 = 90;
+        const BAR: u32 = 6;
         if !video_encode_support(None, Some("hevc".to_owned())).unwrap() {
             return;
         }
-        let options = WasmCreateOptions::new(None).unwrap();
-        let output = WasmMediaOutput {
-            bytes: Vec::new(),
-            mime_type: options.mime_type,
-            container: options.container,
-            max_output_bytes: options.max_output_bytes,
-            state: Rc::new(Cell::new(false)),
-            timeline: None,
-            video_timescale: 30,
-            video_frame_duration: 1,
-            video_codec: Codec::Hevc,
-            browser_video_tracks: Rc::new(RefCell::new(BTreeMap::new())),
-            browser_audio: Rc::new(RefCell::new(BrowserAudioTrack::new(Codec::Aac))),
-            cover_art: None,
-            cover_source: CoverSource::default(),
-        };
+        let mut options = WasmCreateOptions::new(Some("mp4".to_owned())).unwrap();
+        options.set_video_codec("hevc".to_owned()).unwrap();
+        let mut output = browser_output(&options);
         let video = output.video(0).unwrap();
-        let frame = WasmVideoFrame::rgba(4, 4, owned_u8_array(&[128_u8; 4 * 4 * 4])).unwrap();
-        for frame_index in 0..3_u64 {
+        for frame_index in 0..FRAMES {
+            let left = frame_index as u32 * BAR;
+            let mut pixels = vec![16_u8; (WIDTH * HEIGHT * 4) as usize];
+            for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                if (left..left + BAR).contains(&(index as u32 % WIDTH)) {
+                    pixel.copy_from_slice(&[235, 235, 235, 255]);
+                } else {
+                    pixel[3] = 255;
+                }
+            }
+            let frame = WasmVideoFrame::rgba(WIDTH, HEIGHT, owned_u8_array(&pixels)).unwrap();
             if let Err(error) =
                 JsFuture::from(video.put(BigInt::from(frame_index).into(), &frame, None)).await
             {
@@ -3493,21 +3497,71 @@ mod tests {
                 return;
             }
         }
-        let mut output = output;
         let blob: Blob = JsFuture::from(output.finish())
             .await
-            .unwrap()
+            .expect("an HEVC output must finish with the encoder's hvcC")
             .unchecked_into();
         let bytes = Uint8Array::new(&JsFuture::from(blob.array_buffer()).await.unwrap()).to_vec();
-        let demuxer = crate::Mp4Demuxer::open(
-            &MemorySource::new(bytes),
-            crate::Mp4DemuxerOptions::default(),
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = crate::Mp4Demuxer::open(&source, crate::Mp4DemuxerOptions::default())
+            .await
+            .expect("the browser-encoded output must be a parseable MP4");
+        assert_eq!(demuxer.tracks.len(), 1);
+        let track = &demuxer.tracks[0];
+        assert_eq!(track.codec, Codec::Hevc);
+        assert_eq!(track.samples.len(), FRAMES as usize);
+        let config = &track.decoder_config;
+        assert_eq!(&config[4..8], b"hvcC");
+        let record = zvidlib_hevc_syntax::parse_hvcc(&config[8..]).unwrap();
+        let parameter_sets: Vec<u8> = record
+            .nal_units
+            .iter()
+            .map(|unit| unit.header.nal_unit_type)
+            .collect();
+        assert_eq!(parameter_sets, [32, 33, 34], "VPS, SPS and PPS");
+        // The samples are framed with the length size the hvcC declares.
+        let mut first = vec![0; track.samples[0].size as usize];
+        track
+            .read_sample_into(&source, 0, &mut first)
+            .await
+            .unwrap();
+        let units = zvidlib_hevc_syntax::split_length_prefixed(&first, record.length_size)
+            .expect("the first sample is length-prefixed as its hvcC declares");
+        assert!(units.iter().any(|unit| unit.header.is_vcl()));
+
+        let input = WasmMediaInput::open_inner(
+            Uint8Array::from(bytes.as_slice()).into(),
+            Limits::default().max_allocation_bytes,
+            None,
         )
         .await
-        .expect("the browser-encoded output must be a parseable MP4");
-        assert_eq!(demuxer.tracks.len(), 1);
-        assert_eq!(demuxer.tracks[0].codec, Codec::Hevc);
-        assert_eq!(demuxer.tracks[0].samples.len(), 3);
+        .unwrap();
+        let video = input.video(0).unwrap();
+        let frame = match JsFuture::from(video.get(BigInt::from(45_u64).into(), None)).await {
+            Ok(frame) => frame,
+            // This browser can encode HEVC but has no decoder for it.
+            Err(error) => {
+                assert_error_code(&error, "UNSUPPORTED");
+                return;
+            }
+        };
+        let pixels = Reflect::get(&frame, &JsValue::from_str("pixels"))
+            .unwrap()
+            .unchecked_into::<Uint8Array>()
+            .to_vec();
+        assert_eq!(pixels.len(), (WIDTH * HEIGHT * 4) as usize);
+        let column_brightness = |column: u32| -> u32 {
+            (0..HEIGHT)
+                .map(|row| u32::from(pixels[((row * WIDTH + column) * 4) as usize]))
+                .sum()
+        };
+        let brightest = (0..WIDTH).max_by_key(|&column| column_brightness(column));
+        assert!(
+            (45 * BAR..46 * BAR).contains(&brightest.unwrap()),
+            "frame 45's bar spans columns {}..{}, but column {brightest:?} is brightest",
+            45 * BAR,
+            46 * BAR,
+        );
     }
 
     /// Issue #528: `videoCodec = "vp9"` encodes through WebCodecs into a
