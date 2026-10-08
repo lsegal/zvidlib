@@ -546,7 +546,12 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         self.last_presented = None;
         if self.playing {
             self.output.start(target)?;
-            self.fill_audio()?;
+            match self.fill_audio() {
+                // The seek itself is complete, and the next `present` or `pump_audio` tops the
+                // queue up from where this stopped once the source has loaded it.
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                result => result?,
+            }
         }
         Ok(())
     }

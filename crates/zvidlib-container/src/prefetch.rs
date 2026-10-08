@@ -153,35 +153,33 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
     }
 
     /// Loads every sample in `required` that is not already loaded, then up
-    /// to `readahead` samples after it while they fit in the budget alongside
-    /// `required`.
+    /// to `readahead` samples after it, as far as the budget allows.
     ///
     /// `required` is clamped to the track. Adjacent samples that are stored
     /// contiguously are read together. The samples loaded here are the most
-    /// recently used, so making room for them evicts other samples first; a
-    /// `required` run whose samples alone exceed the budget is refused with
-    /// [`ErrorKind::ResourceLimit`] rather than evicting part of itself.
+    /// recently used, so making room for them evicts other samples first.
+    ///
+    /// A `required` run larger than the whole budget - the walk to a frame
+    /// deep inside a long group of pictures - is loaded from its start for as
+    /// far as it fits, with no readahead. The reader decodes that much, reports
+    /// [`ErrorKind::WouldBlock`] for the next sample, and resumes from there,
+    /// so the run streams through the budget over several loads rather than
+    /// having to fit in it at once.
     pub async fn load(&self, required: Range<usize>, readahead: usize) -> Result<()> {
         let len = self.track.samples.len();
-        let end = required.end.min(len);
-        let start = required.start.min(end);
-        let required_bytes = self.bytes_of(start..end);
-        if required_bytes > self.cache.budget_bytes {
-            return Err(limit(
-                "the samples a request needs exceed the sample cache budget",
-            ));
-        }
-        let mut batch_bytes = required_bytes;
-        let mut ahead_end = end;
-        while ahead_end < len && ahead_end - end < readahead {
-            let size = u64::from(self.track.samples[ahead_end].size);
+        let required_end = required.end.min(len);
+        let start = required.start.min(required_end);
+        let mut batch_bytes = 0_u64;
+        let mut end = start;
+        while end < len && (end < required_end || end - required_end < readahead) {
+            let size = u64::from(self.track.samples[end].size);
             if batch_bytes + size > self.cache.budget_bytes {
                 break;
             }
             batch_bytes += size;
-            ahead_end += 1;
+            end += 1;
         }
-        self.fetch(start..ahead_end).await
+        self.fetch(start..end).await
     }
 
     /// Loads every sample a provider was asked for and did not have since the
@@ -221,13 +219,6 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
 
     pub fn budget_bytes(&self) -> u64 {
         self.cache.budget_bytes
-    }
-
-    fn bytes_of(&self, range: Range<usize>) -> u64 {
-        self.track.samples[range]
-            .iter()
-            .map(|sample| u64::from(sample.size))
-            .sum()
     }
 
     /// Loads the samples of `range` that are not resident and marks the rest
@@ -587,8 +578,11 @@ mod tests {
         assert!((12..16).all(|index| loader.is_loaded(index)));
         assert_eq!(loader.resident_bytes(), 40);
 
-        let error = block_on(loader.load(0..5, 0)).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        // A run larger than the budget loads from its start as far as it fits.
+        block_on(loader.load(0..6, 10)).unwrap();
+        assert!((0..4).all(|index| loader.is_loaded(index)));
+        assert!(!loader.is_loaded(4) && !loader.is_loaded(5));
+        assert_eq!(loader.resident_bytes(), 40);
     }
 
     #[test]
