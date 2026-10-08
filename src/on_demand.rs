@@ -112,23 +112,30 @@ pub(crate) async fn crate_video_source<S: ByteSource>(
 /// reading them, and how many of them a read decodes ahead of the first it
 /// needs. Reads no packet but an Opus track's last, whose first bytes give its
 /// length; a Vorbis track's intervals come from the first bytes the WebM
-/// demuxer recorded.
+/// demuxer recorded. Fails with [`ErrorKind::ResourceLimit`] if the loader's
+/// budget cannot hold a packet together with its preroll packets.
 pub(crate) async fn audio_packets<S: ByteSource>(
     loader: &TrackSampleLoader<S>,
 ) -> Result<(PrefetchedAudioPacketProvider, usize)> {
-    match loader.track().codec {
+    let (packets, preroll) = match loader.track().codec {
         Codec::Opus => {
             let packets = loader.opus_packet_provider().await?;
             let preroll = opus_preroll_packets(&packets);
-            Ok((packets, preroll))
+            (packets, preroll)
         }
-        Codec::Aac => Ok((loader.aac_packet_provider()?, AAC_PREROLL_PACKETS)),
-        Codec::Vorbis => Ok((loader.vorbis_packet_provider()?, VORBIS_PREROLL_PACKETS)),
-        _ => Err(Error::new(
-            ErrorKind::Unsupported,
-            "on-demand playback supports AAC, Opus and Vorbis audio tracks",
-        )),
-    }
+        Codec::Aac => (loader.aac_packet_provider()?, AAC_PREROLL_PACKETS),
+        Codec::Vorbis => (loader.vorbis_packet_provider()?, VORBIS_PREROLL_PACKETS),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "on-demand playback supports AAC, Opus and Vorbis audio tracks",
+            ));
+        }
+    };
+    // A budget that cannot hold a packet with its preroll would load the same
+    // prefix of a read's packets on every prefetch, forever (issue #694).
+    loader.check_audio_budget(&packets, preroll)?;
+    Ok((packets, preroll))
 }
 
 /// How many packets an Opus read decodes ahead of the first one it needs:

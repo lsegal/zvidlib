@@ -241,6 +241,53 @@ impl<S: ByteSource> TrackSampleLoader<S> {
         self.audio_packet_provider(decoded_ranges)
     }
 
+    /// The smallest budget an [`AudioSampleReader`] over `packets`, decoding
+    /// `preroll_packets` packets ahead of the first one a request needs, can
+    /// make progress through: the largest run of a packet that decodes
+    /// samples together with its preroll packets.
+    ///
+    /// The reader keeps nothing it decodes as preroll, nor a packet that
+    /// decodes no samples, so a request that resets the decoder must find its
+    /// first packet and every preroll packet before it loaded at once. With
+    /// less than this, the loader loads the same prefix of such a run on
+    /// every [`Self::load`] and the reader reports
+    /// [`ErrorKind::WouldBlock`] for the rest of it each time (issue #694).
+    ///
+    /// [`AudioSampleReader`]: crate::audio::AudioSampleReader
+    pub fn audio_budget_floor(
+        &self,
+        packets: &PrefetchedAudioPacketProvider,
+        preroll_packets: usize,
+    ) -> u64 {
+        let mut prefix = Vec::with_capacity(self.track.samples.len() + 1);
+        prefix.push(0_u64);
+        for sample in &self.track.samples {
+            prefix.push(prefix[prefix.len() - 1] + u64::from(sample.size));
+        }
+        (0..packets.len())
+            .filter(|&index| !packets.decoded_range(index).is_empty())
+            .map(|index| prefix[index + 1] - prefix[index.saturating_sub(preroll_packets)])
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Fails with [`ErrorKind::ResourceLimit`] if the budget is below
+    /// [`Self::audio_budget_floor`], so a reader over `packets` could never
+    /// load the packets one of its requests decodes. Reads no packet data.
+    pub fn check_audio_budget(
+        &self,
+        packets: &PrefetchedAudioPacketProvider,
+        preroll_packets: usize,
+    ) -> Result<()> {
+        if self.cache.budget_bytes < self.audio_budget_floor(packets, preroll_packets) {
+            return Err(limit(
+                "the sample cache budget cannot hold an audio packet together with its preroll \
+                 packets",
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads every sample in `required` that is not already loaded, then up
     /// to `readahead` samples after it, as far as the budget allows.
     ///
@@ -772,5 +819,36 @@ mod tests {
         assert_eq!(provider.read(2).unwrap_err().kind(), ErrorKind::WouldBlock);
         block_on(loader.load_missing()).unwrap();
         assert_eq!(provider.read(2).unwrap().as_ref(), &[2; 4]);
+    }
+
+    /// Issue #694: the floor is the largest run of a packet that decodes
+    /// samples and its preroll packets, so a first packet that decodes nothing,
+    /// as a Vorbis stream's does, only counts as another packet's preroll.
+    #[test]
+    fn an_audio_budget_must_hold_a_packet_with_its_preroll() {
+        let (mut track, source) = track_and_source(&[40, 10, 20, 30, 5]);
+        track.kind = TrackKind::Audio;
+        let loader = TrackSampleLoader::new(track, source, 40).unwrap();
+        let mut start = 0;
+        let ranges: Vec<_> = [0, 64, 128, 128, 64]
+            .into_iter()
+            .map(|length| {
+                start += length;
+                SampleRange::new(start - length, start).unwrap()
+            })
+            .collect();
+        let provider = loader.audio_packet_provider(ranges).unwrap();
+        // With no preroll, packet 0's 40 bytes never need to be loaded.
+        assert_eq!(loader.audio_budget_floor(&provider, 0), 30);
+        // Packets 0 and 1.
+        assert_eq!(loader.audio_budget_floor(&provider, 1), 50);
+        // Packets 1, 2 and 3 rather than 0, 1 and 2.
+        assert_eq!(loader.audio_budget_floor(&provider, 2), 70);
+        assert_eq!(loader.audio_budget_floor(&provider, usize::MAX), 105);
+        loader.check_audio_budget(&provider, 0).unwrap();
+        assert_eq!(
+            loader.check_audio_budget(&provider, 1).unwrap_err().kind(),
+            ErrorKind::ResourceLimit
+        );
     }
 }

@@ -224,7 +224,9 @@ impl<D: crate::AudioDecoder, S: ByteSource> OnDemandAudioSource<D, S> {
     /// `reader` must have been built with [`crate::AudioSampleReader::from_provider`] over
     /// `loader`'s [`TrackSampleLoader::audio_packet_provider`]. A prefetch loads up to
     /// `readahead_packets` packets past the run the requested range needs, as far as the
-    /// loader's budget allows.
+    /// loader's budget allows. The budget must pass [`TrackSampleLoader::check_audio_budget`]
+    /// for the reader's provider and preroll count, or a read that resets the decoder may
+    /// never find its packets loaded together.
     pub fn new(
         reader: crate::AudioSampleReader<D>,
         loader: TrackSampleLoader<S>,
