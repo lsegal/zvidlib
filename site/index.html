@@ -118,6 +118,7 @@ draw(frame.pixels, frame.width, frame.height);</code></pre>
           <p class="small muted">
             Drag the timeline: the nearest seek preview draws at once, then the exact frame replaces it.
             The clip is a single 768-frame group of pictures, so every exact frame depends on every frame before it.
+            Play reads the clip's AAC soundtrack in exact sample ranges with <code>audio.getRange()</code> and keeps the picture in step with it.
             Sample: <a href="https://peach.blender.org/">Big Buck Bunny</a> © Blender Foundation, CC BY 3.0.
           </p>
         </div>

@@ -1,14 +1,21 @@
 // The landing page's live demo, running on zvidlib's WebAssembly package (`../pkg`, built by the
 // Docs workflow with `wasm-pack build --target web --features web`).
 //
-// Two panels: a frame-exact scrubber over the bundled Big Buck Bunny AV1 sample, and a recorder
-// that encodes an animated canvas to MP4 or WebM and reads a frame back out of the file it wrote.
+// Two panels: a frame-exact scrubber over the bundled Big Buck Bunny AV1 sample, which plays the
+// clip's AAC soundtrack alongside it, and a recorder that encodes an animated canvas to MP4 or WebM
+// and reads a frame back out of the file it wrote.
 
 const SAMPLE_URL = "media/BigBuckBunny.av1.mp4";
 const RECORD_FRAMES = 90;
 const RECORD_FPS = 30;
 const SAMPLE_RATE = 48_000;
 const READBACK_FRAME = 45;
+// How much of the soundtrack each audio read decodes, and how far ahead of the clock playback
+// keeps it scheduled.
+const AUDIO_SLICE_SECONDS = 0.5;
+const AUDIO_LEAD_SECONDS = 1;
+// The Web Audio clock starts this far after Play, so the first slice is decoded before it is due.
+const AUDIO_START_DELAY_SECONDS = 0.15;
 
 // What each encoder is asked about before it is offered, so a codec this browser cannot encode
 // is shown as unavailable instead of failing halfway through a recording.
@@ -91,6 +98,27 @@ async function startScrubber() {
   timeline.max = String(last);
   const formatTime = (ms) => `${Math.floor(ms / 60000)}:${((ms / 1000) % 60).toFixed(3).padStart(6, "0")}`;
 
+  // The clip's soundtrack, read through zvidlib's exact sample ranges and scheduled on the Web Audio
+  // clock. The picture runs on the page's clock from the moment the first sample is heard.
+  let sound = null;
+  try {
+    const track = input.audio(0);
+    const config = await track.decoderConfig();
+    sound = {
+      track,
+      codec: config.codec.startsWith("mp4a") ? "AAC" : config.codec.startsWith("opus") ? "Opus" : config.codec,
+      rate: config.sampleRate,
+      channels: config.numberOfChannels,
+      length: Number(await track.sampleCount()),
+    };
+  } catch {
+    sound = null;
+  }
+  let audioContext = null;
+  let audioSources = [];
+  let audioOrigin = 0;
+  let audioRun = 0;
+
   let shown = -1;
   let wanted = 0;
   let decoding = false;
@@ -171,14 +199,77 @@ async function startScrubber() {
     pump();
   }
 
+  // Decodes the soundtrack from startMs in slices and schedules each one to be heard at the moment
+  // its first sample is due on the audio clock, a little ahead of time. A newer run (a pause, seek
+  // or loop) ends this one.
+  async function playSound(startMs, run) {
+    const first = Math.round((startMs / 1000) * sound.rate);
+    const slice = Math.round(AUDIO_SLICE_SECONDS * sound.rate);
+    let next = first;
+    try {
+      while (run === audioRun && next < sound.length) {
+        const at = audioOrigin + (next - first) / sound.rate;
+        if (at - audioContext.currentTime > AUDIO_LEAD_SECONDS) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        const end = Math.min(sound.length, next + slice);
+        const decoded = await sound.track.getRange(BigInt(next), BigInt(end));
+        const samples = decoded.samples;
+        const channels = decoded.channels;
+        const frames = samples.length / channels;
+        decoded.free();
+        if (run !== audioRun) return;
+        const buffer = audioContext.createBuffer(channels, frames, sound.rate);
+        for (let channel = 0; channel < channels; channel++) {
+          const data = buffer.getChannelData(channel);
+          for (let i = 0; i < frames; i++) data[i] = samples[i * channels + channel];
+        }
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        // A slice that arrives late starts part-way through, and one that arrives too late is skipped.
+        const late = audioContext.currentTime - at;
+        if (late < buffer.duration) {
+          source.start(Math.max(at, audioContext.currentTime), Math.max(0, late));
+          source.onended = () => (audioSources = audioSources.filter((playing) => playing !== source));
+          audioSources.push(source);
+        }
+        next = end;
+      }
+    } catch (error) {
+      if (run === audioRun) status.textContent = `audio.getRange() rejected: ${errorText(zvid, error)}`;
+    }
+  }
+
+  function stopSound() {
+    audioRun++;
+    for (const source of audioSources) source.stop();
+    audioSources = [];
+  }
+
+  function beginPlayback(frame, now) {
+    playStartFrame = frame;
+    playStartedAt = now;
+    if (!sound || !audioContext) return;
+    stopSound();
+    audioOrigin = audioContext.currentTime + AUDIO_START_DELAY_SECONDS;
+    // When the first sample reaches the speakers, on the page's clock. A context that is still
+    // starting up has no output timestamp yet.
+    const output = audioContext.getOutputTimestamp?.();
+    playStartedAt = output?.performanceTime
+      ? output.performanceTime + (audioOrigin - output.contextTime) * 1000
+      : now + AUDIO_START_DELAY_SECONDS * 1000;
+    playSound(starts[frame], audioRun);
+  }
+
   function tick(now) {
     if (!playing) return;
     const ms = starts[playStartFrame] + (now - playStartedAt);
     let frame = playStartFrame;
     while (frame < last && starts[frame + 1] <= ms) frame++;
     if (frame >= last) {
-      playStartFrame = 0;
-      playStartedAt = now;
+      beginPlayback(0, now);
       frame = 0;
     }
     if (frame !== wanted) {
@@ -193,9 +284,13 @@ async function startScrubber() {
     playing = next;
     play.textContent = playing ? "Pause" : "Play";
     if (playing) {
-      playStartFrame = shown < 0 || shown >= last ? 0 : shown;
-      playStartedAt = performance.now();
+      // Created on the click itself, so the browser lets it make sound.
+      if (sound && !audioContext) audioContext = new AudioContext();
+      audioContext?.resume();
+      beginPlayback(shown < 0 || shown >= last ? 0 : shown, performance.now());
       requestAnimationFrame(tick);
+    } else if (sound) {
+      stopSound();
     }
   }
 
@@ -212,6 +307,7 @@ async function startScrubber() {
   status.textContent =
     `Opened ${(Number(input.byteLength) / 1048576).toFixed(1)} MiB ${input.container?.toUpperCase()} · ` +
     `${frameCount} frames · AV1 ${canvas.width}x${canvas.height}` +
+    (sound ? ` · ${sound.channels}-channel ${sound.rate / 1000} kHz ${sound.codec} soundtrack, played with Play` : "") +
     (previews ? ` · seek previews every ${previews.stride} frames, filling in the background` : "");
   for (const control of buttons) control.disabled = false;
   seek(0);
