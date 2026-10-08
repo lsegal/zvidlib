@@ -9,6 +9,7 @@ use crate::{
     AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Limits, Result, SampleRange,
     Timeline,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// One compressed audio packet - an AAC access unit, an Opus packet or a
@@ -36,6 +37,49 @@ pub trait AudioDecoder {
 
 /// The name [`AudioDecoder`] had while AAC was the only audio codec.
 pub use self::AudioDecoder as AacDecoder;
+
+/// Supplies [`AudioSampleReader`] with compressed audio packets by index, so
+/// a reader does not have to own every packet of a track up front.
+///
+/// An owned `Vec<EncodedAudioSample>` implements this directly and is what
+/// [`AudioSampleReader::new`] wraps, so that constructor and its callers are
+/// unchanged. [`AudioSampleReader::from_provider`] accepts any other
+/// implementation, such as one that reads through a container track's index
+/// and a [`crate::io::ByteSource`] on demand.
+///
+/// `len` and `decoded_range` answer from the index alone and must not read
+/// packet data; only [`Self::read`] may do that, and only for the one packet
+/// it is asked for. A packet's decoded interval must be knowable without
+/// reading any packet's bytes: an AAC packet's comes from the track's sample
+/// durations, which this holds for. An Opus packet's own table of contents
+/// gives its interval, and a Vorbis packet's depends on the block size of the
+/// packet before it, so neither decides its boundary without the data a
+/// provider is meant not to hold; a provider for either codec is out of
+/// scope here, and `Mp4Track::to_encoded_audio_samples` remains how those
+/// tracks are read.
+///
+/// Implementations used from a decode thread must be `Send`.
+pub trait AudioPacketProvider: Send {
+    /// The number of packets.
+    fn len(&self) -> usize;
+    fn decoded_range(&self, index: usize) -> SampleRange;
+    /// Returns the compressed bytes of one packet.
+    fn read(&self, index: usize) -> Result<Cow<'_, [u8]>>;
+}
+
+impl AudioPacketProvider for Vec<EncodedAudioSample> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn decoded_range(&self, index: usize) -> SampleRange {
+        self[index].decoded_range
+    }
+
+    fn read(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        Ok(Cow::Borrowed(&self[index].data))
+    }
+}
 
 impl<D: AudioDecoder + ?Sized> AudioDecoder for Box<D> {
     fn decode(
@@ -74,7 +118,7 @@ pub struct AudioTrackTiming {
 /// Exact presentation-range access over a track's sequential audio packets.
 pub struct AudioSampleReader<D> {
     decoder: D,
-    packets: Vec<EncodedAudioSample>,
+    packets: Box<dyn AudioPacketProvider>,
     decoded: BTreeMap<u64, AudioBuffer>,
     /// Inclusive packet-index bounds of the contiguous run held in `decoded`.
     ///
@@ -108,7 +152,33 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         preroll_packets: usize,
         limits: Limits,
     ) -> Result<Self> {
-        if packets.is_empty() {
+        Self::from_provider(
+            decoder,
+            Box::new(packets),
+            sample_rate,
+            channels,
+            timing,
+            preroll_packets,
+            limits,
+        )
+    }
+
+    /// Builds a reader over any [`AudioPacketProvider`], such as one that
+    /// reads compressed bytes from a container track and a
+    /// [`crate::io::ByteSource`] on demand instead of owning every packet.
+    ///
+    /// Behaves exactly as [`Self::new`], which is this constructor with an
+    /// owned `Vec<EncodedAudioSample>` as the provider.
+    pub fn from_provider(
+        decoder: D,
+        packets: Box<dyn AudioPacketProvider>,
+        sample_rate: u32,
+        channels: u16,
+        timing: AudioTrackTiming,
+        preroll_packets: usize,
+        limits: Limits,
+    ) -> Result<Self> {
+        if packets.len() == 0 {
             return Err(invalid("an audio reader requires at least one packet"));
         }
         if sample_rate == 0 || sample_rate > limits.max_sample_rate {
@@ -118,11 +188,12 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
             return Err(limit("audio channel count is outside configured limits"));
         }
         let mut expected = 0;
-        for packet in &packets {
-            if packet.decoded_range.start != expected {
+        for index in 0..packets.len() {
+            let range = packets.decoded_range(index);
+            if range.start != expected {
                 return Err(invalid("audio packet sample intervals must be contiguous"));
             }
-            expected = packet.decoded_range.end;
+            expected = range.end;
         }
         if expected == 0 {
             return Err(invalid("audio packets decode no samples"));
@@ -194,7 +265,8 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
                     if cancellation.is_canceled() {
                         return Err(canceled());
                     }
-                    let buffer = self.decoder.decode(&self.packets[index], cancellation)?;
+                    let packet = self.packet_at(index)?;
+                    let buffer = self.decoder.decode(&packet, cancellation)?;
                     self.accept_decoded(&plan, index, buffer)?;
                 }
                 self.evict_behind(plan.first);
@@ -226,7 +298,10 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         for mapping in mappings {
             let Some(media) = mapping.media else { continue };
             if let Some(plan) = self.plan_decode(media)? {
-                let buffers = decode(plan.reset, &self.packets[plan.from..=plan.last]).await?;
+                let window = (plan.from..=plan.last)
+                    .map(|index| self.packet_at(index))
+                    .collect::<Result<Vec<_>>>()?;
+                let buffers = decode(plan.reset, &window).await?;
                 if cancellation.is_canceled() {
                     return Err(canceled());
                 }
@@ -295,6 +370,15 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         Ok(())
     }
 
+    /// Builds the owned, transient [`EncodedAudioSample`] the decoder is
+    /// given for one packet, reading its bytes from the provider.
+    fn packet_at(&self, index: usize) -> Result<EncodedAudioSample> {
+        Ok(EncodedAudioSample {
+            decoded_range: self.packets.decoded_range(index),
+            data: self.packets.read(index)?.into_owned(),
+        })
+    }
+
     fn discard_resident(&mut self) {
         self.decoded.clear();
         self.resident = None;
@@ -318,7 +402,7 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         {
             // An empty packet's buffer was never cached, and its start is the
             // key of the packet after it.
-            let range = self.packets[start].decoded_range;
+            let range = self.packets.decoded_range(start);
             if !range.is_empty()
                 && let Some(buffer) = self.decoded.remove(&range.start)
             {
@@ -369,15 +453,11 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
     /// cold, backwards, or separated by a gap - takes the reset path, which is
     /// what a real seek needs, and discards the resident run.
     fn plan_decode(&mut self, range: SampleRange) -> Result<Option<DecodePlan>> {
-        let first = self
-            .packets
-            .iter()
-            .position(|packet| packet.decoded_range.end > range.start)
+        let first = (0..self.packets.len())
+            .find(|&index| self.packets.decoded_range(index).end > range.start)
             .ok_or_else(|| invalid("audio edit maps beyond decoded samples"))?;
-        let last = self
-            .packets
-            .iter()
-            .rposition(|packet| packet.decoded_range.start < range.end)
+        let last = (0..self.packets.len())
+            .rfind(|&index| self.packets.decoded_range(index).start < range.end)
             .ok_or_else(|| invalid("audio edit maps before decoded samples"))?;
         let seek_start = first.saturating_sub(self.preroll_packets);
         if last - seek_start + 1 > self.limits.max_decode_samples_per_seek as usize {
@@ -421,8 +501,8 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         index: usize,
         buffer: AudioBuffer,
     ) -> Result<()> {
-        let packet = &self.packets[index];
-        if buffer.range != packet.decoded_range
+        let decoded_range = self.packets.decoded_range(index);
+        if buffer.range != decoded_range
             || buffer.sample_rate != self.sample_rate
             || buffer.channels != self.channels
         {
