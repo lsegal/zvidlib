@@ -1,0 +1,562 @@
+//! `OnDemandPlayer` opens an MP4 in one call, plays and seeks it within its
+//! byte budgets without the caller loading anything, and switches audio tracks
+//! by position or language mid-playback (issue #689).
+
+#![cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
+
+use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+
+use zvidlib::io::{ByteSource, FileSource, IoFuture, MemorySink, MemorySource};
+use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
+use zvidlib::transfer::{CpuFrameSource, FrameSource, Orientation};
+use zvidlib::{
+    AudioBuffer, AudioEncoderConfig, AudioEncoderFactory, AudioOutputBackend, AudioOutputOpener,
+    Codec, CodecProfile, ColorRange, ErrorKind, FrameIndex, HardwarePreference, Limits, Mp4Demuxer,
+    Mp4DemuxerOptions, NativeAudioOutput, OnDemandOptions, OnDemandPlayer, PixelFormat, Plane,
+    PlaybackAudioOutput, SampleRange, TrackKind, VideoDimensions, VideoEncoderConfig,
+    VideoEncoderFactory, VideoFrame, native_av1_video_encoder_factory,
+    native_opus_audio_encoder_factory,
+};
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+            return value;
+        }
+    }
+}
+
+const RATE: u64 = 30;
+const FRAMES: u64 = 60;
+const LANGUAGES: [&str; 3] = ["eng", "fra", "deu"];
+
+/// The gray levels of frame `index` of [`movie`], a moving gradient.
+fn gray(index: u64) -> Vec<u8> {
+    (0..18_u32)
+        .flat_map(|y| (0..32_u32).map(move |x| ((x * 7 + y * 3 + index as u32 * 5) % 256) as u8))
+        .collect()
+}
+
+/// Opus packets of `frames` stereo samples of a tone at `frequency`.
+fn opus_track(
+    frames: u64,
+    frequency: f32,
+) -> (
+    Mp4TrackConfig,
+    Vec<zvidlib::EncodedSample>,
+    zvidlib::AudioGapless,
+) {
+    let samples: Vec<f32> = (0..frames)
+        .flat_map(|i| {
+            let level = 0.3 * (2.0 * std::f32::consts::PI * frequency * i as f32 / 48_000.0).sin();
+            [level, level]
+        })
+        .collect();
+    let mut encoder = native_opus_audio_encoder_factory()
+        .create(
+            &AudioEncoderConfig {
+                codec: Codec::Opus,
+                profile: CodecProfile::Opus,
+                sample_rate: 48_000,
+                channels: 2,
+                timescale: 48_000,
+                configuration: 96_000_u32.to_be_bytes().to_vec(),
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+    let buffer = AudioBuffer::new(
+        SampleRange::new(0, frames).unwrap(),
+        48_000,
+        2,
+        samples,
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut packets = block_on(encoder.encode(FrameIndex(0), buffer)).unwrap();
+    let drain = block_on(encoder.finish()).unwrap();
+    packets.extend(drain.samples);
+    let track = Mp4TrackConfig {
+        encoder: encoder.config().clone(),
+        format: Mp4TrackFormat::Audio { channels: 2 },
+    };
+    (track, packets, drain.gapless)
+}
+
+/// Two seconds of lossless monochrome 32x18 AV1 at 30 fps, and `audio_tracks`
+/// Opus tracks beside it, each a different tone in the language
+/// [`LANGUAGES`] gives it.
+fn movie(audio_tracks: usize) -> Vec<u8> {
+    let limits = Limits::default();
+    let dimensions = VideoDimensions::new(32, 18, &limits).unwrap();
+    let mut encoder = native_av1_video_encoder_factory()
+        .create(
+            &VideoEncoderConfig {
+                codec: Codec::Av1,
+                profile: CodecProfile::Av1Main,
+                coded_dimensions: dimensions,
+                input_format: PixelFormat::Gray8,
+                color_range: ColorRange::Full,
+                hardware: HardwarePreference::Avoid,
+                timescale: RATE as u32,
+                frame_duration: 1,
+                configuration: Vec::new(),
+            },
+            &limits,
+        )
+        .unwrap();
+    let audio: Vec<_> = (0..audio_tracks)
+        .map(|index| opus_track(48_000 * FRAMES / RATE, 330.0 * (index + 1) as f32))
+        .collect();
+    let mut configs = vec![Mp4TrackConfig {
+        encoder: encoder.config().clone(),
+        format: Mp4TrackFormat::Video(dimensions),
+    }];
+    configs.extend(audio.iter().map(|(config, _, _)| config.clone()));
+    let mut muxer = block_on(Mp4Muxer::new(MemorySink::new(), configs, 100_000)).unwrap();
+    let mut video = Vec::new();
+    for index in 0..FRAMES {
+        let frame = VideoFrame::new(
+            dimensions,
+            PixelFormat::Gray8,
+            ColorRange::Full,
+            vec![Plane {
+                data: gray(index),
+                stride: dimensions.width as usize,
+            }],
+            &limits,
+        )
+        .unwrap();
+        video.extend(
+            block_on(encoder.encode(
+                FrameIndex(index),
+                FrameSource::Cpu(CpuFrameSource {
+                    frame: &frame,
+                    orientation: Orientation::TopLeft,
+                }),
+            ))
+            .unwrap(),
+        );
+    }
+    video.extend(block_on(encoder.finish()).unwrap());
+    for sample in video {
+        block_on(muxer.write_sample(0, sample)).unwrap();
+    }
+    for (index, (_, packets, gapless)) in audio.into_iter().enumerate() {
+        for packet in packets {
+            block_on(muxer.write_sample(index + 1, packet)).unwrap();
+        }
+        muxer.set_audio_gapless(index + 1, gapless).unwrap();
+    }
+    let mut bytes = block_on(muxer.finish()).unwrap().into_inner();
+    label_languages(&mut bytes);
+    bytes
+}
+
+/// Gives each audio track of [`movie`] its language from [`LANGUAGES`]: the
+/// muxer marks every track undetermined. The `mdhd` boxes come in track
+/// order, video first, and each packs its code 20 bytes into the box's
+/// version-0 body.
+fn label_languages(bytes: &mut [u8]) {
+    let boxes: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, kind)| kind == b"mdhd")
+        .map(|(at, _)| at)
+        .collect();
+    for (&at, language) in boxes.iter().skip(1).zip(LANGUAGES) {
+        assert_eq!(bytes[at + 4], 0, "the muxer writes version-0 mdhd boxes");
+        let packed = language.bytes().fold(0_u16, |packed, letter| {
+            (packed << 5) | u16::from(letter - 0x60)
+        });
+        bytes[at + 24..at + 26].copy_from_slice(&packed.to_be_bytes());
+    }
+}
+
+/// A shared clock the test moves by hand, in samples of whatever rate the
+/// output was opened at.
+#[derive(Clone, Default)]
+struct Clock(Arc<Mutex<u64>>);
+
+impl Clock {
+    fn advance(&self, samples: u64) {
+        *self.0.lock().unwrap() += samples;
+    }
+}
+
+/// What one output the player opened was asked to play.
+#[derive(Default)]
+struct Opened {
+    sample_rate: u32,
+    channels: u16,
+    scheduled: Vec<SampleRange>,
+}
+
+struct Backend {
+    clock: Clock,
+    opened: Arc<Mutex<Opened>>,
+}
+
+impl AudioOutputBackend for Backend {
+    fn clock_samples(&self) -> u64 {
+        *self.clock.0.lock().unwrap()
+    }
+    fn start(&mut self, _: u64) -> zvidlib::Result<()> {
+        Ok(())
+    }
+    fn schedule(&mut self, buffer: AudioBuffer, _: u64) -> zvidlib::Result<()> {
+        self.opened.lock().unwrap().scheduled.push(buffer.range);
+        Ok(())
+    }
+    fn cancel_queued(&mut self, _: u64) -> zvidlib::Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self) -> zvidlib::Result<()> {
+        Ok(())
+    }
+}
+
+/// Outputs on one hand-moved clock, recording each one the player opens.
+/// Every output an opener has opened, in order.
+type OpenedOutputs = Arc<Mutex<Vec<Arc<Mutex<Opened>>>>>;
+
+fn outputs(clock: &Clock) -> (AudioOutputOpener, OpenedOutputs) {
+    let all = Arc::new(Mutex::new(Vec::new()));
+    let (clock, recorded) = (clock.clone(), Arc::clone(&all));
+    let opener: AudioOutputOpener = Box::new(move |sample_rate, channels| {
+        let opened = Arc::new(Mutex::new(Opened {
+            sample_rate,
+            channels,
+            scheduled: Vec::new(),
+        }));
+        recorded.lock().unwrap().push(Arc::clone(&opened));
+        Ok(Box::new(NativeAudioOutput(Backend {
+            clock: clock.clone(),
+            opened,
+        })) as Box<dyn PlaybackAudioOutput>)
+    });
+    (opener, all)
+}
+
+fn assert_gray(frame: &VideoFrame, index: u64) {
+    let plane = &frame.planes[0];
+    let row = frame.dimensions.width as usize * 4;
+    let levels: Vec<u8> = plane
+        .data
+        .chunks(plane.stride)
+        .take(frame.dimensions.height as usize)
+        .flat_map(|line| line[..row].chunks(4).map(|pixel| pixel[0]))
+        .collect();
+    assert_eq!(levels, gray(index), "frame {index}");
+}
+
+#[test]
+fn reads_each_audio_tracks_language_from_its_media_header() {
+    let source = MemorySource::new(movie(3));
+    let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+    let languages: Vec<_> = demuxer
+        .tracks
+        .iter()
+        .map(|track| (track.kind, track.language.as_deref()))
+        .collect();
+    assert_eq!(
+        languages,
+        [
+            (TrackKind::Video, Some("und")),
+            (TrackKind::Audio, Some("eng")),
+            (TrackKind::Audio, Some("fra")),
+            (TrackKind::Audio, Some("deu")),
+        ]
+    );
+}
+
+#[test]
+fn opens_a_file_and_plays_it_without_the_caller_loading_anything() {
+    let path = std::env::temp_dir().join(format!(
+        "zvidlib-on-demand-player-{}.mp4",
+        std::process::id()
+    ));
+    std::fs::write(&path, movie(1)).unwrap();
+    let clock = Clock::default();
+    let (opener, opened) = outputs(&clock);
+    let mut player = OnDemandPlayer::with_output(
+        FileSource::open(&path).unwrap(),
+        OnDemandOptions::default(),
+        opener,
+    )
+    .unwrap();
+    assert_eq!(player.frame_count(), FRAMES);
+    assert_eq!(player.sample_rate(), Some(48_000));
+    assert_eq!(player.audio_track(), Some(0));
+    {
+        let opened = opened.lock().unwrap();
+        assert_eq!(opened.len(), 1);
+        let first = opened[0].lock().unwrap();
+        assert_eq!((first.sample_rate, first.channels), (48_000, 2));
+    }
+
+    assert_gray(&player.current_frame().unwrap(), 0);
+    player.play().unwrap();
+    let mut presented = Vec::new();
+    for _ in 0..20 {
+        clock.advance(48_000 / RATE);
+        if let (_, Some(frame)) = player.present().unwrap() {
+            let index = player.current_frame_index().unwrap();
+            assert_gray(&frame, index.0);
+            presented.push(index.0);
+        }
+    }
+    assert_eq!(presented, (1..=20).collect::<Vec<_>>());
+    assert!(
+        !opened.lock().unwrap()[0]
+            .lock()
+            .unwrap()
+            .scheduled
+            .is_empty()
+    );
+
+    player.seek(FrameIndex(45)).unwrap();
+    assert!(player.is_playing());
+    let (presentation, frame) = player.present().unwrap();
+    assert_eq!(presentation.frame, Some(FrameIndex(45)));
+    assert_gray(&frame.unwrap(), 45);
+    drop(player);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn switching_audio_tracks_keeps_the_frame_and_releases_the_old_tracks_packets() {
+    let clock = Clock::default();
+    let (opener, opened) = outputs(&clock);
+    let options = OnDemandOptions {
+        audio_budget_bytes: 16 * 1024,
+        ..OnDemandOptions::default()
+    };
+    let mut player =
+        OnDemandPlayer::with_output(MemorySource::new(movie(3)), options, opener).unwrap();
+    let languages: Vec<_> = player
+        .audio_tracks()
+        .iter()
+        .map(|track| track.language.clone().unwrap())
+        .collect();
+    assert_eq!(languages, LANGUAGES);
+
+    player.seek(FrameIndex(10)).unwrap();
+    player.play().unwrap();
+    clock.advance(48_000 / RATE);
+    let (presentation, _) = player.present().unwrap();
+    assert_eq!(presentation.frame, Some(FrameIndex(11)));
+    assert!(player.audio_resident_bytes() > 0);
+
+    player.select_audio_language("fra").unwrap();
+    assert_eq!(player.audio_track(), Some(1));
+    assert!(player.is_playing());
+    assert_eq!(player.current_frame_index().unwrap(), FrameIndex(11));
+    // Nothing of the old track is held, and nothing of the new one yet.
+    assert_eq!(player.audio_resident_bytes(), 0);
+
+    // The new track plays on its own output from the frame's interval.
+    let (presentation, _) = player.present().unwrap();
+    assert_eq!(presentation.requested_frame, FrameIndex(11));
+    assert!(player.audio_resident_bytes() > 0);
+    assert!(player.audio_resident_bytes() <= options.audio_budget_bytes);
+    {
+        let opened = opened.lock().unwrap();
+        assert_eq!(opened.len(), 2);
+        let scheduled = &opened[1].lock().unwrap().scheduled;
+        assert_eq!(scheduled.first().unwrap().start, 11 * 48_000 / RATE);
+    }
+    clock.advance(48_000 / RATE);
+    let (_, frame) = player.present().unwrap();
+    assert_gray(&frame.unwrap(), 12);
+
+    // Paused, a switch stays paused on the same frame.
+    player.pause().unwrap();
+    let paused_on = player.current_frame_index().unwrap();
+    player.select_audio_track(2).unwrap();
+    assert!(!player.is_playing());
+    assert_eq!(player.current_frame_index().unwrap(), paused_on);
+    assert_gray(&player.current_frame().unwrap(), paused_on.0);
+}
+
+#[test]
+fn refuses_an_audio_track_or_language_the_input_lacks() {
+    let clock = Clock::default();
+    let (opener, _) = outputs(&clock);
+    let bytes = movie(2);
+    let error = OnDemandPlayer::with_output(
+        MemorySource::new(bytes.clone()),
+        OnDemandOptions {
+            audio_track: 2,
+            ..OnDemandOptions::default()
+        },
+        opener,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+    let (opener, _) = outputs(&clock);
+    let mut player =
+        OnDemandPlayer::with_output(MemorySource::new(bytes), OnDemandOptions::default(), opener)
+            .unwrap();
+    assert_eq!(
+        player.select_audio_track(2).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        player.select_audio_language("deu").unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(player.audio_track(), Some(0));
+}
+
+#[test]
+fn plays_a_video_only_input_on_its_own_clock() {
+    let clock = Clock::default();
+    let (opener, opened) = outputs(&clock);
+    let mut player = OnDemandPlayer::with_output(
+        MemorySource::new(movie(0)),
+        OnDemandOptions::default(),
+        opener,
+    )
+    .unwrap();
+    assert!(opened.lock().unwrap().is_empty());
+    assert_eq!(player.sample_rate(), None);
+    assert_eq!(player.audio_track(), None);
+    player.seek(FrameIndex(30)).unwrap();
+    assert_gray(&player.current_frame().unwrap(), 30);
+    player.play().unwrap();
+    let (presentation, _) = player.present().unwrap();
+    assert!(presentation.requested_frame >= FrameIndex(30));
+}
+
+/// A source whose every read suspends once before completing, the way a
+/// network read does, so a caller that polls it once gets no answer.
+#[derive(Clone)]
+struct SuspendingSource {
+    inner: Rc<MemorySource>,
+    reads: Rc<Cell<usize>>,
+}
+
+impl ByteSource for SuspendingSource {
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+
+    fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
+        self.reads.set(self.reads.get() + 1);
+        Box::pin(async move {
+            YieldOnce(false).await;
+            self.inner.read_at(offset, destination).await
+        })
+    }
+}
+
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+#[test]
+fn waits_on_a_source_whose_reads_suspend() {
+    let clock = Clock::default();
+    let (opener, _) = outputs(&clock);
+    let source = SuspendingSource {
+        inner: Rc::new(MemorySource::new(movie(1))),
+        reads: Rc::new(Cell::new(0)),
+    };
+    let mut player =
+        OnDemandPlayer::with_output(source.clone(), OnDemandOptions::default(), opener).unwrap();
+    player.play().unwrap();
+    for index in 1..=5 {
+        clock.advance(48_000 / RATE);
+        let (_, frame) = player.present().unwrap();
+        assert_gray(&frame.unwrap(), index);
+    }
+    assert!(source.reads.get() > 0);
+}
+
+/// The bundled AV1 and AAC sample, read through budgets too small for the
+/// frames and audio these seeks reach - three of its largest video samples,
+/// and about two seconds of its audio - never holds more compressed data than
+/// they allow while it plays and seeks back and forth.
+#[cfg(feature = "aac-decoder")]
+#[test]
+fn plays_and_seeks_the_bundled_sample_within_its_byte_budgets() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/media/BigBuckBunny.av1.mp4");
+    let source = FileSource::open(&path).unwrap();
+    let demuxer = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
+    let largest = |kind| {
+        let track = demuxer
+            .tracks
+            .iter()
+            .find(|track| track.kind == kind)
+            .unwrap();
+        let largest = track
+            .samples
+            .iter()
+            .map(|sample| u64::from(sample.size))
+            .max()
+            .unwrap();
+        let total: u64 = track
+            .samples
+            .iter()
+            .map(|sample| u64::from(sample.size))
+            .sum();
+        (largest, total)
+    };
+    let (largest_video, total_video) = largest(TrackKind::Video);
+    let (largest_audio, total_audio) = largest(TrackKind::Audio);
+    let options = OnDemandOptions {
+        video_budget_bytes: largest_video * 3,
+        audio_budget_bytes: largest_audio * 64,
+        max_cached_frames: 4,
+        ..OnDemandOptions::default()
+    };
+    assert!(options.video_budget_bytes < total_video / 4);
+    assert!(options.audio_budget_bytes < total_audio / 4);
+
+    let clock = Clock::default();
+    let (opener, opened) = outputs(&clock);
+    let mut player = OnDemandPlayer::with_output(source, options, opener).unwrap();
+    let rate = u64::from(player.sample_rate().unwrap());
+    let within_budgets = |player: &OnDemandPlayer| {
+        assert!(player.video_resident_bytes() <= options.video_budget_bytes);
+        assert!(player.audio_resident_bytes() <= options.audio_budget_bytes);
+    };
+    player.play().unwrap();
+    // The sample is one group of pictures, so a seek decodes every frame
+    // before its target: these stay near the start to keep the test quick,
+    // and still move back and forth across what the budgets can hold.
+    for target in [0, 48, 16, 72, 24] {
+        player.seek(FrameIndex(target)).unwrap();
+        within_budgets(&player);
+        for _ in 0..6 {
+            clock.advance(rate / 24);
+            player.present().unwrap();
+            within_budgets(&player);
+        }
+    }
+    let scheduled = opened.lock().unwrap()[0].lock().unwrap().scheduled.len();
+    assert!(scheduled > 0);
+}

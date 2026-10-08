@@ -270,6 +270,7 @@ struct TrackBuilder {
     dimensions: Option<VideoDimensions>,
     channels: Option<u16>,
     sample_rate: Option<u32>,
+    language: Option<String>,
     decoder_config: Vec<u8>,
     edits: Vec<EditMapping>,
     stts: Vec<(u32, u32)>,
@@ -530,12 +531,29 @@ fn parse_mdhd(payload: &[u8], track: &mut TrackBuilder) -> Result<()> {
         return Err(malformed("track timescale is zero"));
     }
     track.timescale = Some(timescale);
-    track.duration = if version == 0 {
-        u64::from(be_u32(body, duration_at)?)
+    let language_at = if version == 0 {
+        track.duration = u64::from(be_u32(body, duration_at)?);
+        duration_at + 4
     } else {
-        be_u64(body, duration_at)?
+        track.duration = be_u64(body, duration_at)?;
+        duration_at + 8
     };
+    // A box cut short before its language still gives the timing.
+    track.language = be_u16(body, language_at).ok().and_then(iso_639_language);
     Ok(())
+}
+
+/// The three-letter code `mdhd` packs into 15 bits, five per letter, each
+/// stored as its offset from 0x60; `None` unless all three are lowercase
+/// letters.
+fn iso_639_language(packed: u16) -> Option<String> {
+    [10_u16, 5, 0]
+        .iter()
+        .map(|shift| {
+            let letter = char::from(((packed >> shift) & 0x1f) as u8 + 0x60);
+            letter.is_ascii_lowercase().then_some(letter)
+        })
+        .collect()
 }
 
 fn parse_hdlr(payload: &[u8], track: &mut TrackBuilder) -> Result<()> {
@@ -894,6 +912,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Tr
         dimensions: b.dimensions,
         channels: b.channels,
         sample_rate: b.sample_rate,
+        language: b.language,
         decoder_config: b.decoder_config,
         edits: b.edits,
         samples: b.samples,
@@ -1747,6 +1766,17 @@ mod tests {
         }
     }
 
+    /// Issue #689: `mdhd` packs a track's ISO 639-2 code five bits a letter,
+    /// and anything but three lowercase letters is no code at all.
+    #[test]
+    fn mdhd_languages_unpack_to_their_codes() {
+        assert_eq!(iso_639_language(0x15c7).as_deref(), Some("eng"));
+        assert_eq!(iso_639_language(0x55c4).as_deref(), Some("und"));
+        assert_eq!(iso_639_language(0x1a41).as_deref(), Some("fra"));
+        assert_eq!(iso_639_language(0), None);
+        assert_eq!(iso_639_language(0x7fff), None);
+    }
+
     #[test]
     fn fragmented_mp4_expands_decode_and_presentation_indexes_incrementally() {
         block_on(async {
@@ -2126,6 +2156,7 @@ mod tests {
             dimensions: None,
             channels: Some(2),
             sample_rate: Some(OPUS_SAMPLE_RATE),
+            language: None,
             decoder_config: OpusHead::new(2, 312, 48_000).unwrap().to_dops(),
             edits: Vec::new(),
             presentation_order: (0..packets.len()).collect(),
