@@ -1517,6 +1517,56 @@ mod tests {
         }
     }
 
+    /// Issue #655: reads paced like playback, with time between them for the
+    /// decoder to run ahead, continue one decode session instead of resetting
+    /// it. Evicting by age closed the frames the decoder emitted ahead of each
+    /// read, so on this single group of pictures every other read re-decoded
+    /// the track from frame 0.
+    #[wasm_bindgen_test(async)]
+    async fn paced_sequential_reads_keep_the_frames_the_decoder_ran_ahead_to() {
+        const COLOR_AV1: &[u8] = include_bytes!("../examples/media/BigBuckBunny.av1.mp4");
+        let mut session = WebVideoDecodeSession::open(COLOR_AV1, 0, &Limits::default())
+            .await
+            .unwrap();
+        if session.is_software() {
+            return;
+        }
+        for frame in 0..24 {
+            let index = FrameIndex(frame);
+            if frame > 0 {
+                let DecodeBackend::WebCodecs(decoder) = &session.backend else {
+                    unreachable!("checked above");
+                };
+                let position = decoder.decode_position_by_presentation[&index];
+                assert!(
+                    decoder.cache.contains_key(&index)
+                        || can_continue_session(
+                            decoder.next_decode_position,
+                            decoder.session_start,
+                            decoder.nearest_random_access(position),
+                            &decoder.published_since_reset,
+                            index,
+                        ),
+                    "reading frame {frame} would reset the decoder"
+                );
+            }
+            session
+                .get(index, &CancellationToken::new())
+                .await
+                .unwrap_or_else(|error| panic!("frame {frame}: {error:?}"));
+            let pause = js_sys::Promise::new(&mut |resolve, _reject| {
+                let set_timeout: js_sys::Function =
+                    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+                        .unwrap()
+                        .unchecked_into();
+                set_timeout
+                    .call2(&JsValue::NULL, &resolve, &JsValue::from_f64(40.0))
+                    .unwrap();
+            });
+            JsFuture::from(pause).await.unwrap();
+        }
+    }
+
     /// Issue #527: a VP9 track (libvpx's two-pass encode of the bundled
     /// sample, whose superframes carry hidden alternate reference frames)
     /// decodes through the fallback to exactly the frames libvpx decodes it
