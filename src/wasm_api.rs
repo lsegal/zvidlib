@@ -37,7 +37,7 @@ use web_sys::{AbortSignal, Blob};
 #[cfg(test)]
 use web_sys::ReadableStream;
 
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[wasm_bindgen(module = "/js/browser.js")]
 extern "C" {
@@ -85,7 +85,7 @@ fn error_code_for_kind(kind: ErrorKind) -> &'static str {
     }
 }
 
-fn js_error(kind: ErrorKind, message: impl AsRef<str>) -> JsValue {
+pub(crate) fn js_error(kind: ErrorKind, message: impl AsRef<str>) -> JsValue {
     make_error(error_code_for_kind(kind), message.as_ref())
 }
 
@@ -128,7 +128,7 @@ fn check_signal(signal: Option<&AbortSignal>) -> Result<(), JsValue> {
     }
 }
 
-fn parse_u64(value: &JsValue, field: &str) -> Result<u64, JsValue> {
+pub(crate) fn parse_u64(value: &JsValue, field: &str) -> Result<u64, JsValue> {
     if value.is_bigint() {
         return BigInt::new(value)
             .ok()
@@ -202,7 +202,7 @@ fn parse_allocation_limit(value: Option<&JsValue>, field: &str) -> Result<u64, J
     Ok(limit)
 }
 
-fn property(target: &JsValue, name: &str) -> Result<Option<JsValue>, JsValue> {
+pub(crate) fn property(target: &JsValue, name: &str) -> Result<Option<JsValue>, JsValue> {
     let value = Reflect::get(target, &JsValue::from_str(name))
         .map_err(|error| normalize_browser_error(error, &format!("reading option {name}")))?;
     if value.is_null() || value.is_undefined() {
@@ -239,7 +239,7 @@ fn parse_playback_options(options: Option<JsValue>) -> Result<WasmPlaybackOption
     })
 }
 
-fn bigint_u64(value: u64) -> JsValue {
+pub(crate) fn bigint_u64(value: u64) -> JsValue {
     BigInt::from(value).into()
 }
 
@@ -247,7 +247,7 @@ fn bigint_i64(value: i64) -> JsValue {
     BigInt::from(value).into()
 }
 
-fn owned_u8_array(bytes: &[u8]) -> Uint8Array {
+pub(crate) fn owned_u8_array(bytes: &[u8]) -> Uint8Array {
     Uint8Array::from(bytes)
 }
 
@@ -255,7 +255,7 @@ fn owned_f32_array(samples: &[f32]) -> Float32Array {
     Float32Array::from(samples)
 }
 
-fn ensure_open(state: &Rc<Cell<bool>>) -> Result<(), JsValue> {
+pub(crate) fn ensure_open(state: &Rc<Cell<bool>>) -> Result<(), JsValue> {
     if state.get() {
         Err(js_error(
             ErrorKind::InvalidState,

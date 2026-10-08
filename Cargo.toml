@@ -284,6 +284,9 @@ web-sys = { version = "0.3.104", optional = true, features = [
     # The Web Audio types only the browser tests use, to have Chrome's own media
     # stack decode an Opus MP4 zvidlib wrote.
     "AudioBuffer",
+    # Scheduling decoded audio on a Web Audio context's clock, for on-demand
+    # playback (issue #677).
+    "AudioBufferSourceNode",
     "AudioData",
     "AudioDataCopyToOptions",
     "AudioDataInit",
@@ -291,10 +294,13 @@ web-sys = { version = "0.3.104", optional = true, features = [
     "AudioDecoderConfig",
     "AudioDecoderInit",
     "AudioDecoderSupport",
+    "AudioDestinationNode",
     "AudioEncoder",
     "AudioEncoderConfig",
     "AudioEncoderInit",
+    "AudioNode",
     "AudioSampleFormat",
+    "AudioScheduledSourceNode",
     "BaseAudioContext",
     "Blob",
     "EncodedAudioChunk",

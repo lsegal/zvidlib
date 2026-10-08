@@ -192,6 +192,33 @@ try {
 input.close();
 ```
 
+Play and seek a remote MP4 without downloading it: `OnDemandPlayback` reads only the movie header and the compressed samples playback reaches, with HTTP range requests (or from a `Blob`), into byte-budgeted caches. No call waits on the network; one that needs a sample not loaded yet throws `WOULD_BLOCK`, and `prefetch()` loads it:
+
+```js
+import init, { OnDemandPlayback, errorCode } from "zvidlib";
+
+await init();
+
+const playback = await OnDemandPlayback.open("https://example.com/clip.mp4", {
+  audioContext: new AudioContext(), // its clock times playback: create it in a click handler
+  videoBudgetBytes: 16 * 1024 * 1024,
+});
+function render() {
+  try {
+    if (!playback.isPlaying) playback.play();
+    const { picture } = playback.present(); // null until the clock reaches a new frame
+    if (picture) ctx.putImageData(new ImageData(new Uint8ClampedArray(picture.pixels), picture.width, picture.height), 0, 0);
+  } catch (error) {
+    if (errorCode(error) !== "WOULD_BLOCK") throw error;
+    playback.prefetch();
+  }
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+```
+
+The server must answer range requests and, cross-origin, expose `Content-Range` through CORS. Video decodes on zvidlib's software decoders and AAC audio through WebCodecs.
+
 Record a canvas to WebM (or `"mp4"`) with synchronized Opus audio:
 
 ```js
@@ -454,7 +481,7 @@ zvidlib's core is complete: exact reads, synchronized writes, two containers, se
 
 1. **Color AV1 encoding.** The native AV1 encoder writes 8-bit monochrome key frames. Color and inter-frame AV1 come next. Browsers already encode color AV1 through WebCodecs.
 2. **Inter-frame HEVC in pure Rust.** The software HEVC encoder writes every picture as an IDR. Hardware HEVC encoders already use inter prediction.
-3. **Playback backends.** A browser `Playback` backend (`Playback.play()` and `present()` report `UNSUPPORTED` today; [`examples/web_canvas`](examples/web_canvas) shows the equivalent loop built from `get(n)` and Web Audio), and portable native audio devices beyond default-device PCM output.
+3. **Playback backends.** A browser `Playback` backend over a `MediaInput` (`Playback.play()` and `present()` report `UNSUPPORTED` today; `OnDemandPlayback` plays a URL or `Blob` read on demand, and [`examples/web_canvas`](examples/web_canvas) shows the equivalent loop built from `get(n)` and Web Audio), WebCodecs video decoding for on-demand playback, and portable native audio devices beyond default-device PCM output.
 4. **More hardware.** Hardware encoders on Linux, hardware HEVC Main 10 decoding, and hardware AV1 decoding.
 5. **Fragmented MP4 writing** for streaming and crash-safe recording.
 6. **WebM VP8 alternate-reference frames.** A VP8 frame the encoder hid as a separate block is currently indexed as a frame of its own, and reading it fails.

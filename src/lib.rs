@@ -109,6 +109,9 @@ mod web_decoder;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod web_encoder;
 
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod web_playback;
+
 /// The browser's preview driver: the same [`previews::PreviewPass`] the native
 /// index runs, advanced one preview per idle callback instead of on a thread.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
@@ -116,6 +119,9 @@ pub mod web_previews;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub use wasm_api::*;
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub use web_playback::WasmOnDemandPlayback;
 
 #[doc(no_inline)]
 pub use api::{Capability, Error, ErrorKind, Limits, Result, Support, TransferMode};
