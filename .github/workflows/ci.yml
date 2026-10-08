@@ -528,7 +528,7 @@ jobs:
       # `samples.test.js` beside it (#441), and naming one file is how the second one would go
       # unrun. Not the bare directory - `node --test <dir>` resolves it as a module and fails.
       - name: Test the web example's pure decisions
-        run: node --test 'examples/web_canvas/*.test.js'
+        run: node --test 'examples/web_canvas/*.test.js' 'site/assets/*.test.cjs'
 
   # The browser build shares nothing with the native one - another target,
   # another feature set, another `target/` subtree - so it runs beside the other
