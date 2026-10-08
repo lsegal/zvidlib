@@ -256,8 +256,9 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
             }
             let mut bytes = vec![
                 0_u8;
-                usize::try_from(run_bytes)
-                    .map_err(|_| limit("coalesced sample read cannot be represented"))?
+                usize::try_from(run_bytes).map_err(|_| limit(
+                    "coalesced sample read cannot be represented"
+                ))?
             ];
             read_exact(&self.source, offset, &mut bytes).await?;
             let mut cache = self.cache.lock();
@@ -365,7 +366,9 @@ impl SharedCache {
     fn lock(&self) -> MutexGuard<'_, CacheState> {
         // Nothing holding the lock can leave the cache inconsistent partway,
         // so a panic elsewhere while it was held does not invalidate it.
-        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn read(&self, index: usize) -> Result<Cow<'static, [u8]>> {

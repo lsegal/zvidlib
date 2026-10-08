@@ -1303,7 +1303,12 @@ mod tests {
 
         // A cached frame needs nothing; the next one needs only its own sample; a frame in
         // another group needs the run from its random-access point.
-        assert!(reader.decode_positions_for(FrameIndex(6)).unwrap().is_empty());
+        assert!(
+            reader
+                .decode_positions_for(FrameIndex(6))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(reader.decode_positions_for(FrameIndex(7)).unwrap(), 7..8);
         assert_eq!(reader.decode_positions_for(FrameIndex(10)).unwrap(), 8..11);
         assert_eq!(reader.decode_positions_for(FrameIndex(1)).unwrap(), 0..2);

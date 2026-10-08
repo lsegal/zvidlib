@@ -607,7 +607,9 @@ struct Mapping {
 /// What one media range of a request needs.
 enum Planned {
     /// Every packet it covers is resident; `first` is the first of them.
-    Resident { first: usize },
+    Resident {
+        first: usize,
+    },
     Decode(DecodePlan),
 }
 

@@ -204,8 +204,6 @@ pub use mp4_demux::{
     AacTrackConfig, EditMapping, Mp4Demuxer, Mp4DemuxerOptions, Mp4Sample, Mp4SampleProvider,
     Mp4Track, probe_mp4,
 };
-#[doc(no_inline)]
-pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 #[cfg(feature = "opus-decoder")]
 #[doc(no_inline)]
 pub use opus::NativeOpusDecoder;
@@ -221,9 +219,12 @@ pub use output::{MediaOutput, OutputOptions};
 #[doc(no_inline)]
 pub use playback::{
     AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
-    PlaybackAudioOutput, PlaybackAudioSource, PlaybackController, PlaybackOptions,
-    PlaybackVideoSource, Presentation, WebAudioOutput,
+    OnDemandAudioSource, OnDemandVideoSource, PlaybackAudioOutput, PlaybackAudioSource,
+    PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
+    PrefetchVideoSource, Presentation, WebAudioOutput,
 };
+#[doc(no_inline)]
+pub use prefetch::{Mp4SampleLoader, PrefetchedAudioPacketProvider, PrefetchedSampleProvider};
 #[doc(no_inline)]
 pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
 #[doc(no_inline)]

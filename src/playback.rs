@@ -1,8 +1,26 @@
 //! Audio-clock-driven playback shared by native and browser adapters.
+//!
+//! Natively, a [`PlaybackController`] reads its sources synchronously: an
+//! [`crate::ExactFrameReader`] and [`crate::AudioSampleReader`] over owned samples, or over an
+//! on-demand [`crate::Mp4SampleProvider`] whose source answers immediately. The browser's main
+//! thread cannot wait for a `fetch`, so there the sources are an [`OnDemandVideoSource`] and an
+//! [`OnDemandAudioSource`], which read compressed samples only from what their
+//! [`Mp4SampleLoader`] has already loaded and report [`ErrorKind::WouldBlock`] for anything else.
+//! The controller passes that error up without losing its place, and the caller awaits
+//! [`PlaybackController::prefetch`] - which loads the run the current frame and the scheduling
+//! window need, plus a readahead - before trying again (issue #672):
+//!
+//! ```ignore
+//! match controller.present() {
+//!     Err(error) if error.kind() == ErrorKind::WouldBlock => controller.prefetch().await?,
+//!     result => draw(result?),
+//! }
+//! ```
 
+use crate::io::{ByteSource, IoFuture};
 use crate::{
-    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Result, SampleRange, Timeline,
-    VideoFrame,
+    AudioBuffer, CancellationToken, Error, ErrorKind, FrameIndex, Mp4SampleLoader, Result,
+    SampleRange, Timeline, VideoFrame,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +100,166 @@ pub trait PlaybackVideoSource {
         cancellation: &CancellationToken,
     ) -> Result<VideoFrame>;
     fn reset(&mut self) -> Result<()>;
+}
+
+/// A [`PlaybackVideoSource`] whose reads report [`ErrorKind::WouldBlock`] until what they need
+/// has been loaded, and which can load it without blocking.
+pub trait PrefetchVideoSource: PlaybackVideoSource {
+    /// Loads what [`PlaybackVideoSource::get_exact`] of `frame` reads, along with whatever an
+    /// earlier read reported missing and a readahead for playing on from `frame`.
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()>;
+}
+
+/// A [`PlaybackAudioSource`] whose reads report [`ErrorKind::WouldBlock`] until what they need
+/// has been loaded, and which can load it without blocking.
+pub trait PrefetchAudioSource: PlaybackAudioSource {
+    /// Loads what [`PlaybackAudioSource::read`] of `range` reads, along with whatever an earlier
+    /// read reported missing and a readahead for playing on past `range`.
+    fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()>;
+}
+
+/// Exact video frames decoded from compressed samples an [`Mp4SampleLoader`] loads on demand,
+/// for a byte source whose reads suspend, such as a browser `fetch`.
+///
+/// [`PlaybackVideoSource::get_exact`] never waits on the source: it reports
+/// [`ErrorKind::WouldBlock`] when a sample it needs is not loaded yet, and
+/// [`PrefetchVideoSource::prefetch`] loads it.
+pub struct OnDemandVideoSource<S> {
+    reader: crate::ExactFrameReader,
+    loader: Mp4SampleLoader<S>,
+    readahead_samples: usize,
+}
+
+impl<S: ByteSource> OnDemandVideoSource<S> {
+    /// `reader` must have been built with [`crate::ExactFrameReader::from_provider`] over
+    /// `loader`'s [`Mp4SampleLoader::sample_provider`]. A prefetch loads up to
+    /// `readahead_samples` decode-order samples past the run the requested frame needs, as far
+    /// as the loader's budget allows.
+    pub fn new(
+        reader: crate::ExactFrameReader,
+        loader: Mp4SampleLoader<S>,
+        readahead_samples: usize,
+    ) -> Self {
+        Self {
+            reader,
+            loader,
+            readahead_samples,
+        }
+    }
+
+    pub fn reader(&self) -> &crate::ExactFrameReader {
+        &self.reader
+    }
+
+    pub fn reader_mut(&mut self) -> &mut crate::ExactFrameReader {
+        &mut self.reader
+    }
+
+    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+        &self.loader
+    }
+}
+
+impl<S: ByteSource> PlaybackVideoSource for OnDemandVideoSource<S> {
+    fn get_exact(
+        &mut self,
+        frame: FrameIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<VideoFrame> {
+        self.reader.get(frame, cancellation)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.loader.clear_missing();
+        self.reader.reset()
+    }
+}
+
+impl<S: ByteSource> PrefetchVideoSource for OnDemandVideoSource<S> {
+    fn prefetch(&mut self, frame: FrameIndex) -> IoFuture<'_, ()> {
+        Box::pin(async move {
+            self.loader.load_missing().await?;
+            let positions = self.reader.decode_positions_for(frame)?;
+            self.loader.load(positions, self.readahead_samples).await
+        })
+    }
+}
+
+/// Exact audio ranges decoded from compressed packets an [`Mp4SampleLoader`] loads on demand,
+/// for a byte source whose reads suspend, such as a browser `fetch`.
+///
+/// [`PlaybackAudioSource::read`] never waits on the source: it reports
+/// [`ErrorKind::WouldBlock`] when a packet it needs is not loaded yet, and
+/// [`PrefetchAudioSource::prefetch`] loads it.
+pub struct OnDemandAudioSource<D, S> {
+    reader: crate::AudioSampleReader<D>,
+    loader: Mp4SampleLoader<S>,
+    readahead_packets: usize,
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> OnDemandAudioSource<D, S> {
+    /// `reader` must have been built with [`crate::AudioSampleReader::from_provider`] over
+    /// `loader`'s [`Mp4SampleLoader::audio_packet_provider`]. A prefetch loads up to
+    /// `readahead_packets` packets past the run the requested range needs, as far as the
+    /// loader's budget allows.
+    pub fn new(
+        reader: crate::AudioSampleReader<D>,
+        loader: Mp4SampleLoader<S>,
+        readahead_packets: usize,
+    ) -> Self {
+        Self {
+            reader,
+            loader,
+            readahead_packets,
+        }
+    }
+
+    pub fn reader(&self) -> &crate::AudioSampleReader<D> {
+        &self.reader
+    }
+
+    pub fn reader_mut(&mut self) -> &mut crate::AudioSampleReader<D> {
+        &mut self.reader
+    }
+
+    pub fn loader(&self) -> &Mp4SampleLoader<S> {
+        &self.loader
+    }
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> PlaybackAudioSource for OnDemandAudioSource<D, S> {
+    fn sample_rate(&self) -> u32 {
+        self.reader.sample_rate()
+    }
+
+    fn presentation_length(&self) -> u64 {
+        self.reader.presentation_length()
+    }
+
+    fn read(
+        &mut self,
+        range: SampleRange,
+        cancellation: &CancellationToken,
+    ) -> Result<AudioBuffer> {
+        self.reader.get_range(range, cancellation)
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.loader.clear_missing();
+        self.reader.reset()
+    }
+}
+
+impl<D: crate::AudioDecoder, S: ByteSource> PrefetchAudioSource for OnDemandAudioSource<D, S> {
+    fn prefetch(&mut self, range: SampleRange) -> IoFuture<'_, ()> {
+        Box::pin(async move {
+            self.loader.load_missing().await?;
+            for run in self.reader.packets_for_range(range)? {
+                self.loader.load(run, self.readahead_packets).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,7 +533,14 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         let preroll_start = target.saturating_sub(self.options.preroll_samples);
         if preroll_start < target {
             let preroll = crate::SampleRange::new(preroll_start, target)?;
-            let _ = self.audio.read(preroll, &self.cancellation)?;
+            match self.audio.read(preroll, &self.cancellation) {
+                // The preroll only warms the decoder up, and an audio reader decodes its own
+                // preroll packets after a reset anyway, so an on-demand source that has not
+                // loaded it yet does not hold the seek up.
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
         }
         self.queued_until = target;
         self.last_presented = None;
@@ -483,6 +668,35 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
             let buffer = self.audio.read(range, &self.cancellation)?;
             self.output.schedule(buffer, self.generation)?;
             self.queued_until = end;
+        }
+        Ok(())
+    }
+}
+
+impl<V: PrefetchVideoSource, A: PrefetchAudioSource, O: PlaybackAudioOutput>
+    PlaybackController<V, A, O>
+{
+    /// Loads what the next [`Self::present`] reads - the frame the audio clock calls for now and
+    /// the audio that tops the scheduling window up - or, while paused, what
+    /// [`Self::current_frame`] and [`Self::play`] read, along with each source's readahead.
+    ///
+    /// This is the browser's way through playback: with on-demand sources, `present`, `play`
+    /// and `current_frame` report [`ErrorKind::WouldBlock`] instead of waiting for a sample to
+    /// arrive, leave the controller where it was, and succeed once this has loaded what they
+    /// were missing. Calling it ahead of time, between frames, keeps them from reporting it at
+    /// all. [`Self::seek`] itself never needs it: the only thing it reads is a preroll it can
+    /// skip.
+    pub async fn prefetch(&mut self) -> Result<()> {
+        let now = self.current_sample();
+        let frame = self.timeline.frame_for_audio_sample(now)?;
+        self.video.prefetch(frame).await?;
+        let length = self.audio.presentation_length();
+        let start = self.queued_until.max(now).min(length);
+        let end = now
+            .saturating_add(self.options.schedule_ahead_samples)
+            .min(length);
+        if start < end {
+            self.audio.prefetch(SampleRange::new(start, end)?).await?;
         }
         Ok(())
     }
