@@ -53,7 +53,7 @@ await init();
 const input = await MediaInput.open(blob);
 const video = input.video(0);
 
-// Exactly frame 4 812. Not the keyframe before it.
+// Exactly frame 4812, not the keyframe before it.
 const frame = await video.get(4812n);
 draw(frame.pixels, frame.width, frame.height);</code></pre>
       </div>

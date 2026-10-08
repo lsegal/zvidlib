@@ -213,3 +213,8 @@ td { color: #c9cdea; line-height: 1.9; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
 }
+
+@media (max-width: 640px) {
+  .hud .mono { font-size: 0.66rem; }
+  .badge { font-size: 0.62rem; }
+}

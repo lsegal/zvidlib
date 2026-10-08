@@ -20,7 +20,11 @@ const VIDEO_CODECS = {
 };
 
 const $ = (selector) => document.querySelector(selector);
-const errorText = (zvid, error) => zvid.errorCode(error) ?? error?.message ?? String(error);
+const errorText = (zvid, error) => {
+  const code = zvid.errorCode(error);
+  const message = error?.message ?? String(error);
+  return code && message !== code ? `${code}: ${message}` : (code ?? message);
+};
 
 let zvidPromise = null;
 function loadZvidlib() {
@@ -309,13 +313,15 @@ async function startRecorder() {
   status.textContent = "Loading zvidlib (WebAssembly)…";
   const zvid = await loadZvidlib();
   const available = await encodableCodecs();
+  // Codecs that reported support but then failed to encode here, so they are not offered again.
+  const failed = new Set();
 
   function fillCodecs() {
     const container = containerSelect.value;
     codecSelect.replaceChildren();
     for (const [name, codec] of Object.entries(VIDEO_CODECS)) {
       if (!codec.containers.includes(container)) continue;
-      const usable = available.has(name) && zvid.videoEncodeSupport("prefer", name);
+      const usable = available.has(name) && !failed.has(name) && zvid.videoEncodeSupport("prefer", name);
       const option = new Option(usable ? codec.label : `${codec.label} (not in this browser)`, name);
       option.disabled = !usable;
       codecSelect.append(option);
@@ -335,10 +341,11 @@ async function startRecorder() {
     start.disabled = true;
     download.hidden = true;
     const container = containerSelect.value;
+    const codec = codecSelect.value;
     let output = null;
     try {
       const options = new zvid.CreateOptions(container);
-      options.videoCodec = codecSelect.value;
+      options.videoCodec = codec;
       options.setTimeline(RECORD_FPS, 1, SAMPLE_RATE);
       let audioCodec = null;
       if (audioToggle.checked) {
@@ -368,7 +375,7 @@ async function startRecorder() {
       const blob = await output.finish();
       output = null;
       const seconds = (performance.now() - began) / 1000;
-      const codecLabel = VIDEO_CODECS[codecSelect.value].label;
+      const codecLabel = VIDEO_CODECS[codec].label;
       const audioLabel = audioCodec ? ` + ${audioCodec === "aac" ? "AAC" : "Opus"}` : "";
       status.textContent =
         `Wrote ${(blob.size / 1024).toFixed(1)} KiB ${container.toUpperCase()} (${codecLabel}${audioLabel}) ` +
@@ -400,11 +407,13 @@ async function startRecorder() {
         input.close();
       }
     } catch (error) {
-      status.textContent = `Encoding failed: ${errorText(zvid, error)}`;
       output?.close();
+      failed.add(codec);
+      fillCodecs();
+      status.textContent = `${VIDEO_CODECS[codec].label} encoding failed in this browser (${errorText(zvid, error)}). Try another codec.`;
     } finally {
       recording = false;
-      start.disabled = false;
+      start.disabled = !codecSelect.selectedOptions[0] || codecSelect.selectedOptions[0].disabled;
     }
   });
 }

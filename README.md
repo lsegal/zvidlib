@@ -440,7 +440,7 @@ The [project website](https://lsegal.github.io/zvidlib/) lives in [`site/`](site
 
 ```console
 wasm-pack build --target web --out-dir site/pkg --features web
-cp examples/media/BigBuckBunny.av1.mp4 site/media/
+mkdir -p site/media && cp examples/media/BigBuckBunny.av1.mp4 site/media/
 python -m http.server 8000 --directory site
 ```
 
