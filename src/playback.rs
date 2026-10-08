@@ -1570,6 +1570,7 @@ mod tests {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         fn run_natively<F: Future<Output = ()>>(future: F) {
             let mut future = std::pin::pin!(future);
             let mut context = Context::from_waker(std::task::Waker::noop());

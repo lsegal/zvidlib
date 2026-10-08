@@ -1233,8 +1233,9 @@ impl WasmOnDemandPlayback {
             .map(|frame| bigint_u64(frame.0))
     }
 
-    /// Starts playing from the current position. Throws `WOULD_BLOCK` until
-    /// the audio it starts with has been loaded.
+    /// Starts playing from the current position. Throws `WOULD_BLOCK`, leaving
+    /// playback paused where it was, until the audio it starts with has been
+    /// loaded.
     pub fn play(&self) -> std::result::Result<(), JsValue> {
         self.with_controller(Controller::play)
     }
