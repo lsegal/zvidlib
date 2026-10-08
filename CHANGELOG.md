@@ -4,6 +4,8 @@ All notable changes to zvidlib will be documented in this file.
 
 ## Unreleased
 
+- Links to the project website now show a rich preview image when shared on social sites, chat apps and link unfurlers (issue #665). `site/index.html` had only `og:title` and `og:description`; it now carries the full set of Open Graph and Twitter `summary_large_image` card tags, with absolute URLs, pointing at a new 1200x630 preview image that recreates the hero's headline, gradient, `scrub.js` code window and branding. `site/assets/generate_og_image.py` renders that PNG from the hero's own colors and copy, so it can be regenerated when the hero changes.
+
 ## 0.5.0 - 2026-10-08
 
 - **Breaking:** spell everything in American English, including public names (issue #657). The repository mixed British and American spellings; it now uses American spellings throughout, and `AGENTS.md` gives the rule. This renames these public items, with no deprecated aliases for the old names:
