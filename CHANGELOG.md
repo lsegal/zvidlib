@@ -5,6 +5,7 @@ All notable changes to zvidlib will be documented in this file.
 ## Unreleased
 
 - Links to the project website now show a rich preview image when shared on social sites, chat apps and link unfurlers (issue #665). `site/index.html` had only `og:title` and `og:description`; it now carries the full set of Open Graph and Twitter `summary_large_image` card tags, with absolute URLs, pointing at a new 1200x630 preview image that recreates the hero's headline, gradient, `scrub.js` code window and branding. `site/assets/generate_og_image.py` renders that PNG from the hero's own colors and copy, so it can be regenerated when the hero changes.
+- The project website's scrub demo Play/Pause button no longer changes width when its label switches, so the other controls in the row (the next-frame button, the timeline slider, and so on) no longer shift every time playback starts or stops (issue #666).
 
 ## 0.5.0 - 2026-10-08
 
