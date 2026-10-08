@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>zvidlib: frame-exact video for Rust and the browser</title>
-  <meta name="description" content="zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8, VP9, AAC, Opus and Vorbis, natively and in WebAssembly, with frame-exact indexed get and put and synchronized audio." />
+  <title>zvidlib: frame-exact video and sample-exact audio for Rust and the browser</title>
+  <meta name="description" content="zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8, VP9, AAC, Opus and Vorbis, natively and in WebAssembly, with frame-exact video, sample-exact audio reads, and audio kept in sync with every frame." />
   <meta property="og:title" content="zvidlib" />
-  <meta property="og:description" content="Frame-exact video and synchronized audio for Rust and the browser." />
+  <meta property="og:description" content="Frame-exact video and sample-exact audio for Rust and the browser: decode, encode and mux HEVC, AV1, VP8, VP9, AAC, Opus and Vorbis." />
   <meta name="theme-color" content="#0b0d17" />
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="assets/style.css" />
@@ -28,11 +28,12 @@
     <section class="hero">
       <div class="hero-copy">
         <p class="eyebrow">Rust · WebAssembly · No FFmpeg</p>
-        <h1>Frame-exact video,<br /><span class="grad">native and in the browser.</span></h1>
+        <h1>Frame-exact video and audio,<br /><span class="grad">native and in the browser.</span></h1>
         <p class="lede">
-          zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8 and VP9 video and AAC, Opus and
-          Vorbis audio, from one API on desktop and the web. Ask for frame <code>n</code> and get
-          exactly frame <code>n</code>. Write frame <code>n</code> and the audio stays in sync.
+          zvidlib decodes, encodes and muxes HEVC, AV1, VP8 and VP9 video and AAC, Opus and Vorbis
+          audio in MP4 and WebM, from one API on desktop and the web. Ask for frame <code>n</code> and
+          get exactly frame <code>n</code>; ask for a sample range and get exactly those samples.
+          Write frame <code>n</code> and the audio stays in sync.
         </p>
         <div class="cta">
           <a class="button primary" href="#demo">Try the live demo</a>
@@ -69,8 +70,8 @@ draw(frame.pixels, frame.width, frame.height);</code></pre>
         <p>A built-in seek-preview tier answers any position in constant time while the exact frame decodes behind it. That's what makes a timeline drag feel immediate.</p>
       </article>
       <article>
-        <h3>Synchronized audio</h3>
-        <p>An audio read returns exactly the samples a video frame covers. Priming, padding and edit lists are handled, so gapless round trips come back sample for sample.</p>
+        <h3>Sample-exact audio</h3>
+        <p>AAC, Opus and Vorbis decode and encode alongside the video. Read any exact sample range with <code>getRange</code>, or exactly the samples a video frame covers. Priming, padding and edit lists are handled, so gapless round trips come back sample for sample, and audio is muxed in sync with the video into MP4 and WebM.</p>
       </article>
       <article>
         <h3>One API, two targets</h3>
@@ -111,6 +112,7 @@ draw(frame.pixels, frame.width, frame.height);</code></pre>
           <button id="scrub-next" type="button" title="Next frame" aria-label="Next frame" disabled>▶︎</button>
           <input id="scrub-timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Timeline" disabled />
           <button id="scrub-random" type="button" disabled>Random frame</button>
+          <button id="scrub-mute" type="button" aria-pressed="false" disabled>Sound on</button>
         </div>
         <div class="demo-notes">
           <p id="scrub-status" class="mono small">Waiting to load…</p>

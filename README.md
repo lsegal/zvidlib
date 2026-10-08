@@ -1,6 +1,6 @@
 # zvidlib
 
-**Frame-exact video and synchronized audio for Rust and the browser.**
+**Frame-exact video and sample-exact audio for Rust and the browser.**
 
 [Website and live demo](https://lsegal.github.io/zvidlib/) ·
 [API docs](https://lsegal.github.io/zvidlib/zvidlib/) ·
@@ -8,12 +8,12 @@
 [docs.rs](https://docs.rs/zvidlib) ·
 [Releases](https://github.com/lsegal/zvidlib/releases/latest)
 
-zvidlib reads and writes MP4 and WebM with HEVC, AV1, VP8 and VP9 video and AAC, Opus and Vorbis audio. It runs natively and in WebAssembly from one API. Ask for frame `n` with `get(n)` and you get exactly frame `n`, even in streams full of B-frames and long groups of pictures. Write frame `n` with `put(n)` and zvidlib encodes it, keeps the audio aligned to it, and muxes the result into a file any player can open.
+zvidlib decodes, encodes and muxes video and audio: HEVC, AV1, VP8 and VP9 video and AAC, Opus and Vorbis audio, in MP4 and WebM. It runs natively and in WebAssembly from one API. Ask for frame `n` with `get(n)` and you get exactly frame `n`, even in streams full of B-frames and long groups of pictures. Ask for a sample range and you get exactly those samples. Write frame `n` with `put(n)` and zvidlib encodes it, keeps the audio aligned to it, and muxes the result into a file any player can open.
 
 It's built for apps that treat video as data: editors, compositors, recorders, timeline UIs, thumbnailers, and render pipelines that draw into a GL or WebGL canvas and need the file to match what was drawn.
 
 - **Frame-exact indexed `get` and `put`.** Every read returns the frame you asked for, never the nearest keyframe. zvidlib keeps decoded frames and decoder state between requests, so sequential access stays fast. A seek-preview tier answers scrubs instantly while the exact frame decodes behind it.
-- **Synchronized audio.** An audio read returns exactly the samples covered by a video frame. Priming, padding and edit lists are handled, so gapless round trips come back sample for sample.
+- **Sample-exact audio.** AAC, Opus and Vorbis decode and encode alongside the video. Read any exact sample range (`AudioSampleReader` natively, `AudioStream.getRange()` in the browser), or exactly the samples covered by a video frame. Priming, padding and edit lists are handled, so gapless round trips come back sample for sample, and audio is muxed in sync with the video into MP4 and WebM.
 - **One API, native and WebAssembly.** The same concepts work in Rust on Windows, macOS and Linux, and in JavaScript through a `wasm-bindgen` package with BigInt-safe frame indices, `Blob` and stream I/O, and stable error codes.
 - **Hardware first, pure Rust always.** zvidlib uses NVDEC, Media Foundation (NVENC, Quick Sync, AMF), VideoToolbox and browser WebCodecs when they're available. When they aren't, it falls back to its own pure-Rust codecs, which are checked against libvpx, libdav1d and FFmpeg.
 - **No FFmpeg dependency.** No C toolchain, no system codec packages, no GPL. Codecs and containers are Rust crates you can trim down to what your app uses with [Cargo features](#choosing-codecs).
