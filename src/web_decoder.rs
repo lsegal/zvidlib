@@ -18,9 +18,9 @@
 use crate::av1::{Av1CodecConfigurationRecord, Av1Obu, Av1Parser};
 use crate::codec::{
     CancellationToken, CodecProfile, EncodedVideoSample, ExactFrameReader, HardwarePreference,
-    VideoDecoderConfig, VideoDecoderFactory,
+    SampleProvider, VideoDecoderConfig, VideoDecoderFactory,
 };
-use crate::codec_config::derive_codec_string;
+use crate::codec_config::{DerivedCodecString, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
 use crate::mp4_demux::Mp4Track;
@@ -205,27 +205,10 @@ impl WebVideoDecodeSession {
             Error::new(ErrorKind::MalformedMedia, "video track has no dimensions")
         })?;
         let derived = derive_codec_string(track.codec, &track.decoder_config)?;
-        let description = codec_description(track.codec, &track.decoder_config)?;
-
-        let config = JsVideoDecoderConfig::new(&derived.codec_string);
-        config.set_coded_width(dimensions.width);
-        config.set_coded_height(dimensions.height);
-        if !description.is_empty() {
-            config.set_description_u8_array(&js_sys::Uint8Array::from(description));
-        }
-        config.set_optimize_for_latency(true);
+        let config = webcodecs_config(&track, &derived, dimensions)?;
 
         let webcodecs_supported = match choice {
-            BackendChoice::Automatic => {
-                let support: VideoDecoderSupport =
-                    JsFuture::from(js_to_promise(JsVideoDecoder::is_config_supported(&config)))
-                        .await
-                        .map_err(|error| {
-                            normalize_js_error(error, "querying WebCodecs decoder support")
-                        })?
-                        .unchecked_into();
-                support.get_supported().unwrap_or(false)
-            }
+            BackendChoice::Automatic => webcodecs_supports(&config).await?,
             #[cfg(all(test, feature = "all"))]
             BackendChoice::SoftwareOnly => false,
         };
@@ -234,7 +217,7 @@ impl WebVideoDecodeSession {
         // A decode-only sample, such as a hidden VP8 frame, is not a frame.
         let frame_count = track.presentation_order.len() as u64;
         let backend = if webcodecs_supported {
-            DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, samples, limits)?)
+            DecodeBackend::WebCodecs(WebCodecsDecoder::open(config, Box::new(samples), limits)?)
         } else {
             let decoder =
                 SoftwareDecoder::open(&track, derived.profile, dimensions, samples, limits)
@@ -301,6 +284,34 @@ impl WebVideoDecodeSession {
             DecodeBackend::Software(decoder) => decoder.get(presentation_index, cancellation).await,
         }
     }
+}
+
+/// The `WebCodecs` decoder configuration for `track`, whose codec string is
+/// `derived`. Fails for a codec `WebCodecs` has no registration for here.
+pub(crate) fn webcodecs_config(
+    track: &Mp4Track,
+    derived: &DerivedCodecString,
+    dimensions: VideoDimensions,
+) -> Result<JsVideoDecoderConfig> {
+    let description = codec_description(track.codec, &track.decoder_config)?;
+    let config = JsVideoDecoderConfig::new(&derived.codec_string);
+    config.set_coded_width(dimensions.width);
+    config.set_coded_height(dimensions.height);
+    if !description.is_empty() {
+        config.set_description_u8_array(&js_sys::Uint8Array::from(description));
+    }
+    config.set_optimize_for_latency(true);
+    Ok(config)
+}
+
+/// Whether this browser's `WebCodecs` `VideoDecoder` accepts `config`.
+pub(crate) async fn webcodecs_supports(config: &JsVideoDecoderConfig) -> Result<bool> {
+    let support: VideoDecoderSupport =
+        JsFuture::from(js_to_promise(JsVideoDecoder::is_config_supported(config)))
+            .await
+            .map_err(|error| normalize_js_error(error, "querying WebCodecs decoder support"))?
+            .unchecked_into();
+    Ok(support.get_supported().unwrap_or(false))
 }
 
 /// The crate's own software decoder for `codec`.
@@ -470,8 +481,13 @@ async fn yield_to_event_loop() {
 }
 
 /// A lazily-configured `WebCodecs` decode session for one input video track.
-struct WebCodecsDecoder {
-    samples: Vec<EncodedVideoSample>,
+///
+/// Its samples come from any [`SampleProvider`]: a track held in memory, or
+/// one loaded on demand, whose reads report [`ErrorKind::WouldBlock`] for a
+/// sample not loaded yet. [`Self::get_with`] loads such a sample and carries
+/// on, so on-demand playback decodes through the same session (issue #680).
+pub(crate) struct WebCodecsDecoder {
+    samples: Box<dyn SampleProvider>,
     decode_position_by_presentation: HashMap<FrameIndex, usize>,
     decoder: JsVideoDecoder,
     config: JsVideoDecoderConfig,
@@ -516,9 +532,9 @@ struct WebCodecsDecoder {
 }
 
 impl WebCodecsDecoder {
-    fn open(
+    pub(crate) fn open(
         config: JsVideoDecoderConfig,
-        samples: Vec<EncodedVideoSample>,
+        samples: Box<dyn SampleProvider>,
         limits: &Limits,
     ) -> Result<Self> {
         let pending_frames: Rc<RefCell<Vec<JsVideoFrame>>> = Rc::new(RefCell::new(Vec::new()));
@@ -557,8 +573,8 @@ impl WebCodecsDecoder {
             .map_err(|error| normalize_js_error(error, "configuring the WebCodecs VideoDecoder"))?;
 
         let mut decode_position_by_presentation = HashMap::with_capacity(samples.len());
-        for (position, sample) in samples.iter().enumerate() {
-            decode_position_by_presentation.insert(sample.presentation_index, position);
+        for position in 0..samples.len() {
+            decode_position_by_presentation.insert(samples.presentation_index(position), position);
         }
 
         Ok(Self {
@@ -584,12 +600,12 @@ impl WebCodecsDecoder {
     /// decode order: the target is one of its leading pictures, which a decode starting there
     /// cannot reconstruct (issue #506).
     fn nearest_random_access(&self, position: usize) -> usize {
-        let target = self.samples[position].presentation_index;
+        let target = self.samples.presentation_index(position);
         (0..=position)
             .rev()
             .find(|&candidate| {
-                let sample = &self.samples[candidate];
-                sample.random_access && sample.presentation_index <= target
+                self.samples.is_random_access(candidate)
+                    && self.samples.presentation_index(candidate) <= target
             })
             .unwrap_or(0)
     }
@@ -602,6 +618,26 @@ impl WebCodecsDecoder {
         &mut self,
         presentation_index: FrameIndex,
         cancellation: &CancellationToken,
+    ) -> Result<(VideoDimensions, Vec<u8>)> {
+        // A track held in memory never reports a sample missing.
+        self.get_with(presentation_index, cancellation, async |_| {
+            Err(Error::new(
+                ErrorKind::Internal,
+                "an in-memory video track reported a sample missing",
+            ))
+        })
+        .await
+    }
+
+    /// As [`Self::get`], for samples that may not be loaded yet: when one the
+    /// decode reaches reports [`ErrorKind::WouldBlock`], `load` is awaited
+    /// with its decode position, and the sample is read again.
+    /// The decoder keeps working through what it was already given meanwhile.
+    pub(crate) async fn get_with(
+        &mut self,
+        presentation_index: FrameIndex,
+        cancellation: &CancellationToken,
+        mut load: impl AsyncFnMut(usize) -> Result<()>,
     ) -> Result<(VideoDimensions, Vec<u8>)> {
         cancellation.check()?;
         // Frames this request has moved past are closed before anything is
@@ -705,7 +741,13 @@ impl WebCodecsDecoder {
                             "exact-frame request exceeded the configured decode-work limit",
                         ));
                     }
-                    self.submit_at(position)?;
+                    match self.submit_at(position) {
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            load(position).await?;
+                            continue;
+                        }
+                        result => result?,
+                    }
                     submitted += 1;
                     continue;
                 }
@@ -760,9 +802,11 @@ impl WebCodecsDecoder {
 
     /// Submits the sample at `position` and advances `next_decode_position`,
     /// or invalidates the session (forcing a reset on the next `get()` call)
-    /// if submission fails.
+    /// if submission fails. A sample that is not loaded yet leaves the session
+    /// as it was, to submit once it is.
     fn submit_at(&mut self, position: usize) -> Result<()> {
-        match self.submit(&self.samples[position]) {
+        let data = self.samples.read(position)?;
+        match self.submit(position, &data) {
             Ok(()) => {
                 self.next_decode_position = Some(position + 1);
                 Ok(())
@@ -861,15 +905,16 @@ impl WebCodecsDecoder {
         }
     }
 
-    fn submit(&self, sample: &EncodedVideoSample) -> Result<()> {
-        let kind = if sample.random_access {
+    /// Submits `data`, the sample at decode `position`.
+    fn submit(&self, position: usize, data: &[u8]) -> Result<()> {
+        let kind = if self.samples.is_random_access(position) {
             EncodedVideoChunkType::Key
         } else {
             EncodedVideoChunkType::Delta
         };
-        let data = js_sys::Uint8Array::from(sample.data.as_slice());
+        let data = js_sys::Uint8Array::from(data);
         let init = EncodedVideoChunkInit::new_with_u8_array(&data, 0, kind);
-        init.set_timestamp_f64(sample.presentation_index.0 as f64);
+        init.set_timestamp_f64(self.samples.presentation_index(position).0 as f64);
         let chunk = EncodedVideoChunk::new(&init)
             .map_err(|error| normalize_js_error(error, "constructing an EncodedVideoChunk"))?;
         self.decoder
