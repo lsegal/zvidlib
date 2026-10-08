@@ -343,12 +343,11 @@ impl BrowserAudioSource {
             ));
         }
         let sample_rate = audio.audio_sample_rate()?;
-        let decoded_ranges = audio.aac_decoded_ranges(sample_rate)?;
         let timing = audio.audio_timing(movie_timescale)?;
         let loader = Mp4SampleLoader::new(audio, source, budget_bytes)?;
         let reader = AudioSampleReader::from_provider(
             NoSoftwareDecoder,
-            Box::new(loader.audio_packet_provider(decoded_ranges)?),
+            Box::new(loader.aac_packet_provider()?),
             sample_rate,
             config.channels,
             timing,
@@ -957,8 +956,21 @@ mod tests {
         supported
     }
 
-    /// The sample's `frames`, decoded from every sample held in memory.
-    async fn eager_frames(frames: &[u64]) -> Vec<Vec<u8>> {
+    /// How many of the sample's leading frames [`eager_frames`] decodes.
+    const EAGER_FRAMES: u64 = 4;
+
+    thread_local! {
+        static EAGER: RefCell<Option<Rc<Vec<Vec<u8>>>>> = const { RefCell::new(None) };
+    }
+
+    /// The sample's first [`EAGER_FRAMES`] frames, decoded in software from
+    /// every sample held in memory: what on-demand playback must reproduce.
+    /// Decoded once and shared, since a 1080p software decode is the slow
+    /// part of these tests.
+    async fn eager_frames() -> Rc<Vec<Vec<u8>>> {
+        if let Some(frames) = EAGER.with_borrow(Clone::clone) {
+            return frames;
+        }
         let (demuxer, source) = sample_tracks().await;
         let video = first_track(&demuxer, TrackKind::Video).unwrap();
         let limits = Limits::default();
@@ -978,14 +990,16 @@ mod tests {
         let mut reader =
             ExactFrameReader::new(factory.as_ref(), configuration, samples, limits).unwrap();
         let cancellation = CancellationToken::new();
-        let mut decoded = Vec::with_capacity(frames.len());
-        for &frame in frames {
+        let mut decoded = Vec::new();
+        for frame in 0..EAGER_FRAMES {
             next_tick().await;
             decoded.push(packed_rgba(
                 &reader.get(FrameIndex(frame), &cancellation).unwrap(),
             ));
         }
-        decoded
+        let frames = Rc::new(decoded);
+        EAGER.set(Some(Rc::clone(&frames)));
+        frames
     }
 
     /// Lets the event loop run, so the test driver's polling is answered
@@ -1048,7 +1062,7 @@ mod tests {
             "opening reads the movie header, not the media"
         );
 
-        let expected = eager_frames(&[0, 2, 3, 6]).await;
+        let expected = eager_frames().await;
 
         // Nothing is loaded yet, so starting playback says so rather than
         // waiting for its audio.
@@ -1064,9 +1078,9 @@ mod tests {
         assert!(field(&again, "frame").is_null());
         assert!(field(&again, "picture").is_null());
 
-        playback.seek(JsValue::from_f64(6.0)).unwrap();
+        playback.seek(JsValue::from_f64(3.0)).unwrap();
         let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
-        assert_eq!(frame_of(&presentation), 6);
+        assert_eq!(frame_of(&presentation), 3);
         assert_eq!(pixels(&field(&presentation, "picture")), expected[3]);
 
         // While a prefetch is loading, playback calls report it instead of
@@ -1078,17 +1092,17 @@ mod tests {
         JsFuture::from(first).await.unwrap();
 
         // Backwards, so the decode restarts from the random-access point.
-        playback.seek(JsValue::from_f64(2.0)).unwrap();
+        playback.seek(JsValue::from_f64(1.0)).unwrap();
         let presentation = until_loaded(&playback, WasmOnDemandPlayback::present).await;
-        assert_eq!(frame_of(&presentation), 2);
+        assert_eq!(frame_of(&presentation), 1);
         assert_eq!(pixels(&field(&presentation, "picture")), expected[1]);
 
         // Paused, the current frame comes through the same loop.
         playback.pause().unwrap();
-        playback.seek(BigInt::from(3_u64).into()).unwrap();
+        playback.seek(BigInt::from(2_u64).into()).unwrap();
         assert_eq!(
             parse_u64(&playback.current_frame_index().unwrap(), "frame").unwrap(),
-            3
+            2
         );
         let picture = until_loaded(&playback, WasmOnDemandPlayback::current_frame).await;
         assert_eq!(pixels(&picture), expected[2]);
@@ -1114,7 +1128,7 @@ mod tests {
         if !browser_decodes_sample_audio().await {
             return;
         }
-        let expected = eager_frames(&[0]).await;
+        let expected = eager_frames().await;
         let url = make_object_url(SAMPLE, "video/mp4").unwrap();
         let blob = make_blob(SAMPLE, "video/mp4").unwrap();
         for source in [JsValue::from_str(&url), blob.into()] {

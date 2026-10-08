@@ -314,13 +314,9 @@ impl Mp4Track {
         Ok(packets)
     }
 
-    /// The decoded PCM interval of every AAC packet, in decode order, from the
-    /// sample table's durations alone, on a clock of `sample_rate` samples a
-    /// second. Reads no sample data.
-    ///
-    /// These are the intervals [`crate::Mp4SampleLoader::audio_packet_provider`]
-    /// takes for an AAC track.
-    pub fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
+    /// The decoded PCM interval of every AAC packet, from the sample table's
+    /// durations alone. Reads no sample data.
+    pub(crate) fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
         let mut decoded_start = 0_u64;
         let mut track_ticks = 0_u64;
         let mut ranges = Vec::with_capacity(self.samples.len());
@@ -2614,6 +2610,74 @@ mod tests {
         }
         let (video, bytes) = bundled_hevc_track_and_bytes();
         let error = Mp4AudioPacketProvider::new(video, MemorySource::new(bytes))
+            .err()
+            .expect("a video track is rejected");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    /// Issue #676: a loader builds an AAC track's prefetched provider from
+    /// the track's index alone, with exactly the decoded ranges the eager
+    /// path and `Mp4AudioPacketProvider` give.
+    #[test]
+    fn a_loader_builds_an_aac_packet_provider_from_the_index_alone() {
+        for (track, bytes) in aac_fixture_tracks_and_bytes() {
+            let eager =
+                block_on(track.to_encoded_audio_samples(
+                    &MemorySource::new(bytes.clone()),
+                    &Limits::default(),
+                ))
+                .unwrap();
+            let on_demand =
+                Mp4AudioPacketProvider::new(track.clone(), MemorySource::new(bytes.clone()))
+                    .unwrap();
+            let source = CountingSource {
+                inner: MemorySource::new(bytes),
+                bytes_read: Cell::new(0),
+            };
+            let loader = crate::Mp4SampleLoader::new(track, source, 1 << 20).unwrap();
+            let provider = loader.aac_packet_provider().unwrap();
+            assert_eq!(provider.len(), eager.len());
+            for (index, expected) in eager.iter().enumerate() {
+                assert_eq!(provider.decoded_range(index), expected.decoded_range);
+                assert_eq!(
+                    provider.decoded_range(index),
+                    on_demand.decoded_range(index)
+                );
+            }
+            assert_eq!(
+                loader.source().bytes_read.get(),
+                0,
+                "building the provider or reading its index read packet data"
+            );
+            assert_eq!(provider.read(0).unwrap_err().kind(), ErrorKind::WouldBlock);
+            block_on(loader.load_missing()).unwrap();
+            assert_eq!(provider.read(0).unwrap().as_ref(), eager[0].data);
+        }
+    }
+
+    /// Issue #676: Opus and Vorbis tracks, and video tracks, still need
+    /// caller-supplied ranges, so the AAC constructor rejects them.
+    #[test]
+    fn a_loader_rejects_an_aac_packet_provider_for_other_tracks() {
+        let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
+        for codec in [Codec::Opus, Codec::Vorbis] {
+            let track = Mp4Track {
+                codec,
+                ..aac.clone()
+            };
+            let loader =
+                crate::Mp4SampleLoader::new(track, MemorySource::new(bytes.clone()), 1 << 20)
+                    .unwrap();
+            let error = loader
+                .aac_packet_provider()
+                .err()
+                .expect("a non-AAC audio track is rejected");
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+        }
+        let (video, bytes) = bundled_hevc_track_and_bytes();
+        let loader = crate::Mp4SampleLoader::new(video, MemorySource::new(bytes), 1 << 24).unwrap();
+        let error = loader
+            .aac_packet_provider()
             .err()
             .expect("a video track is rejected");
         assert_eq!(error.kind(), ErrorKind::Unsupported);

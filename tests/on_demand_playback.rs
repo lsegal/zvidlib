@@ -393,14 +393,7 @@ fn playback_plays_and_seeks_through_on_demand_sources_over_a_suspending_source()
         256 * 1024,
     )
     .unwrap();
-    let decoded_ranges = bundled
-        .eager_audio_packets()
-        .iter()
-        .map(|packet| packet.decoded_range)
-        .collect();
-    let audio_reader = bundled.audio_reader(Box::new(
-        audio_loader.audio_packet_provider(decoded_ranges).unwrap(),
-    ));
+    let audio_reader = bundled.audio_reader(Box::new(audio_loader.aac_packet_provider().unwrap()));
     let audio = OnDemandAudioSource::new(audio_reader, audio_loader, 32);
 
     let backend = Backend::default();
@@ -491,14 +484,7 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples() {
         256 * 1024,
     )
     .unwrap();
-    let decoded_ranges = bundled
-        .eager_audio_packets()
-        .iter()
-        .map(|packet| packet.decoded_range)
-        .collect();
-    let audio_reader = bundled.audio_reader(Box::new(
-        audio_loader.audio_packet_provider(decoded_ranges).unwrap(),
-    ));
+    let audio_reader = bundled.audio_reader(Box::new(audio_loader.aac_packet_provider().unwrap()));
     let backend = Backend::default();
     let timeline = bundled.timeline();
     let mut playback = PlaybackController::new_with_indexed_timeline(
