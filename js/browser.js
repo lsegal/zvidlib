@@ -160,3 +160,114 @@ export async function probeTestVideo(blob, seekTo) {
     URL.revokeObjectURL(url);
   }
 }
+
+// A range source is what `OnDemandPlayback` reads an MP4 through without
+// loading all of it: a URL (a string or `URL`) read with HTTP range requests,
+// a `Blob` or `File` read by slicing, or an object with a numeric `size` and a
+// `read(offset, length)` method resolving to a `Uint8Array` or `ArrayBuffer`.
+function isUrl(source) {
+  return typeof source === "string" || source instanceof URL;
+}
+
+function isRangeReader(source) {
+  return source !== null && typeof source === "object" && typeof source.read === "function";
+}
+
+function rangeSourceError() {
+  return makeError(
+    "INVALID_INPUT",
+    "source must be a URL, a Blob, or an object with a size and a read(offset, length) method",
+  );
+}
+
+// The total length of `source` in bytes. A URL's comes from the
+// `Content-Range` of a one-byte range request, so the server must answer
+// range requests and, cross-origin, expose that header through CORS.
+export async function rangeSourceSize(source) {
+  if (source instanceof Blob) return source.size;
+  if (isRangeReader(source)) {
+    if (!Number.isSafeInteger(source.size) || source.size < 0) {
+      throw makeError("INVALID_INPUT", "a range reader's size must be a non-negative safe integer");
+    }
+    return source.size;
+  }
+  if (!isUrl(source)) throw rangeSourceError();
+  let response;
+  try {
+    response = await fetch(source, { headers: { Range: "bytes=0-0" } });
+  } catch (error) {
+    throw makeError("IO", `fetching ${source}: ${error?.message ?? error}`);
+  }
+  await response.body?.cancel();
+  if (response.status !== 206) {
+    throw makeError(
+      response.ok ? "UNSUPPORTED" : "IO",
+      response.ok
+        ? `${source} does not answer HTTP range requests`
+        : `fetching ${source}: HTTP ${response.status}`,
+    );
+  }
+  const total = /\/(\d+)\s*$/.exec(response.headers.get("Content-Range") ?? "")?.[1];
+  if (total === undefined) {
+    throw makeError(
+      "UNSUPPORTED",
+      `${source} gave no total length in its Content-Range header, or did not expose it via CORS`,
+    );
+  }
+  return Number(total);
+}
+
+// Reads up to `length` bytes of `source` from `offset`. The read suspends
+// rather than blocks: it resolves once the bytes arrive.
+export async function readRangeSource(source, offset, length) {
+  if (source instanceof Blob) {
+    return new Uint8Array(await source.slice(offset, offset + length).arrayBuffer());
+  }
+  if (isRangeReader(source)) {
+    const bytes = await source.read(offset, length);
+    if (bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+    if (bytes instanceof Uint8Array) return bytes;
+    throw makeError("INVALID_INPUT", "a range reader must resolve to a Uint8Array or ArrayBuffer");
+  }
+  if (!isUrl(source)) throw rangeSourceError();
+  let response;
+  try {
+    response = await fetch(source, {
+      headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+    });
+  } catch (error) {
+    throw makeError("IO", `fetching ${source}: ${error?.message ?? error}`);
+  }
+  if (response.status !== 206) {
+    await response.body?.cancel();
+    throw makeError(
+      response.ok ? "UNSUPPORTED" : "IO",
+      response.ok
+        ? `${source} does not answer HTTP range requests`
+        : `fetching ${source}: HTTP ${response.status}`,
+    );
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+// Test-only: a range reader over `bytes` whose every read suspends until a
+// later event-loop turn, as a network read does.
+export function makeSuspendingReader(bytes) {
+  const data = new Uint8Array(bytes).slice();
+  return {
+    size: data.byteLength,
+    reads: 0,
+    read(offset, length) {
+      this.reads += 1;
+      return new Promise((resolve) =>
+        setTimeout(() => resolve(data.slice(offset, offset + length)), 0),
+      );
+    },
+  };
+}
+
+// Test-only: a `blob:` URL for `bytes`, which `fetch` reads with range
+// requests just as it does an HTTP URL.
+export function makeObjectUrl(bytes, mimeType) {
+  return URL.createObjectURL(makeBlob(bytes, mimeType));
+}

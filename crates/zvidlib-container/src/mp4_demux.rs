@@ -314,9 +314,13 @@ impl Mp4Track {
         Ok(packets)
     }
 
-    /// The decoded PCM interval of every AAC packet, from the sample table's
-    /// durations alone. Reads no sample data.
-    fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
+    /// The decoded PCM interval of every AAC packet, in decode order, from the
+    /// sample table's durations alone, on a clock of `sample_rate` samples a
+    /// second. Reads no sample data.
+    ///
+    /// These are the intervals [`crate::Mp4SampleLoader::audio_packet_provider`]
+    /// takes for an AAC track.
+    pub fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
         let mut decoded_start = 0_u64;
         let mut track_ticks = 0_u64;
         let mut ranges = Vec::with_capacity(self.samples.len());

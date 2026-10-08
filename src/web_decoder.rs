@@ -324,6 +324,49 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
     }
 }
 
+/// The crate's software decoder for `track` and the configuration it decodes
+/// the track with.
+///
+/// `profile` is the profile the track's configuration box names, so an HEVC
+/// Main 10 track is opened as Main 10 (issue #508) and a VP9 track as the VP9
+/// profile its `vpcC` declares. `samples` are the track's leading samples in
+/// decode order: an AV1 or VP9 track's color range is read from the first one
+/// when its configuration record does not say, so a caller that loads samples
+/// on demand need only pass that one.
+pub(crate) fn software_video_decoder(
+    track: &Mp4Track,
+    profile: CodecProfile,
+    dimensions: VideoDimensions,
+    samples: &[EncodedVideoSample],
+    limits: &Limits,
+) -> Result<(Box<dyn VideoDecoderFactory>, VideoDecoderConfig)> {
+    let factory = software_decoder_factory(track.codec)?;
+    // The HEVC decoder only accepts limited-range input, while the AV1
+    // and VP9 decoders report whatever range the stream signals and the
+    // reader holds every frame to the configured one.
+    let (profile, color_range) = match track.codec {
+        Codec::Av1 => (
+            CodecProfile::Av1Main,
+            av1_color_range(track, samples, limits),
+        ),
+        Codec::Vp9 => (profile, vp9_color_range(track, samples)),
+        _ => (profile, ColorRange::Limited),
+    };
+    // The decoders validate the configuration record itself, so a stream
+    // they cannot decode (color AV1, say) is refused here, at open,
+    // rather than on its first frame.
+    let configuration = VideoDecoderConfig {
+        codec: track.codec,
+        profile,
+        coded_dimensions: dimensions,
+        output_format: PixelFormat::Rgba8,
+        color_range,
+        hardware: HardwarePreference::Avoid,
+        configuration: track.decoder_config.clone(),
+    };
+    Ok((factory, configuration))
+}
+
 /// The portable software decoder, behind the same exact-frame reader native
 /// callers use.
 struct SoftwareDecoder {
@@ -331,9 +374,7 @@ struct SoftwareDecoder {
 }
 
 impl SoftwareDecoder {
-    /// `profile` is the profile the track's configuration box names, so an
-    /// HEVC Main 10 track is opened as Main 10 (issue #508) and a VP9 track
-    /// as the VP9 profile its `vpcC` declares.
+    /// `profile` is as [`software_video_decoder`] takes it.
     fn open(
         track: &Mp4Track,
         profile: CodecProfile,
@@ -341,30 +382,8 @@ impl SoftwareDecoder {
         samples: Vec<EncodedVideoSample>,
         limits: &Limits,
     ) -> Result<Self> {
-        let factory = software_decoder_factory(track.codec)?;
-        // The HEVC decoder only accepts limited-range input, while the AV1
-        // and VP9 decoders report whatever range the stream signals and the
-        // reader holds every frame to the configured one.
-        let (profile, color_range) = match track.codec {
-            Codec::Av1 => (
-                CodecProfile::Av1Main,
-                av1_color_range(track, &samples, limits),
-            ),
-            Codec::Vp9 => (profile, vp9_color_range(track, &samples)),
-            _ => (profile, ColorRange::Limited),
-        };
-        // The decoders validate the configuration record itself, so a stream
-        // they cannot decode (color AV1, say) is refused here, at open,
-        // rather than on its first frame.
-        let configuration = VideoDecoderConfig {
-            codec: track.codec,
-            profile,
-            coded_dimensions: dimensions,
-            output_format: PixelFormat::Rgba8,
-            color_range,
-            hardware: HardwarePreference::Avoid,
-            configuration: track.decoder_config.clone(),
-        };
+        let (factory, configuration) =
+            software_video_decoder(track, profile, dimensions, &samples, limits)?;
         let reader = ExactFrameReader::new(factory.as_ref(), configuration, samples, *limits)?;
         Ok(Self { reader })
     }
@@ -433,7 +452,7 @@ fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRan
 
 /// The frame's RGBA rows without stride padding, the layout a `WebCodecs`
 /// copy produces and every caller of [`WebVideoDecodeSession::get`] expects.
-fn packed_rgba(frame: &VideoFrame) -> Vec<u8> {
+pub(crate) fn packed_rgba(frame: &VideoFrame) -> Vec<u8> {
     let plane = &frame.planes[0];
     let row = frame.dimensions.width as usize * 4;
     plane

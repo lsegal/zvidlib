@@ -38,7 +38,7 @@ use web_sys::{
 /// How many packets an AAC read decodes ahead of the first one it needs. An
 /// AAC frame overlaps the one before it, so one is enough; the second covers
 /// the decoder's own start-up.
-const AAC_PREROLL_PACKETS: usize = 2;
+pub(crate) const AAC_PREROLL_PACKETS: usize = 2;
 
 /// The `WebCodecs` decoder configuration for an input audio track: its codec
 /// string, sample rate and channel count, and the `description` the codec
@@ -97,7 +97,7 @@ impl WebAudioDecoderConfig {
         }
     }
 
-    fn to_js(&self) -> JsAudioDecoderConfig {
+    pub(crate) fn to_js(&self) -> JsAudioDecoderConfig {
         let config =
             JsAudioDecoderConfig::new(&self.codec, u32::from(self.channels), self.sample_rate);
         if let Some(description) = &self.description {
@@ -269,7 +269,7 @@ impl WebAudioDecodeSession {
 
 /// The reader's decoder when the browser build has no software decoder for a
 /// track's codec, so every packet is decoded through `WebCodecs`.
-struct NoSoftwareDecoder;
+pub(crate) struct NoSoftwareDecoder;
 
 impl AudioDecoder for NoSoftwareDecoder {
     fn decode(&mut self, _: &EncodedAudioSample, _: &CancellationToken) -> Result<AudioBuffer> {
@@ -285,7 +285,7 @@ impl AudioDecoder for NoSoftwareDecoder {
 }
 
 /// A `WebCodecs` `AudioDecoder` reconfigured for every batch of packets.
-struct WebCodecsAudioDecoder {
+pub(crate) struct WebCodecsAudioDecoder {
     config: WebAudioDecoderConfig,
     decoder: JsAudioDecoder,
     outputs: Rc<RefCell<Vec<AudioData>>>,
@@ -298,7 +298,7 @@ struct WebCodecsAudioDecoder {
 }
 
 impl WebCodecsAudioDecoder {
-    fn open(config: WebAudioDecoderConfig, limits: Limits) -> Result<Self> {
+    pub(crate) fn open(config: WebAudioDecoderConfig, limits: Limits) -> Result<Self> {
         let outputs: Rc<RefCell<Vec<AudioData>>> = Rc::new(RefCell::new(Vec::new()));
         let error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let output_sink = Rc::clone(&outputs);
@@ -332,7 +332,7 @@ impl WebCodecsAudioDecoder {
 
     /// Decodes `packets` in order from a freshly configured decoder, returning
     /// one buffer per packet.
-    async fn decode(&mut self, packets: &[EncodedAudioSample]) -> Result<Vec<AudioBuffer>> {
+    pub(crate) async fn decode(&mut self, packets: &[EncodedAudioSample]) -> Result<Vec<AudioBuffer>> {
         let rate = f64::from(self.config.sample_rate);
         self.close_outputs();
         *self.error.borrow_mut() = None;
