@@ -98,13 +98,13 @@ pub struct WebVideoEncodeSession {
     vp9_level: u8,
     width: u32,
     height: u32,
-    pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>>,
+    pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, EncodedVideoChunkMetadata)>>>,
     encode_error: Rc<RefCell<Option<String>>>,
     waker: Rc<RefCell<Option<js_sys::Function>>>,
     emitted_config: bool,
     finished: bool,
     // Kept alive for the lifetime of `encoder`.
-    _output_closure: Closure<dyn FnMut(EncodedVideoChunk, JsValue)>,
+    _output_closure: Closure<dyn FnMut(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
     _error_closure: Closure<dyn FnMut(JsValue)>,
 }
 
@@ -171,7 +171,7 @@ impl WebVideoEncodeSession {
             ));
         }
 
-        let pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, JsValue)>>> =
+        let pending_chunks: Rc<RefCell<VecDeque<(EncodedVideoChunk, EncodedVideoChunkMetadata)>>> =
             Rc::new(RefCell::new(VecDeque::new()));
         let encode_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let waker: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
@@ -182,12 +182,16 @@ impl WebVideoEncodeSession {
         // (see `av1c_from_bitstream`), but HEVC's parameter sets are
         // genuinely out-of-band, so `metadata` is kept alongside the chunk
         // for `take_ready_chunk` to read `decoderConfig.description` from.
-        let output_closure = Closure::new(move |chunk: EncodedVideoChunk, metadata: JsValue| {
-            output_chunks.borrow_mut().push_back((chunk, metadata));
-            if let Some(resolve) = output_waker.borrow_mut().take() {
-                let _ = resolve.call0(&JsValue::NULL);
-            }
-        });
+        // It is typed here rather than checked later: a WebIDL dictionary
+        // has no constructor, so `dyn_ref` on it always fails (issue #653).
+        let output_closure = Closure::new(
+            move |chunk: EncodedVideoChunk, metadata: EncodedVideoChunkMetadata| {
+                output_chunks.borrow_mut().push_back((chunk, metadata));
+                if let Some(resolve) = output_waker.borrow_mut().take() {
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+            },
+        );
         let error_state = Rc::clone(&encode_error);
         let error_waker = Rc::clone(&waker);
         let error_closure = Closure::new(move |error: JsValue| {
@@ -858,8 +862,7 @@ fn av1c_from_bitstream(data: &[u8]) -> Option<Vec<u8>> {
 /// payload (see `codec_config::derive_codec_string`'s `hvcC` parse), so this
 /// wraps that payload with its box header rather than scanning the
 /// bitstream.
-fn hvcc_from_metadata(metadata: &JsValue) -> Option<Vec<u8>> {
-    let metadata: &EncodedVideoChunkMetadata = metadata.dyn_ref()?;
+fn hvcc_from_metadata(metadata: &EncodedVideoChunkMetadata) -> Option<Vec<u8>> {
     let decoder_config = metadata.get_decoder_config()?;
     let description = decoder_config.get_description()?;
     let bytes = js_sys::Uint8Array::new(&description).to_vec();
