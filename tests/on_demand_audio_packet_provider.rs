@@ -1,4 +1,4 @@
-//! `AudioSampleReader` built from an on-demand [`Mp4AudioPacketProvider`]
+//! `AudioSampleReader` built from an on-demand [`TrackAudioPacketProvider`]
 //! decodes the same PCM, through the native AAC decoder, that it does from an
 //! eagerly read `Vec<EncodedAudioSample>` (issue #671).
 
@@ -11,8 +11,8 @@ use std::task::{Context, Poll, Waker};
 
 use zvidlib::io::{ByteSource, IoFuture, MemorySource};
 use zvidlib::{
-    AudioSampleReader, CancellationToken, Limits, Mp4AudioPacketProvider, Mp4Demuxer,
-    Mp4DemuxerOptions, Mp4Track, NativeAacDecoder, SampleRange, TrackKind,
+    AudioSampleReader, CancellationToken, Limits, Mp4Demuxer, Mp4DemuxerOptions, NativeAacDecoder,
+    SampleRange, Track, TrackAudioPacketProvider, TrackKind,
 };
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -51,7 +51,7 @@ impl ByteSource for CountingSource {
     }
 }
 
-fn audio_track(bytes: &[u8]) -> (Mp4Track, u32) {
+fn audio_track(bytes: &[u8]) -> (Track, u32) {
     let source = MemorySource::new(bytes.to_vec());
     let movie = block_on(Mp4Demuxer::open(&source, Mp4DemuxerOptions::default())).unwrap();
     let track = movie
@@ -64,7 +64,7 @@ fn audio_track(bytes: &[u8]) -> (Mp4Track, u32) {
 
 /// Builds a reader over `provider` with `track`'s configuration and timing.
 fn reader_from_provider(
-    track: &Mp4Track,
+    track: &Track,
     movie_timescale: u32,
     provider: Box<dyn zvidlib::AudioPacketProvider>,
 ) -> AudioSampleReader<NativeAacDecoder> {
@@ -101,7 +101,7 @@ fn reader_over_the_on_demand_provider_matches_the_eager_reader() {
             inner: MemorySource::new(bytes.to_vec()),
             bytes_read: Arc::clone(&bytes_read),
         };
-        let provider = Mp4AudioPacketProvider::new(track.clone(), counting).unwrap();
+        let provider = TrackAudioPacketProvider::new(track.clone(), counting).unwrap();
         let mut on_demand = reader_from_provider(&track, movie_timescale, Box::new(provider));
         assert_eq!(
             bytes_read.load(Ordering::Relaxed),

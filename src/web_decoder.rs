@@ -23,8 +23,8 @@ use crate::codec::{
 use crate::codec_config::{DerivedCodecString, derive_codec_string};
 use crate::io::MemorySource;
 use crate::media::{Codec, ColorRange, PixelFormat, VideoDimensions, VideoFrame};
-use crate::mp4_demux::Mp4Track;
 use crate::timeline::FrameIndex;
+use crate::track::Track;
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -94,7 +94,7 @@ pub(crate) fn js_to_promise(value: impl JsCast) -> js_sys::Promise {
 }
 
 /// Indexes a video track of an MP4 or WebM input, whichever its signature says it is.
-async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Mp4Track> {
+async fn parse_video_track(source: &MemorySource, index: u32, limits: &Limits) -> Result<Track> {
     crate::container::open_tracks(source, limits)
         .await?
         .into_iter()
@@ -289,7 +289,7 @@ impl WebVideoDecodeSession {
 /// The `WebCodecs` decoder configuration for `track`, whose codec string is
 /// `derived`. Fails for a codec `WebCodecs` has no registration for here.
 pub(crate) fn webcodecs_config(
-    track: &Mp4Track,
+    track: &Track,
     derived: &DerivedCodecString,
     dimensions: VideoDimensions,
 ) -> Result<JsVideoDecoderConfig> {
@@ -345,7 +345,7 @@ fn software_decoder_factory(codec: Codec) -> Result<Box<dyn VideoDecoderFactory>
 /// when its configuration record does not say, so a caller that loads samples
 /// on demand need only pass that one.
 pub(crate) fn software_video_decoder(
-    track: &Mp4Track,
+    track: &Track,
     profile: CodecProfile,
     dimensions: VideoDimensions,
     samples: &[EncodedVideoSample],
@@ -387,7 +387,7 @@ struct SoftwareDecoder {
 impl SoftwareDecoder {
     /// `profile` is as [`software_video_decoder`] takes it.
     fn open(
-        track: &Mp4Track,
+        track: &Track,
         profile: CodecProfile,
         dimensions: VideoDimensions,
         samples: Vec<EncodedVideoSample>,
@@ -417,11 +417,7 @@ impl SoftwareDecoder {
 /// `configOBUs` when it carries one, which it need not, and otherwise from the
 /// first sample, a key frame that must. Limited when neither parses, which
 /// leaves the reader to reject the first frame that disagrees.
-fn av1_color_range(
-    track: &Mp4Track,
-    samples: &[EncodedVideoSample],
-    limits: &Limits,
-) -> ColorRange {
+fn av1_color_range(track: &Track, samples: &[EncodedVideoSample], limits: &Limits) -> ColorRange {
     let from_config = Av1CodecConfigurationRecord::parse(&track.decoder_config, limits)
         .ok()
         .and_then(|record| {
@@ -445,7 +441,7 @@ fn av1_color_range(
 /// its pictures are decoded in. The `vpcC` box's `videoFullRangeFlag` stands
 /// in when the first sample does not parse, and limited range when neither
 /// says, which leaves the reader to reject the first frame that disagrees.
-fn vp9_color_range(track: &Mp4Track, samples: &[EncodedVideoSample]) -> ColorRange {
+fn vp9_color_range(track: &Track, samples: &[EncodedVideoSample]) -> ColorRange {
     let full = samples
         .first()
         .and_then(|sample| zvidlib_vp9_syntax::chunk_full_range(&sample.data))

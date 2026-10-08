@@ -364,12 +364,12 @@ impl PreviewIndex {
     /// [`Self::new`], over the track's first `frame_count` presentation frames.
     ///
     /// Issue #543: a decode-only sample takes an identity past the last
-    /// presentation frame (see [`Mp4Track::to_encoded_video_samples`]), and
+    /// presentation frame (see [`Track::to_encoded_video_samples`]), and
     /// asking for it never produces a picture. Counting it would plan slots no
     /// decode fills and space the rest further apart, so a caller with such a
     /// track passes `presentation_order.len()` here.
     ///
-    /// [`Mp4Track::to_encoded_video_samples`]: crate::Mp4Track::to_encoded_video_samples
+    /// [`Track::to_encoded_video_samples`]: crate::Track::to_encoded_video_samples
     pub fn with_frame_count(
         factory: &dyn VideoDecoderFactory,
         configuration: VideoDecoderConfig,

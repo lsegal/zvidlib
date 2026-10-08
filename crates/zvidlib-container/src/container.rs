@@ -5,7 +5,8 @@ use crate::audio::AudioTrackTiming;
 use crate::codec::TrackKind;
 use crate::io::ByteSource;
 use crate::media::Container;
-use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, probe_mp4};
+use crate::mp4_demux::{Mp4Demuxer, Mp4DemuxerOptions, probe_mp4};
+use crate::track::Track;
 use crate::webm_demux::{WebmDemuxer, WebmDemuxerOptions, probe_webm};
 use crate::{Error, ErrorKind, Limits, Result};
 
@@ -44,7 +45,7 @@ pub fn container_capabilities() -> Vec<Capability> {
 pub async fn open_tracks<S: ByteSource + ?Sized>(
     source: &S,
     limits: &Limits,
-) -> Result<Vec<Mp4Track>> {
+) -> Result<Vec<Track>> {
     if probe_container(source).await? == Some(Container::WebM) {
         let demuxer = WebmDemuxer::open(
             source,
@@ -75,7 +76,7 @@ pub async fn open_audio_track<S: ByteSource + ?Sized>(
     source: &S,
     index: usize,
     limits: &Limits,
-) -> Result<(Mp4Track, AudioTrackTiming)> {
+) -> Result<(Track, AudioTrackTiming)> {
     let no_track = || Error::new(ErrorKind::InvalidInput, "no such audio track");
     if probe_container(source).await? == Some(Container::WebM) {
         let demuxer = WebmDemuxer::open(

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
 
 use zvidlib::io::MemorySource;
-use zvidlib::{Codec, Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, TrackKind, derive_codec_string};
+use zvidlib::{Codec, Mp4Demuxer, Mp4DemuxerOptions, Track, TrackKind, derive_codec_string};
 
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut boxed = Box::pin(future);
@@ -116,7 +116,7 @@ fn read_sample(file: &str) -> Vec<u8> {
     std::fs::read(&linked).unwrap_or_else(|error| panic!("reading {} ({error})", linked.display()))
 }
 
-fn video_track(demuxer: &Mp4Demuxer) -> &Mp4Track {
+fn video_track(demuxer: &Mp4Demuxer) -> &Track {
     demuxer
         .tracks
         .iter()
