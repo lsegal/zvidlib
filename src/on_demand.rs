@@ -25,7 +25,7 @@ use crate::timeline::{FrameIndex, SampleRange};
 use crate::track::Track;
 use crate::{
     Error, ErrorKind, Limits, OPUS_PREROLL_SAMPLES, PrefetchedAudioPacketProvider, Result,
-    TrackSampleLoader,
+    TrackSampleLoader, VORBIS_PREROLL_PACKETS,
 };
 
 /// The compressed video a playback may hold when the caller does not say:
@@ -108,10 +108,11 @@ pub(crate) async fn crate_video_source<S: ByteSource>(
     ))
 }
 
-/// The packets of the loader's AAC or Opus track, indexed without reading
-/// them, and how many of them a read decodes ahead of the first it needs.
-/// Reads no packet but an Opus track's last, whose first bytes give its
-/// length.
+/// The packets of the loader's AAC, Opus or Vorbis track, indexed without
+/// reading them, and how many of them a read decodes ahead of the first it
+/// needs. Reads no packet but an Opus track's last, whose first bytes give its
+/// length; a Vorbis track's intervals come from the first bytes the WebM
+/// demuxer recorded.
 pub(crate) async fn audio_packets<S: ByteSource>(
     loader: &TrackSampleLoader<S>,
 ) -> Result<(PrefetchedAudioPacketProvider, usize)> {
@@ -122,9 +123,10 @@ pub(crate) async fn audio_packets<S: ByteSource>(
             Ok((packets, preroll))
         }
         Codec::Aac => Ok((loader.aac_packet_provider()?, AAC_PREROLL_PACKETS)),
+        Codec::Vorbis => Ok((loader.vorbis_packet_provider()?, VORBIS_PREROLL_PACKETS)),
         _ => Err(Error::new(
             ErrorKind::Unsupported,
-            "on-demand playback supports AAC and Opus audio tracks",
+            "on-demand playback supports AAC, Opus and Vorbis audio tracks",
         )),
     }
 }

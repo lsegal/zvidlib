@@ -45,8 +45,10 @@ fn gray(index: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Opus packets of `frames` stereo samples of a tone at `frequency`.
-fn opus_track(
+/// `codec` packets, Opus or Vorbis, of `frames` stereo samples of a tone at
+/// `frequency`.
+fn audio_track(
+    codec: Codec,
     frames: u64,
     frequency: f32,
 ) -> (
@@ -60,15 +62,29 @@ fn opus_track(
             [level, level]
         })
         .collect();
-    let mut encoder = native_opus_audio_encoder_factory()
+    let (factory, profile, configuration): (Box<dyn AudioEncoderFactory>, _, _) = match codec {
+        Codec::Opus => (
+            Box::new(native_opus_audio_encoder_factory()),
+            CodecProfile::Opus,
+            96_000_u32.to_be_bytes().to_vec(),
+        ),
+        #[cfg(feature = "vorbis-encoder")]
+        Codec::Vorbis => (
+            Box::new(zvidlib::native_vorbis_audio_encoder_factory()),
+            CodecProfile::Vorbis,
+            Vec::new(),
+        ),
+        _ => unreachable!("the test movies' audio is Opus or Vorbis"),
+    };
+    let mut encoder = factory
         .create(
             &AudioEncoderConfig {
-                codec: Codec::Opus,
-                profile: CodecProfile::Opus,
+                codec,
+                profile,
                 sample_rate: 48_000,
                 channels: 2,
                 timescale: 48_000,
-                configuration: 96_000_u32.to_be_bytes().to_vec(),
+                configuration,
             },
             &Limits::default(),
         )
@@ -114,6 +130,16 @@ fn movie(audio_tracks: usize) -> Vec<u8> {
 /// rather than an edit list and whose tracks have no language (issue #685).
 fn webm(audio_tracks: usize) -> Vec<u8> {
     let (configs, samples, gapless) = tracks(audio_tracks);
+    webm_of(configs, samples, gapless)
+}
+
+/// A WebM of the given tracks, video first, and each audio track's gapless
+/// trim.
+fn webm_of(
+    configs: Vec<Mp4TrackConfig>,
+    samples: Vec<Vec<zvidlib::EncodedSample>>,
+    gapless: Vec<zvidlib::AudioGapless>,
+) -> Vec<u8> {
     let timescales: Vec<u32> = configs
         .iter()
         .map(|config| config.encoder.timescale)
@@ -174,7 +200,13 @@ fn tracks(
         )
         .unwrap();
     let audio: Vec<_> = (0..audio_tracks)
-        .map(|index| opus_track(48_000 * FRAMES / RATE, 330.0 * (index + 1) as f32))
+        .map(|index| {
+            audio_track(
+                Codec::Opus,
+                48_000 * FRAMES / RATE,
+                330.0 * (index + 1) as f32,
+            )
+        })
         .collect();
     let mut video = Vec::new();
     for index in 0..FRAMES {
@@ -499,6 +531,67 @@ fn plays_seeks_and_switches_the_audio_of_a_webm() {
     assert_eq!(opened.len(), 2);
     let scheduled = &opened[1].lock().unwrap().scheduled;
     assert_eq!(scheduled.first().unwrap().start, 45 * 48_000 / RATE);
+}
+
+/// Issue #686: a WebM whose audio is Vorbis plays and seeks, backward too,
+/// with its audio scheduled from each frame's interval: its packets'
+/// intervals come from the first bytes the demuxer recorded, so nothing but
+/// the packets playback reaches is loaded, within the audio budget.
+#[cfg(all(feature = "vorbis-decoder", feature = "vorbis-encoder"))]
+#[test]
+fn plays_and_seeks_a_webm_with_vorbis_audio() {
+    let (mut configs, mut samples, _) = tracks(0);
+    let (config, packets, gapless) = audio_track(Codec::Vorbis, 48_000 * FRAMES / RATE, 440.0);
+    configs.push(config);
+    samples.push(packets);
+    let clock = Clock::default();
+    let (opener, opened) = outputs(&clock);
+    let options = OnDemandOptions::default();
+    let audio_budget = options.audio_budget_bytes;
+    let mut player = OnDemandPlayer::with_output(
+        MemorySource::new(webm_of(configs, samples, vec![gapless])),
+        options,
+        opener,
+    )
+    .unwrap();
+    assert_eq!(player.sample_rate(), Some(48_000));
+    assert_eq!(player.audio_tracks().len(), 1);
+    assert_eq!(player.audio_tracks()[0].codec, Codec::Vorbis);
+
+    assert_gray(&player.current_frame().unwrap(), 0);
+    player.play().unwrap();
+    // A WebM times its blocks in whole milliseconds, so the clock is read in
+    // the middle of each frame rather than at its rounded start.
+    clock.advance(48_000 / RATE / 2);
+    for frame in 1..=5 {
+        clock.advance(48_000 / RATE);
+        let (presentation, picture) = player.present().unwrap();
+        assert_eq!(presentation.frame, Some(FrameIndex(frame)));
+        assert_gray(&picture.unwrap(), frame);
+    }
+    for frame in [45, 10] {
+        player.seek(FrameIndex(frame)).unwrap();
+        let (presentation, picture) = player.present().unwrap();
+        assert_eq!(presentation.frame, Some(FrameIndex(frame)));
+        assert_gray(&picture.unwrap(), frame);
+    }
+    assert!(player.audio_resident_bytes() <= audio_budget);
+
+    let opened = opened.lock().unwrap();
+    let output = opened[0].lock().unwrap();
+    assert_eq!(output.scheduled.first().unwrap().start, 0);
+    assert_eq!(output.scheduled.first().unwrap().start, 0);
+    // Each seek schedules from its frame's start, which the WebM gives in
+    // whole milliseconds.
+    for frame in [45, 10] {
+        assert!(
+            output
+                .scheduled
+                .iter()
+                .any(|range| range.start == frame * 1_000 / RATE * 48),
+            "nothing was scheduled from frame {frame}"
+        );
+    }
 }
 
 #[test]

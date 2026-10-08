@@ -3,11 +3,10 @@
 //!
 //! [`OnDemandPlayer`] is the native counterpart of the browser's
 //! `OnDemandPlayback`: it reads the container's header and index when it opens
-//! and then only
-//! the compressed samples playback reaches, into one cache for the video track
-//! and one for the selected audio track, each bounded by a byte budget. It
-//! chooses the video decoder and the AAC or Opus audio decoder from the tracks,
-//! and plays on the default audio device:
+//! and then only the compressed samples playback reaches, into one cache for
+//! the video track and one for the selected audio track, each bounded by a byte
+//! budget. It chooses the video decoder and the AAC, Opus or Vorbis audio
+//! decoder from the tracks, and plays on the default audio device:
 //!
 //! ```no_run
 //! use zvidlib::{FrameIndex, OnDemandOptions, OnDemandPlayer};
@@ -538,12 +537,20 @@ fn audio_decoder(track: &Track, limits: Limits) -> Result<(Box<dyn AudioDecoder>
                 u16::from(head.channels),
             ))
         }
+        #[cfg(feature = "vorbis-decoder")]
+        crate::Codec::Vorbis => {
+            let config = track.vorbis_config()?;
+            Ok((
+                Box::new(crate::NativeVorbisDecoder::new(&config, limits)?),
+                u16::from(config.channels),
+            ))
+        }
         _ => {
             let _ = limits;
             Err(Error::new(
                 ErrorKind::Unsupported,
-                "on-demand playback decodes AAC audio with the aac-decoder feature and Opus \
-                 audio with the opus-decoder feature",
+                "on-demand playback decodes AAC audio with the aac-decoder feature, Opus audio \
+                 with the opus-decoder feature and Vorbis audio with the vorbis-decoder feature",
             ))
         }
     }
