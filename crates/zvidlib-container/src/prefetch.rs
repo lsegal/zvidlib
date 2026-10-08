@@ -254,8 +254,8 @@ impl<S: ByteSource> Mp4SampleLoader<S> {
             read_exact(&self.source, offset, &mut bytes).await?;
             let mut cache = self.cache.lock();
             let mut position = 0_usize;
-            for decode_index in index..run_end {
-                let size = samples[decode_index].size as usize;
+            for (decode_index, sample) in samples.iter().enumerate().take(run_end).skip(index) {
+                let size = sample.size as usize;
                 cache.insert(decode_index, Arc::from(&bytes[position..position + size]));
                 position += size;
             }

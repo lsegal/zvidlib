@@ -1148,4 +1148,272 @@ mod tests {
         assert_eq!(presentation.requested_frame, FrameIndex(1));
         assert_eq!(&*requested.lock().unwrap(), &[FrameIndex(1)]);
     }
+
+    /// Issue #672: `PlaybackController` plays and seeks through on-demand
+    /// sources whose byte source suspends on every read, and never waits on it.
+    /// The same scenario runs natively and in the browser, where it is driven by
+    /// the browser's own event loop on its single thread.
+    mod on_demand {
+        use super::*;
+        use crate::io::MemorySource;
+        use crate::{
+            AudioSampleReader, AudioTrackTiming, Codec, CodecProfile, ColorRange,
+            EncodedAudioSample, ExactFrameReader, HardwarePreference, Mp4Sample, Mp4Track,
+            PixelFormat, SampleDependency, TrackKind, VideoDecoderConfig,
+            uncompressed_video_decoder_factory,
+        };
+        use std::cell::Cell;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context, Poll};
+
+        const FRAMES: usize = 24;
+        const GROUP: usize = 8;
+        const SAMPLE_RATE: u32 = 48_000;
+        const SAMPLES_PER_FRAME: u64 = 2_000;
+        const SAMPLES_PER_PACKET: u64 = 1_000;
+
+        /// A source whose every read suspends once before completing, the way
+        /// a `fetch` does.
+        struct SuspendingSource {
+            inner: MemorySource,
+            reads: Rc<Cell<usize>>,
+        }
+
+        impl ByteSource for SuspendingSource {
+            fn len(&self) -> Option<u64> {
+                self.inner.len()
+            }
+
+            fn read_at<'a>(
+                &'a self,
+                offset: u64,
+                destination: &'a mut [u8],
+            ) -> IoFuture<'a, usize> {
+                self.reads.set(self.reads.get() + 1);
+                Box::pin(async move {
+                    YieldOnce(false).await;
+                    self.inner.read_at(offset, destination).await
+                })
+            }
+        }
+
+        struct YieldOnce(bool);
+
+        impl Future for YieldOnce {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    context.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        /// Each packet decodes to its first byte, its packet index, held for
+        /// its whole interval.
+        struct PacketIndexAudio;
+
+        impl crate::AudioDecoder for PacketIndexAudio {
+            fn decode(
+                &mut self,
+                sample: &EncodedAudioSample,
+                _: &CancellationToken,
+            ) -> Result<AudioBuffer> {
+                AudioBuffer::new(
+                    sample.decoded_range,
+                    SAMPLE_RATE,
+                    1,
+                    vec![f32::from(sample.data[0]); sample.decoded_range.len() as usize],
+                    &Limits::default(),
+                )
+            }
+
+            fn reset(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn track(kind: TrackKind, codec: Codec, samples: Vec<Mp4Sample>) -> Mp4Track {
+            Mp4Track {
+                id: 1,
+                kind,
+                codec,
+                timescale: SAMPLE_RATE,
+                duration: FRAMES as u64 * SAMPLES_PER_FRAME,
+                dimensions: None,
+                channels: Some(1),
+                sample_rate: Some(SAMPLE_RATE),
+                decoder_config: Vec::new(),
+                edits: Vec::new(),
+                presentation_order: (0..samples.len()).collect(),
+                samples,
+            }
+        }
+
+        fn sample(offset: usize, size: u32, index: usize, is_sync: bool) -> Mp4Sample {
+            Mp4Sample {
+                offset: offset as u64,
+                size,
+                dts: index as u64,
+                pts: index as i64,
+                duration: 1,
+                dependency: SampleDependency::INDEPENDENT,
+                is_sync,
+            }
+        }
+
+        /// A file interleaving 1x1 Gray8 video frames, each holding its own
+        /// index, with the two audio packets that play under each.
+        fn media() -> (Vec<u8>, Mp4Track, Mp4Track) {
+            let mut bytes = Vec::new();
+            let mut video = Vec::new();
+            let mut audio = Vec::new();
+            for frame in 0..FRAMES {
+                video.push(sample(bytes.len(), 1, frame, frame % GROUP == 0));
+                bytes.push(frame as u8);
+                for _ in 0..SAMPLES_PER_FRAME / SAMPLES_PER_PACKET {
+                    let packet = audio.len();
+                    audio.push(sample(bytes.len(), 2, packet, true));
+                    bytes.extend([packet as u8, 0]);
+                }
+            }
+            (
+                bytes,
+                track(TrackKind::Video, Codec::UncompressedVideo, video),
+                track(TrackKind::Audio, Codec::Aac, audio),
+            )
+        }
+
+        async fn until_loaded<T, V, A, O>(
+            playback: &mut PlaybackController<V, A, O>,
+            mut step: impl FnMut(&mut PlaybackController<V, A, O>) -> Result<T>,
+        ) -> T
+        where
+            V: PrefetchVideoSource,
+            A: PrefetchAudioSource,
+            O: PlaybackAudioOutput,
+        {
+            for _ in 0..64 {
+                match step(playback) {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        playback.prefetch().await.unwrap();
+                    }
+                    result => return result.unwrap(),
+                }
+            }
+            panic!("playback still had not loaded what it needed");
+        }
+
+        async fn plays_and_seeks_without_blocking() {
+            let (bytes, video_track, audio_track) = media();
+            let reads = Rc::new(Cell::new(0));
+            let source = || SuspendingSource {
+                inner: MemorySource::new(bytes.clone()),
+                reads: reads.clone(),
+            };
+            // Budgets smaller than one group of pictures and one scheduling
+            // window, so both are streamed through over several prefetches.
+            let video_loader = Mp4SampleLoader::new(video_track, source(), 4).unwrap();
+            let video_reader = ExactFrameReader::from_provider(
+                &uncompressed_video_decoder_factory(),
+                VideoDecoderConfig {
+                    codec: Codec::UncompressedVideo,
+                    profile: CodecProfile::UncompressedGray8,
+                    coded_dimensions: VideoDimensions::new(1, 1, &Limits::default()).unwrap(),
+                    output_format: PixelFormat::Gray8,
+                    color_range: ColorRange::Full,
+                    hardware: HardwarePreference::Avoid,
+                    configuration: Vec::new(),
+                },
+                Box::new(video_loader.sample_provider().unwrap()),
+                Limits::default(),
+            )
+            .unwrap();
+            let audio_loader = Mp4SampleLoader::new(audio_track, source(), 8).unwrap();
+            let decoded_ranges = (0..FRAMES as u64 * 2)
+                .map(|packet| {
+                    SampleRange::new(
+                        packet * SAMPLES_PER_PACKET,
+                        (packet + 1) * SAMPLES_PER_PACKET,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let audio_reader = AudioSampleReader::from_provider(
+                PacketIndexAudio,
+                Box::new(audio_loader.audio_packet_provider(decoded_ranges).unwrap()),
+                SAMPLE_RATE,
+                1,
+                AudioTrackTiming::default(),
+                1,
+                Limits::default(),
+            )
+            .unwrap();
+            let clock = Arc::new(Mutex::new(0));
+            let scheduled = Arc::new(Mutex::new(Vec::new()));
+            let backend = FixtureBackend {
+                clock: clock.clone(),
+                scheduled: scheduled.clone(),
+                canceled: Arc::new(Mutex::new(Vec::new())),
+            };
+            let timeline =
+                Timeline::new(crate::FrameRate::new(24, 1).unwrap(), SAMPLE_RATE).unwrap();
+            let mut playback = PlaybackController::new(
+                OnDemandVideoSource::new(video_reader, video_loader, 2),
+                OnDemandAudioSource::new(audio_reader, audio_loader, 2),
+                WebAudioOutput(backend),
+                timeline,
+                PlaybackOptions {
+                    schedule_ahead_samples: 4_000,
+                    preroll_samples: 1_000,
+                },
+            )
+            .unwrap();
+
+            let error = playback.play().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::WouldBlock);
+            assert_eq!(reads.get(), 0, "a synchronous call read the source");
+            until_loaded(&mut playback, |playback| playback.play()).await;
+
+            // The clock reading and media sample at the last seek, which the
+            // controller measures media time from.
+            let mut anchor = (0, 0);
+            for frame in [0, 1, 2, 5, 9, 20, 3, 4] {
+                if frame == 20 || frame == 3 {
+                    playback.seek(FrameIndex(frame)).unwrap();
+                    anchor = (*clock.lock().unwrap(), frame * SAMPLES_PER_FRAME);
+                }
+                *clock.lock().unwrap() = anchor.0 + frame * SAMPLES_PER_FRAME - anchor.1;
+                let (presentation, picture) =
+                    until_loaded(&mut playback, |playback| playback.present()).await;
+                assert_eq!(presentation.frame, Some(FrameIndex(frame)));
+                assert_eq!(picture.unwrap().planes[0].data, [frame as u8]);
+            }
+            assert!(reads.get() > 0);
+            assert!(!scheduled.lock().unwrap().is_empty());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn natively() {
+            let mut future = std::pin::pin!(plays_and_seeks_without_blocking());
+            let mut context = Context::from_waker(std::task::Waker::noop());
+            while future.as_mut().poll(&mut context).is_pending() {}
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+        #[cfg(target_arch = "wasm32")]
+        #[wasm_bindgen_test::wasm_bindgen_test(async)]
+        async fn in_the_browser() {
+            plays_and_seeks_without_blocking().await;
+        }
+    }
 }
