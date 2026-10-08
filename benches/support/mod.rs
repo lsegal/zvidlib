@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use zvidlib::io::MemorySource;
 use zvidlib::{
     AacTrackConfig, AudioTrackTiming, Codec, CodecProfile, ColorRange, EncodedAudioSample,
-    EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions, Mp4Track, PixelFormat, TrackKind,
+    EncodedVideoSample, Limits, Mp4Demuxer, Mp4DemuxerOptions, PixelFormat, Track, TrackKind,
     VideoDecoderConfig, VorbisConfig,
 };
 
@@ -45,7 +45,7 @@ pub struct BundledAacTrack {
 }
 
 impl BundledAacTrack {
-    pub fn track(&self) -> &Mp4Track {
+    pub fn track(&self) -> &Track {
         &self.movie.tracks[self.track_index]
     }
 

@@ -55,8 +55,8 @@ pub use self::AudioDecoder as AacDecoder;
 /// gives its interval, and a Vorbis packet's depends on the block size of the
 /// packet before it, so neither decides its boundary without the data a
 /// provider is meant not to hold. `zvidlib-container`'s
-/// `Mp4AudioPacketProvider` is the on-demand provider for AAC tracks;
-/// `Mp4Track::to_encoded_audio_samples` remains how Opus and Vorbis tracks
+/// `TrackAudioPacketProvider` is the on-demand provider for AAC tracks;
+/// `Track::to_encoded_audio_samples` remains how Opus and Vorbis tracks
 /// are read.
 ///
 /// Implementations used from a decode thread must be `Send`.

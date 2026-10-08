@@ -20,8 +20,8 @@ use crate::audio::{AudioDecoder, AudioSampleReader, EncodedAudioSample};
 use crate::codec::CancellationToken;
 use crate::io::MemorySource;
 use crate::media::{AudioBuffer, Codec};
-use crate::mp4_demux::Mp4Track;
 use crate::timeline::SampleRange;
+use crate::track::Track;
 use crate::web_decoder::{js_to_promise, normalize_js_error};
 use crate::{Error, ErrorKind, Limits, Result};
 use std::cell::RefCell;
@@ -53,7 +53,7 @@ pub struct WebAudioDecoderConfig {
 
 impl WebAudioDecoderConfig {
     /// The configuration for `track`, an AAC, Opus or Vorbis track.
-    pub fn for_track(track: &Mp4Track) -> Result<Self> {
+    pub fn for_track(track: &Track) -> Result<Self> {
         match track.codec {
             Codec::Aac => {
                 let config = track.aac_config()?;

@@ -1,17 +1,12 @@
 //! Bounded, read-only ISO BMFF/MP4 probing and sample indexing.
 
-use crate::audio::{AudioEdit, AudioPacketProvider, AudioTrackTiming, EncodedAudioSample};
-use crate::codec::{EncodedVideoSample, SampleDependency, SampleProvider, TrackKind};
+use crate::codec::{SampleDependency, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
 use crate::mp4::{CoverArt, CoverArtFormat};
-use crate::opus::{OPUS_SAMPLE_RATE, OpusHead};
-use crate::timeline::FrameIndex;
-use crate::vorbis::VorbisConfig;
+use crate::track::{EditMapping, Track, TrackSample, read_exact};
 use crate::{Error, ErrorKind, Limits, Result};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 
 const HEADER_SIZE: usize = 8;
 
@@ -37,600 +32,6 @@ impl Default for Mp4DemuxerOptions {
     }
 }
 
-/// A movie-to-media timeline edit. A media time of `-1` is an empty edit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EditMapping {
-    pub segment_duration: u64,
-    pub media_time: i64,
-    pub media_rate_integer: i16,
-    pub media_rate_fraction: i16,
-}
-
-/// One encoded sample in decode order.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Mp4Sample {
-    pub offset: u64,
-    pub size: u32,
-    pub dts: u64,
-    pub pts: i64,
-    pub duration: u32,
-    pub dependency: SampleDependency,
-    pub is_sync: bool,
-}
-
-/// Read-only metadata and indexes for one MP4 track.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Mp4Track {
-    pub id: u32,
-    pub kind: TrackKind,
-    pub codec: Codec,
-    pub timescale: u32,
-    pub duration: u64,
-    pub dimensions: Option<VideoDimensions>,
-    pub channels: Option<u16>,
-    pub sample_rate: Option<u32>,
-    /// Complete codec configuration box, including its header.
-    pub decoder_config: Vec<u8>,
-    pub edits: Vec<EditMapping>,
-    /// Samples in decode order.
-    pub samples: Vec<Mp4Sample>,
-    /// Decode-order indexes of the presentation frames, sorted by PTS, then
-    /// DTS, then decode index. A decode-only sample, such as a hidden VP8
-    /// frame stored as a WebM block of its own, is decoded on the way to the
-    /// frames after it but is never presented, so it is not listed.
-    pub presentation_order: Vec<usize>,
-}
-
-impl Mp4Track {
-    /// Returns a sample by its zero-based presentation index.
-    pub fn presentation_sample(&self, index: usize) -> Option<&Mp4Sample> {
-        self.presentation_order
-            .get(index)
-            .and_then(|&decode_index| self.samples.get(decode_index))
-    }
-
-    /// Reads one decode-order sample without changing caller-visible source state.
-    pub async fn read_sample_into<S: ByteSource + ?Sized>(
-        &self,
-        source: &S,
-        decode_index: usize,
-        destination: &mut [u8],
-    ) -> Result<()> {
-        let sample = self
-            .samples
-            .get(decode_index)
-            .ok_or_else(|| invalid("MP4 sample index is out of range"))?;
-        if destination.len() != sample.size as usize {
-            return Err(invalid("sample destination size does not match the index"));
-        }
-        read_exact(source, sample.offset, destination).await
-    }
-
-    /// The presentation identity, in [`FrameIndex`] terms, of every
-    /// decode-order sample: [`Self::presentation_order`]'s inverse, with a
-    /// decode-only sample (one `presentation_order` does not list) given an
-    /// identity past the last presentation frame so it never collides with
-    /// a frame a caller asks for. Reads no sample data.
-    pub(crate) fn presentation_index_by_decode(&self) -> Result<Vec<u64>> {
-        let mut presentation_index_by_decode = vec![None; self.samples.len()];
-        for (presentation_index, &decode_index) in self.presentation_order.iter().enumerate() {
-            let presentation_index = u64::try_from(presentation_index)
-                .map_err(|_| limit("presentation index overflow"))?;
-            *presentation_index_by_decode
-                .get_mut(decode_index)
-                .ok_or_else(|| malformed("presentation order references a missing sample"))? =
-                Some(presentation_index);
-        }
-        let mut next_decode_only = self.presentation_order.len() as u64;
-        Ok(presentation_index_by_decode
-            .into_iter()
-            .map(|index| {
-                index.unwrap_or_else(|| {
-                    next_decode_only += 1;
-                    next_decode_only - 1
-                })
-            })
-            .collect())
-    }
-
-    /// Reads every decode-order sample and returns owned
-    /// [`EncodedVideoSample`] values keyed by presentation order, ready for
-    /// a [`crate::codec::VideoDecoderFactory`] backend.
-    ///
-    /// The zero-based position of each sample within
-    /// [`Self::presentation_order`] becomes its `presentation_index`, and
-    /// `is_sync` becomes `random_access`. A decode-only sample, which
-    /// `presentation_order` does not list, takes an identity past the last
-    /// presentation frame, in decode order, so it never collides with a frame
-    /// a caller asks for. Total decoded sample bytes are bounded by
-    /// `limits.max_allocation_bytes`.
-    pub async fn to_encoded_video_samples<S: ByteSource + ?Sized>(
-        &self,
-        source: &S,
-        limits: &Limits,
-    ) -> Result<Vec<EncodedVideoSample>> {
-        if self.kind != TrackKind::Video {
-            return Err(unsupported("encoded video samples require a video track"));
-        }
-        let presentation_index_by_decode = self.presentation_index_by_decode()?;
-
-        let mut total_bytes = 0_u64;
-        let mut samples = Vec::with_capacity(self.samples.len());
-        for (decode_index, sample) in self.samples.iter().enumerate() {
-            total_bytes = total_bytes
-                .checked_add(u64::from(sample.size))
-                .ok_or_else(|| limit("encoded sample allocation overflow"))?;
-            if total_bytes > limits.max_allocation_bytes {
-                return Err(limit(
-                    "encoded video samples exceed the configured allocation limit",
-                ));
-            }
-            let mut data = vec![0_u8; sample.size as usize];
-            self.read_sample_into(source, decode_index, &mut data)
-                .await?;
-            samples.push(EncodedVideoSample {
-                presentation_index: FrameIndex(presentation_index_by_decode[decode_index]),
-                random_access: sample.is_sync,
-                data,
-            });
-        }
-        Ok(samples)
-    }
-
-    /// Parses the AAC AudioSpecificConfig carried by this track's `esds` box.
-    pub fn aac_config(&self) -> Result<AacTrackConfig> {
-        if self.kind != TrackKind::Audio || self.codec != Codec::Aac {
-            return Err(unsupported("AAC configuration requires an AAC audio track"));
-        }
-        let sample_rate = self
-            .sample_rate
-            .ok_or_else(|| malformed("AAC sample rate is missing"))?;
-        let channels = self
-            .channels
-            .ok_or_else(|| malformed("AAC channel count is missing"))?;
-        parse_aac_config(&self.decoder_config, sample_rate, channels)
-    }
-
-    /// Parses the Opus identification header carried by this track's `dOps`
-    /// box.
-    pub fn opus_config(&self) -> Result<OpusHead> {
-        if self.kind != TrackKind::Audio || self.codec != Codec::Opus {
-            return Err(unsupported(
-                "Opus configuration requires an Opus audio track",
-            ));
-        }
-        let head = OpusHead::from_dops(&self.decoder_config)?;
-        if self.channels != Some(u16::from(head.channels)) {
-            return Err(malformed(
-                "Opus dOps channel count disagrees with the sample entry",
-            ));
-        }
-        Ok(head)
-    }
-
-    /// Parses the three Vorbis header packets a WebM Vorbis track carries as
-    /// its `decoder_config` (see [`crate::WebmDemuxer`]); Vorbis has no MP4
-    /// sample entry.
-    pub fn vorbis_config(&self) -> Result<VorbisConfig> {
-        if self.kind != TrackKind::Audio || self.codec != Codec::Vorbis {
-            return Err(unsupported(
-                "Vorbis configuration requires a Vorbis audio track",
-            ));
-        }
-        VorbisConfig::from_codec_private(&self.decoder_config)
-    }
-
-    /// The sample rate this audio track decodes at: the AAC
-    /// `AudioSpecificConfig`'s or the Vorbis identification header's, or 48
-    /// kHz for Opus, which always decodes at that rate whatever its input was.
-    pub fn audio_sample_rate(&self) -> Result<u32> {
-        match self.codec {
-            Codec::Aac => Ok(self.aac_config()?.sample_rate),
-            Codec::Opus => {
-                self.opus_config()?;
-                Ok(OPUS_SAMPLE_RATE)
-            }
-            Codec::Vorbis => Ok(self.vorbis_config()?.sample_rate),
-            _ => Err(unsupported(
-                "audio packets require an AAC, Opus or Vorbis track",
-            )),
-        }
-    }
-
-    /// Reads every indexed audio packet - AAC access units, Opus or Vorbis
-    /// packets - from its validated byte range.
-    ///
-    /// Packet intervals use the decoded PCM sample clock and remain contiguous
-    /// even when the MP4 track timescale differs from the decoded sample rate.
-    pub async fn to_encoded_audio_samples<S: ByteSource + ?Sized>(
-        &self,
-        source: &S,
-        limits: &Limits,
-    ) -> Result<Vec<EncodedAudioSample>> {
-        let sample_rate = self.audio_sample_rate()?;
-        // A Vorbis packet's length depends on the one before it, so the
-        // intervals are assigned once every packet has been read.
-        let vorbis = if self.codec == Codec::Vorbis {
-            Some(self.vorbis_config()?)
-        } else {
-            None
-        };
-        // An AAC packet's interval comes from the sample table alone.
-        let aac_ranges = if self.codec == Codec::Aac {
-            Some(self.aac_decoded_ranges(sample_rate)?)
-        } else {
-            None
-        };
-        let mut total_bytes = 0_u64;
-        let mut decoded_start = 0_u64;
-        let mut packets = Vec::with_capacity(self.samples.len());
-        for (decode_index, sample) in self.samples.iter().enumerate() {
-            total_bytes = total_bytes
-                .checked_add(u64::from(sample.size))
-                .ok_or_else(|| limit("encoded audio allocation overflow"))?;
-            if total_bytes > limits.max_allocation_bytes {
-                return Err(limit(
-                    "encoded audio samples exceed the configured allocation limit",
-                ));
-            }
-            let mut data = vec![0_u8; sample.size as usize];
-            self.read_sample_into(source, decode_index, &mut data)
-                .await?;
-            if vorbis.is_some() {
-                packets.push(EncodedAudioSample {
-                    decoded_range: crate::SampleRange::new(0, 0)?,
-                    data,
-                });
-                continue;
-            }
-            if let Some(ranges) = &aac_ranges {
-                packets.push(EncodedAudioSample {
-                    decoded_range: ranges[decode_index],
-                    data,
-                });
-                continue;
-            }
-            // An Opus packet's own table of contents says how long it
-            // decodes. Muxers shorten the last sample's duration to trim
-            // the stream's end - FFmpeg does - so the sample table cannot.
-            let decoded_end = decoded_start
-                .checked_add(u64::from(crate::opus::opus_packet_samples(&data)?))
-                .ok_or_else(|| limit("audio track timing overflow"))?;
-            if decoded_end <= decoded_start {
-                return Err(malformed("audio packet has an empty decoded interval"));
-            }
-            packets.push(EncodedAudioSample {
-                decoded_range: crate::SampleRange::new(decoded_start, decoded_end)?,
-                data,
-            });
-            decoded_start = decoded_end;
-        }
-        if packets.is_empty() {
-            return Err(malformed("audio track contains no samples"));
-        }
-        if let Some(vorbis) = vorbis {
-            return vorbis.encoded_samples(packets.into_iter().map(|packet| packet.data).collect());
-        }
-        Ok(packets)
-    }
-
-    /// The decoded PCM interval of every AAC packet, from the sample table's
-    /// durations alone. Reads no sample data.
-    pub(crate) fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
-        self.table_decoded_ranges(&self.samples, sample_rate)
-    }
-
-    /// The decoded PCM interval of every Opus packet: the sample table's
-    /// durations for all but the last, and `last_packet_samples`, read from
-    /// the last packet's own table of contents, for that one. A muxer shortens
-    /// the last sample's duration to trim the stream's end, as
-    /// [`Self::to_encoded_audio_samples`] explains, so the table cannot give
-    /// it. Reads no sample data.
-    pub(crate) fn opus_decoded_ranges(
-        &self,
-        last_packet_samples: u32,
-    ) -> Result<Vec<crate::SampleRange>> {
-        let (_, leading) = self
-            .samples
-            .split_last()
-            .ok_or_else(|| malformed("audio track contains no samples"))?;
-        let mut ranges = self.table_decoded_ranges(leading, OPUS_SAMPLE_RATE)?;
-        let start = ranges.last().map_or(0, |range| range.end);
-        let end = start
-            .checked_add(u64::from(last_packet_samples))
-            .ok_or_else(|| limit("audio track timing overflow"))?;
-        if end <= start {
-            return Err(malformed("audio packet has an empty decoded interval"));
-        }
-        ranges.push(crate::SampleRange::new(start, end)?);
-        Ok(ranges)
-    }
-
-    /// The decoded PCM interval of each of `samples`, the track's leading
-    /// samples, from their sample-table durations.
-    fn table_decoded_ranges(
-        &self,
-        samples: &[Mp4Sample],
-        sample_rate: u32,
-    ) -> Result<Vec<crate::SampleRange>> {
-        let mut decoded_start = 0_u64;
-        let mut track_ticks = 0_u64;
-        let mut ranges = Vec::with_capacity(samples.len());
-        for sample in samples {
-            track_ticks = track_ticks
-                .checked_add(u64::from(sample.duration))
-                .ok_or_else(|| limit("audio track timing overflow"))?;
-            let decoded_end = scale_time(track_ticks, self.timescale, sample_rate)?;
-            if decoded_end <= decoded_start {
-                return Err(malformed("audio packet has an empty decoded interval"));
-            }
-            ranges.push(crate::SampleRange::new(decoded_start, decoded_end)?);
-            decoded_start = decoded_end;
-        }
-        Ok(ranges)
-    }
-
-    /// Converts MP4 edit-list timing to the presentation sample clock used by
-    /// [`crate::AudioSampleReader`], including decoder priming and end padding.
-    ///
-    /// An Opus track without an edit list still has its `dOps` pre-skip
-    /// trimmed as priming, and ends where its sample table does: the packets
-    /// themselves can decode past that end, which is how a muxer that writes
-    /// no edit list trims the stream.
-    pub fn audio_timing(&self, movie_timescale: u32) -> Result<AudioTrackTiming> {
-        let sample_rate = self.audio_sample_rate()?;
-        let decoded_length = scale_time(self.duration, self.timescale, sample_rate)?;
-        if self.edits.is_empty() {
-            if self.codec != Codec::Opus {
-                return Ok(AudioTrackTiming::default());
-            }
-            let priming = self.opus_config()?.pre_skip;
-            let length = decoded_length
-                .checked_sub(u64::from(priming))
-                .filter(|&length| length > 0)
-                .ok_or_else(|| malformed("Opus pre-skip covers the whole track"))?;
-            return Ok(AudioTrackTiming {
-                priming: u32::from(priming),
-                padding: 0,
-                track_offset: 0,
-                edits: vec![AudioEdit {
-                    presentation: crate::SampleRange::new(0, length)?,
-                    media_start: Some(u64::from(priming)),
-                }],
-            });
-        }
-        let mut presentation_start = 0_u64;
-        let mut edits = Vec::with_capacity(self.edits.len());
-        let mut first_media = None;
-        let mut last_media_end = 0_u64;
-        for edit in &self.edits {
-            if edit.media_rate_integer != 1 || edit.media_rate_fraction != 0 {
-                return Err(unsupported(
-                    "audio edit rates other than 1.0 are unsupported",
-                ));
-            }
-            let length = scale_time(edit.segment_duration, movie_timescale, sample_rate)?;
-            if length == 0 {
-                return Err(malformed("audio edit has an empty presentation interval"));
-            }
-            let presentation_end = presentation_start
-                .checked_add(length)
-                .ok_or_else(|| limit("audio edit presentation overflow"))?;
-            let media_start = if edit.media_time == -1 {
-                None
-            } else {
-                if edit.media_time < 0 {
-                    return Err(malformed("audio edit has an invalid negative media time"));
-                }
-                let start = scale_time(edit.media_time as u64, self.timescale, sample_rate)?;
-                let end = start
-                    .checked_add(length)
-                    .ok_or_else(|| limit("audio edit media range overflow"))?;
-                first_media = Some(first_media.map_or(start, |value: u64| value.min(start)));
-                last_media_end = last_media_end.max(end);
-                Some(start)
-            };
-            edits.push(AudioEdit {
-                presentation: crate::SampleRange::new(presentation_start, presentation_end)?,
-                media_start,
-            });
-            presentation_start = presentation_end;
-        }
-        let priming = u32::try_from(first_media.unwrap_or(0))
-            .map_err(|_| limit("audio priming exceeds the supported range"))?;
-        let padding = u32::try_from(decoded_length.saturating_sub(last_media_end))
-            .map_err(|_| limit("audio padding exceeds the supported range"))?;
-        Ok(AudioTrackTiming {
-            priming,
-            padding,
-            track_offset: 0,
-            edits,
-        })
-    }
-}
-
-/// A [`SampleProvider`] that reads a video track's compressed bytes from a
-/// [`ByteSource`] on demand, holding only `track`'s index (and whatever `S`
-/// itself caches) rather than every sample's bytes.
-///
-/// Built from a shared MP4/WebM [`Mp4Track`] index, so it works over either
-/// container.
-///
-/// `S::read_at`'s future must resolve the first time it is polled: this
-/// provider is used from [`ExactFrameReader::get`][crate::codec::ExactFrameReader::get],
-/// which is synchronous, so [`Self::read`] polls the read once and reports
-/// [`ErrorKind::Unsupported`] rather than blocking if the source does not
-/// finish immediately. [`MemorySource`][crate::io::MemorySource] and a
-/// [`CachingByteSource`][crate::io::CachingByteSource] wrapping one both
-/// satisfy this; a source that genuinely waits on I/O (a network fetch, for
-/// example) needs its own asynchronous reader rather than this provider.
-///
-/// `S` must be `Send` so the provider - and a reader built over it - can be
-/// moved to a decode thread, matching [`SampleProvider`]'s own requirement.
-pub struct Mp4SampleProvider<S> {
-    track: Mp4Track,
-    source: S,
-    presentation_index_by_decode: Vec<u64>,
-}
-
-impl<S: ByteSource + Send> Mp4SampleProvider<S> {
-    /// Fails if `track` is not a video track; reads no sample data.
-    pub fn new(track: Mp4Track, source: S) -> Result<Self> {
-        if track.kind != TrackKind::Video {
-            return Err(unsupported("a sample provider requires a video track"));
-        }
-        let presentation_index_by_decode = track.presentation_index_by_decode()?;
-        Ok(Self {
-            track,
-            source,
-            presentation_index_by_decode,
-        })
-    }
-
-    pub fn track(&self) -> &Mp4Track {
-        &self.track
-    }
-
-    pub fn source(&self) -> &S {
-        &self.source
-    }
-
-    pub fn into_source(self) -> S {
-        self.source
-    }
-}
-
-impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
-    fn len(&self) -> usize {
-        self.track.samples.len()
-    }
-
-    fn is_random_access(&self, decode_index: usize) -> bool {
-        self.track.samples[decode_index].is_sync
-    }
-
-    fn presentation_index(&self, decode_index: usize) -> FrameIndex {
-        FrameIndex(self.presentation_index_by_decode[decode_index])
-    }
-
-    fn read(&self, decode_index: usize) -> Result<Cow<'_, [u8]>> {
-        let size = self
-            .track
-            .samples
-            .get(decode_index)
-            .ok_or_else(|| invalid("MP4 sample index is out of range"))?
-            .size as usize;
-        let mut data = vec![0_u8; size];
-        poll_once(
-            self.track
-                .read_sample_into(&self.source, decode_index, &mut data),
-        )
-        .ok_or_else(|| {
-            unsupported(
-                "Mp4SampleProvider requires a byte source whose reads complete \
-                     synchronously; it cannot drive one that suspends",
-            )
-        })??;
-        Ok(Cow::Owned(data))
-    }
-}
-
-/// An [`AudioPacketProvider`] that reads an AAC track's compressed packets
-/// from a [`ByteSource`] on demand, holding only `track`'s index (and
-/// whatever `S` itself caches) rather than every packet's bytes.
-///
-/// The audio counterpart of [`Mp4SampleProvider`], with the same requirement
-/// that `S::read_at`'s future resolve the first time it is polled: a source
-/// that suspends makes [`Self::read`] report [`ErrorKind::Unsupported`]
-/// rather than block.
-///
-/// Only AAC is supported. An AAC packet's decoded interval comes from the
-/// track's sample durations, so [`Self::new`] builds the whole index without
-/// reading any packet. An Opus packet's interval is in its own
-/// table-of-contents byte, and a Vorbis packet's depends on the block size of
-/// the packet before it, so an index for either needs every packet's bytes -
-/// the very data this provider exists not to hold. Those tracks keep using
-/// [`Mp4Track::to_encoded_audio_samples`]; [`Self::new`] rejects them.
-pub struct Mp4AudioPacketProvider<S> {
-    track: Mp4Track,
-    source: S,
-    decoded_ranges: Vec<crate::SampleRange>,
-}
-
-impl<S: ByteSource + Send> Mp4AudioPacketProvider<S> {
-    /// Fails if `track` is not an AAC audio track; reads no packet data.
-    pub fn new(track: Mp4Track, source: S) -> Result<Self> {
-        if track.kind != TrackKind::Audio || track.codec != Codec::Aac {
-            return Err(unsupported(
-                "an on-demand audio packet provider requires an AAC audio track",
-            ));
-        }
-        if track.samples.is_empty() {
-            return Err(malformed("audio track contains no samples"));
-        }
-        let decoded_ranges = track.aac_decoded_ranges(track.audio_sample_rate()?)?;
-        Ok(Self {
-            track,
-            source,
-            decoded_ranges,
-        })
-    }
-
-    pub fn track(&self) -> &Mp4Track {
-        &self.track
-    }
-
-    pub fn source(&self) -> &S {
-        &self.source
-    }
-
-    pub fn into_source(self) -> S {
-        self.source
-    }
-}
-
-impl<S: ByteSource + Send> AudioPacketProvider for Mp4AudioPacketProvider<S> {
-    fn len(&self) -> usize {
-        self.decoded_ranges.len()
-    }
-
-    fn decoded_range(&self, index: usize) -> crate::SampleRange {
-        self.decoded_ranges[index]
-    }
-
-    fn read(&self, index: usize) -> Result<Cow<'_, [u8]>> {
-        let size = self
-            .track
-            .samples
-            .get(index)
-            .ok_or_else(|| invalid("MP4 sample index is out of range"))?
-            .size as usize;
-        let mut data = vec![0_u8; size];
-        poll_once(self.track.read_sample_into(&self.source, index, &mut data)).ok_or_else(
-            || {
-                unsupported(
-                    "Mp4AudioPacketProvider requires a byte source whose reads complete \
-                     synchronously; it cannot drive one that suspends",
-                )
-            },
-        )??;
-        Ok(Cow::Owned(data))
-    }
-}
-
-/// Polls a future once and returns its value if it was ready, without
-/// blocking or spinning. Every `ByteSource` this crate ships resolves on its
-/// first poll; this is how a synchronous caller, such as
-/// [`Mp4SampleProvider::read`], drives one without an async runtime.
-fn poll_once<T>(future: impl Future<Output = T>) -> Option<T> {
-    let mut future = std::pin::pin!(future);
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        std::task::Poll::Ready(value) => Some(value),
-        std::task::Poll::Pending => None,
-    }
-}
-
 /// Decoder configuration extracted from an AAC `mp4a` / `esds` description.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AacTrackConfig {
@@ -644,7 +45,7 @@ pub struct AacTrackConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Mp4Demuxer {
     pub movie_timescale: u32,
-    pub tracks: Vec<Mp4Track>,
+    pub tracks: Vec<Track>,
     /// The first JPEG or PNG picture in iTunes-style
     /// `moov/udta/meta/ilst/covr` metadata, if the file has one.
     pub cover_art: Option<CoverArt>,
@@ -755,7 +156,7 @@ impl Mp4Demuxer {
         Ok(demuxer)
     }
 
-    pub fn track(&self, id: u32) -> Option<&Mp4Track> {
+    pub fn track(&self, id: u32) -> Option<&Track> {
         self.tracks.iter().find(|track| track.id == id)
     }
 }
@@ -841,24 +242,6 @@ async fn read_header<S: ByteSource + ?Sized>(
     })
 }
 
-pub(crate) async fn read_exact<S: ByteSource + ?Sized>(
-    source: &S,
-    mut offset: u64,
-    mut output: &mut [u8],
-) -> Result<()> {
-    while !output.is_empty() {
-        let read = source.read_at(offset, output).await?;
-        if read == 0 {
-            return Err(malformed("unexpected end of MP4 source"));
-        }
-        offset = offset
-            .checked_add(read as u64)
-            .ok_or_else(|| malformed("read offset overflow"))?;
-        output = &mut output[read..];
-    }
-    Ok(())
-}
-
 async fn read_payload<S: ByteSource + ?Sized>(
     source: &S,
     header: Header,
@@ -896,7 +279,7 @@ struct TrackBuilder {
     chunks: Vec<u64>,
     sync: Option<BTreeSet<u32>>,
     dependencies: Vec<SampleDependency>,
-    samples: Vec<Mp4Sample>,
+    samples: Vec<TrackSample>,
     ignored: bool,
 }
 
@@ -1428,7 +811,7 @@ fn parse_sdtp(payload: &[u8], options: &Mp4DemuxerOptions) -> Result<Vec<SampleD
         .collect())
 }
 
-fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp4Track> {
+fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Track> {
     let id = b.id.ok_or_else(|| malformed("track ID is missing"))?;
     let kind = b
         .kind
@@ -1444,7 +827,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
     }
     ensure_allocation(
         b.sizes.len(),
-        std::mem::size_of::<Mp4Sample>(),
+        std::mem::size_of::<TrackSample>(),
         options,
         "sample index",
     )?;
@@ -1488,7 +871,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
             } else {
                 SampleDependency::DEPENDENT
             });
-            b.samples.push(Mp4Sample {
+            b.samples.push(TrackSample {
                 offset: sample_offsets[i],
                 size: b.sizes[i],
                 dts,
@@ -1502,7 +885,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Mp
                 .ok_or_else(|| limit("decode timestamp overflow"))?;
         }
     }
-    Ok(Mp4Track {
+    Ok(Track {
         id,
         kind,
         codec,
@@ -1811,7 +1194,7 @@ fn append_fragments(
                     }
                     ensure_allocation(
                         track.samples.len() + 1,
-                        std::mem::size_of::<Mp4Sample>(),
+                        std::mem::size_of::<TrackSample>(),
                         options,
                         "sample index",
                     )?;
@@ -1839,7 +1222,7 @@ fn append_fragments(
                         .map_err(|_| limit("fragment DTS exceeds i64"))?
                         .checked_add(s.cto)
                         .ok_or_else(|| malformed("fragment PTS overflow"))?;
-                    track.samples.push(Mp4Sample {
+                    track.samples.push(TrackSample {
                         offset,
                         size,
                         dts,
@@ -1891,7 +1274,7 @@ fn add_signed(base: u64, delta: i32) -> Result<u64> {
     .ok_or_else(|| malformed("fragment data offset overflow"))
 }
 
-fn validate_samples(track: &Mp4Track, source_len: u64, media_ranges: &[(u64, u64)]) -> Result<()> {
+fn validate_samples(track: &Track, source_len: u64, media_ranges: &[(u64, u64)]) -> Result<()> {
     for sample in &track.samples {
         if sample.size == 0 {
             return Err(malformed("sample size is zero"));
@@ -2039,21 +1422,11 @@ fn slice(bytes: &[u8], at: usize, len: usize) -> Result<&[u8]> {
     Ok(&bytes[at..at + len])
 }
 
-fn scale_time(value: u64, source_timescale: u32, destination_rate: u32) -> Result<u64> {
-    if source_timescale == 0 || destination_rate == 0 {
-        return Err(malformed("media timescale and sample rate must be nonzero"));
-    }
-    let numerator = u128::from(value)
-        .checked_mul(u128::from(destination_rate))
-        .ok_or_else(|| limit("media time scaling overflow"))?;
-    let rounded = numerator
-        .checked_add(u128::from(source_timescale) / 2)
-        .ok_or_else(|| limit("media time rounding overflow"))?
-        / u128::from(source_timescale);
-    u64::try_from(rounded).map_err(|_| limit("scaled media time cannot be represented"))
-}
-
-fn parse_aac_config(esds: &[u8], entry_rate: u32, entry_channels: u16) -> Result<AacTrackConfig> {
+pub(crate) fn parse_aac_config(
+    esds: &[u8],
+    entry_rate: u32,
+    entry_channels: u16,
+) -> Result<AacTrackConfig> {
     if esds.len() < 13 || &esds[4..8] != b"esds" {
         return Err(malformed("AAC decoder configuration is not an esds box"));
     }
@@ -2510,7 +1883,7 @@ mod tests {
         }
     }
 
-    fn bundled_hevc_track_and_bytes() -> (Mp4Track, Vec<u8>) {
+    fn bundled_hevc_track_and_bytes() -> (Track, Vec<u8>) {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/media/BigBuckBunny.mp4"
@@ -2536,7 +1909,7 @@ mod tests {
             inner: MemorySource::new(bytes),
             bytes_read: Cell::new(0),
         };
-        let provider = Mp4SampleProvider::new(track, source).unwrap();
+        let provider = TrackSampleProvider::new(track, source).unwrap();
         assert_eq!(
             provider.source().bytes_read.get(),
             0,
@@ -2559,13 +1932,13 @@ mod tests {
         assert_eq!(provider.source().bytes_read.get(), one_sample_size);
     }
 
-    fn track_sample_size(track: &Mp4Track, decode_index: usize) -> u64 {
+    fn track_sample_size(track: &Track, decode_index: usize) -> u64 {
         u64::from(track.samples[decode_index].size)
     }
 
     /// The bundled stereo movie's AAC track and a mono `.m4a` with a real
     /// priming edit, each with the file's bytes.
-    fn aac_fixture_tracks_and_bytes() -> Vec<(Mp4Track, Vec<u8>)> {
+    fn aac_fixture_tracks_and_bytes() -> Vec<(Track, Vec<u8>)> {
         [
             include_bytes!("../../../examples/media/BigBuckBunny.mp4").as_slice(),
             include_bytes!("../../../tests/fixtures/codec/aac_lc_mono_48k.m4a").as_slice(),
@@ -2595,7 +1968,7 @@ mod tests {
                 inner: MemorySource::new(bytes),
                 bytes_read: Cell::new(0),
             };
-            let provider = Mp4AudioPacketProvider::new(track, source).unwrap();
+            let provider = TrackAudioPacketProvider::new(track, source).unwrap();
             assert!(provider.len() > 1);
             for index in 0..provider.len() {
                 provider.decoded_range(index);
@@ -2619,7 +1992,7 @@ mod tests {
             let source = MemorySource::new(bytes.clone());
             let eager =
                 block_on(track.to_encoded_audio_samples(&source, &Limits::default())).unwrap();
-            let provider = Mp4AudioPacketProvider::new(track, MemorySource::new(bytes)).unwrap();
+            let provider = TrackAudioPacketProvider::new(track, MemorySource::new(bytes)).unwrap();
             assert_eq!(provider.len(), eager.len());
             for (index, expected) in eager.iter().enumerate() {
                 assert_eq!(provider.decoded_range(index), expected.decoded_range);
@@ -2635,17 +2008,17 @@ mod tests {
     fn mp4_audio_packet_provider_rejects_non_aac_tracks() {
         let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
         for codec in [Codec::Opus, Codec::Vorbis] {
-            let track = Mp4Track {
+            let track = Track {
                 codec,
                 ..aac.clone()
             };
-            let error = Mp4AudioPacketProvider::new(track, MemorySource::new(bytes.clone()))
+            let error = TrackAudioPacketProvider::new(track, MemorySource::new(bytes.clone()))
                 .err()
                 .expect("a non-AAC audio track is rejected");
             assert_eq!(error.kind(), ErrorKind::Unsupported);
         }
         let (video, bytes) = bundled_hevc_track_and_bytes();
-        let error = Mp4AudioPacketProvider::new(video, MemorySource::new(bytes))
+        let error = TrackAudioPacketProvider::new(video, MemorySource::new(bytes))
             .err()
             .expect("a video track is rejected");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
@@ -2653,7 +2026,7 @@ mod tests {
 
     /// Issue #676: a loader builds an AAC track's prefetched provider from
     /// the track's index alone, with exactly the decoded ranges the eager
-    /// path and `Mp4AudioPacketProvider` give.
+    /// path and `TrackAudioPacketProvider` give.
     #[test]
     fn a_loader_builds_an_aac_packet_provider_from_the_index_alone() {
         for (track, bytes) in aac_fixture_tracks_and_bytes() {
@@ -2664,13 +2037,13 @@ mod tests {
                 ))
                 .unwrap();
             let on_demand =
-                Mp4AudioPacketProvider::new(track.clone(), MemorySource::new(bytes.clone()))
+                TrackAudioPacketProvider::new(track.clone(), MemorySource::new(bytes.clone()))
                     .unwrap();
             let source = CountingSource {
                 inner: MemorySource::new(bytes),
                 bytes_read: Cell::new(0),
             };
-            let loader = crate::Mp4SampleLoader::new(track, source, 1 << 20).unwrap();
+            let loader = crate::TrackSampleLoader::new(track, source, 1 << 20).unwrap();
             let provider = loader.aac_packet_provider().unwrap();
             assert_eq!(provider.len(), eager.len());
             for (index, expected) in eager.iter().enumerate() {
@@ -2697,12 +2070,12 @@ mod tests {
     fn a_loader_rejects_an_aac_packet_provider_for_other_tracks() {
         let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
         for codec in [Codec::Opus, Codec::Vorbis] {
-            let track = Mp4Track {
+            let track = Track {
                 codec,
                 ..aac.clone()
             };
             let loader =
-                crate::Mp4SampleLoader::new(track, MemorySource::new(bytes.clone()), 1 << 20)
+                crate::TrackSampleLoader::new(track, MemorySource::new(bytes.clone()), 1 << 20)
                     .unwrap();
             let error = loader
                 .aac_packet_provider()
@@ -2711,7 +2084,8 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::Unsupported);
         }
         let (video, bytes) = bundled_hevc_track_and_bytes();
-        let loader = crate::Mp4SampleLoader::new(video, MemorySource::new(bytes), 1 << 24).unwrap();
+        let loader =
+            crate::TrackSampleLoader::new(video, MemorySource::new(bytes), 1 << 24).unwrap();
         let error = loader
             .aac_packet_provider()
             .err()
@@ -2722,12 +2096,12 @@ mod tests {
     /// A synthetic Opus track of packets with the given table-of-contents
     /// bytes and sample-table durations, stored back to back, with the bytes
     /// of the file that holds them.
-    fn opus_track_and_bytes(packets: &[(u8, u32)]) -> (Mp4Track, Vec<u8>) {
+    fn opus_track_and_bytes(packets: &[(u8, u32)]) -> (Track, Vec<u8>) {
         let mut bytes = Vec::new();
         let mut samples = Vec::new();
         let mut dts = 0_u64;
         for (index, &(toc, duration)) in packets.iter().enumerate() {
-            samples.push(Mp4Sample {
+            samples.push(TrackSample {
                 offset: bytes.len() as u64,
                 size: 4,
                 dts,
@@ -2739,7 +2113,7 @@ mod tests {
             bytes.extend_from_slice(&[toc, index as u8, 0, 0]);
             dts += u64::from(duration);
         }
-        let track = Mp4Track {
+        let track = Track {
             id: 1,
             kind: TrackKind::Audio,
             codec: Codec::Opus,
@@ -2781,7 +2155,7 @@ mod tests {
             inner: MemorySource::new(bytes),
             bytes_read: Cell::new(0),
         };
-        let loader = crate::Mp4SampleLoader::new(track, source, 1 << 20).unwrap();
+        let loader = crate::TrackSampleLoader::new(track, source, 1 << 20).unwrap();
         let provider = block_on(loader.opus_packet_provider()).unwrap();
         assert_eq!(loader.source().bytes_read.get(), 2);
         assert_eq!(provider.len(), eager.len());
@@ -2802,7 +2176,8 @@ mod tests {
         // A 10 ms packet the table says lasts 20 ms.
         packets[2].1 = 960;
         let (track, bytes) = opus_track_and_bytes(&packets);
-        let loader = crate::Mp4SampleLoader::new(track, MemorySource::new(bytes), 1 << 20).unwrap();
+        let loader =
+            crate::TrackSampleLoader::new(track, MemorySource::new(bytes), 1 << 20).unwrap();
         let provider = block_on(loader.opus_packet_provider()).unwrap();
         block_on(loader.load(0..packets.len(), 0)).unwrap();
         provider.read(1).unwrap();
@@ -2815,7 +2190,7 @@ mod tests {
     #[test]
     fn a_loader_rejects_an_opus_packet_provider_for_other_tracks() {
         let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
-        let loader = crate::Mp4SampleLoader::new(aac, MemorySource::new(bytes), 1 << 20).unwrap();
+        let loader = crate::TrackSampleLoader::new(aac, MemorySource::new(bytes), 1 << 20).unwrap();
         let error = block_on(loader.opus_packet_provider())
             .err()
             .expect("an AAC track is rejected");
@@ -2833,7 +2208,7 @@ mod tests {
         let eager = block_on(track.to_encoded_video_samples(&source, &Limits::default())).unwrap();
 
         let provider_source = MemorySource::new(bytes);
-        let provider = Mp4SampleProvider::new(track, provider_source).unwrap();
+        let provider = TrackSampleProvider::new(track, provider_source).unwrap();
         assert_eq!(provider.len(), eager.len());
         for (decode_index, expected) in eager.iter().enumerate() {
             assert_eq!(
@@ -2859,7 +2234,7 @@ mod tests {
         assert!(budget > 0, "the bundled sample is too small for this test");
         let source = MemorySource::new(bytes);
         let cache = CachingByteSource::new(source, 64 * 1024, budget).unwrap();
-        let provider = Mp4SampleProvider::new(track, cache).unwrap();
+        let provider = TrackSampleProvider::new(track, cache).unwrap();
 
         let len = provider.len();
         // Forward through the whole track, then seek back across it, then
