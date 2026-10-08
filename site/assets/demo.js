@@ -138,7 +138,6 @@ async function startScrubber() {
   let playStartedAt = 0;
   let playStartFrame = 0;
   let tickRequest = 0;
-  // Whether a timeline drag is under way, and whether the clip was playing when it began.
   let dragging = false;
   let resumeAfterDrag = false;
 
@@ -333,9 +332,8 @@ async function startScrubber() {
   $("#scrub-prev").addEventListener("click", () => (setPlaying(false), seek(shown - 1)));
   $("#scrub-next").addEventListener("click", () => (setPlaying(false), seek(shown + 1)));
   $("#scrub-random").addEventListener("click", () => (setPlaying(false), seek(Math.floor(Math.random() * frameCount))));
-  // A drag holds playback and its sound while it shows previews and exact frames, and picks
-  // playback back up from the frame it ends on if the clip was playing when it began.
-  timeline.addEventListener("pointerdown", () => {
+  timeline.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
     dragging = true;
     resumeAfterDrag ||= playing;
     if (playing) setPlaying(false);
@@ -345,15 +343,14 @@ async function startScrubber() {
     dragging = false;
     if (resumeAfterDrag) {
       resumeAfterDrag = false;
-      seek(Number(timeline.value));
       setPlaying(true);
     }
   };
   addEventListener("pointerup", endDrag);
   addEventListener("pointercancel", endDrag);
+  addEventListener("blur", endDrag);
   timeline.addEventListener("input", () => {
     seek(Number(timeline.value));
-    // A keyboard change has no drag to wait for, so playback carries on from the new frame now.
     if (playing) beginPlayback(wanted, performance.now());
   });
   canvas.addEventListener("keydown", (event) => {
