@@ -1,6 +1,6 @@
 //! Bounded, read-only ISO BMFF/MP4 probing and sample indexing.
 
-use crate::audio::{AudioEdit, AudioTrackTiming, EncodedAudioSample};
+use crate::audio::{AudioEdit, AudioPacketProvider, AudioTrackTiming, EncodedAudioSample};
 use crate::codec::{EncodedVideoSample, SampleDependency, SampleProvider, TrackKind};
 use crate::io::ByteSource;
 use crate::media::{Codec, VideoDimensions};
@@ -255,9 +255,14 @@ impl Mp4Track {
         } else {
             None
         };
+        // An AAC packet's interval comes from the sample table alone.
+        let aac_ranges = if self.codec == Codec::Aac {
+            Some(self.aac_decoded_ranges(sample_rate)?)
+        } else {
+            None
+        };
         let mut total_bytes = 0_u64;
         let mut decoded_start = 0_u64;
-        let mut track_ticks = 0_u64;
         let mut packets = Vec::with_capacity(self.samples.len());
         for (decode_index, sample) in self.samples.iter().enumerate() {
             total_bytes = total_bytes
@@ -278,19 +283,19 @@ impl Mp4Track {
                 });
                 continue;
             }
-            let decoded_end = if self.codec == Codec::Opus {
-                // An Opus packet's own table of contents says how long it
-                // decodes. Muxers shorten the last sample's duration to trim
-                // the stream's end - FFmpeg does - so the sample table cannot.
-                decoded_start
-                    .checked_add(u64::from(crate::opus::opus_packet_samples(&data)?))
-                    .ok_or_else(|| limit("audio track timing overflow"))?
-            } else {
-                track_ticks = track_ticks
-                    .checked_add(u64::from(sample.duration))
-                    .ok_or_else(|| limit("audio track timing overflow"))?;
-                scale_time(track_ticks, self.timescale, sample_rate)?
-            };
+            if let Some(ranges) = &aac_ranges {
+                packets.push(EncodedAudioSample {
+                    decoded_range: ranges[decode_index],
+                    data,
+                });
+                continue;
+            }
+            // An Opus packet's own table of contents says how long it
+            // decodes. Muxers shorten the last sample's duration to trim
+            // the stream's end - FFmpeg does - so the sample table cannot.
+            let decoded_end = decoded_start
+                .checked_add(u64::from(crate::opus::opus_packet_samples(&data)?))
+                .ok_or_else(|| limit("audio track timing overflow"))?;
             if decoded_end <= decoded_start {
                 return Err(malformed("audio packet has an empty decoded interval"));
             }
@@ -307,6 +312,26 @@ impl Mp4Track {
             return vorbis.encoded_samples(packets.into_iter().map(|packet| packet.data).collect());
         }
         Ok(packets)
+    }
+
+    /// The decoded PCM interval of every AAC packet, from the sample table's
+    /// durations alone. Reads no sample data.
+    fn aac_decoded_ranges(&self, sample_rate: u32) -> Result<Vec<crate::SampleRange>> {
+        let mut decoded_start = 0_u64;
+        let mut track_ticks = 0_u64;
+        let mut ranges = Vec::with_capacity(self.samples.len());
+        for sample in &self.samples {
+            track_ticks = track_ticks
+                .checked_add(u64::from(sample.duration))
+                .ok_or_else(|| limit("audio track timing overflow"))?;
+            let decoded_end = scale_time(track_ticks, self.timescale, sample_rate)?;
+            if decoded_end <= decoded_start {
+                return Err(malformed("audio packet has an empty decoded interval"));
+            }
+            ranges.push(crate::SampleRange::new(decoded_start, decoded_end)?);
+            decoded_start = decoded_end;
+        }
+        Ok(ranges)
     }
 
     /// Converts MP4 edit-list timing to the presentation sample clock used by
@@ -470,6 +495,89 @@ impl<S: ByteSource + Send> SampleProvider for Mp4SampleProvider<S> {
                      synchronously; it cannot drive one that suspends",
             )
         })??;
+        Ok(Cow::Owned(data))
+    }
+}
+
+/// An [`AudioPacketProvider`] that reads an AAC track's compressed packets
+/// from a [`ByteSource`] on demand, holding only `track`'s index (and
+/// whatever `S` itself caches) rather than every packet's bytes.
+///
+/// The audio counterpart of [`Mp4SampleProvider`], with the same requirement
+/// that `S::read_at`'s future resolve the first time it is polled: a source
+/// that suspends makes [`Self::read`] report [`ErrorKind::Unsupported`]
+/// rather than block.
+///
+/// Only AAC is supported. An AAC packet's decoded interval comes from the
+/// track's sample durations, so [`Self::new`] builds the whole index without
+/// reading any packet. An Opus packet's interval is in its own
+/// table-of-contents byte, and a Vorbis packet's depends on the block size of
+/// the packet before it, so an index for either needs every packet's bytes -
+/// the very data this provider exists not to hold. Those tracks keep using
+/// [`Mp4Track::to_encoded_audio_samples`]; [`Self::new`] rejects them.
+pub struct Mp4AudioPacketProvider<S> {
+    track: Mp4Track,
+    source: S,
+    decoded_ranges: Vec<crate::SampleRange>,
+}
+
+impl<S: ByteSource + Send> Mp4AudioPacketProvider<S> {
+    /// Fails if `track` is not an AAC audio track; reads no packet data.
+    pub fn new(track: Mp4Track, source: S) -> Result<Self> {
+        if track.kind != TrackKind::Audio || track.codec != Codec::Aac {
+            return Err(unsupported(
+                "an on-demand audio packet provider requires an AAC audio track",
+            ));
+        }
+        if track.samples.is_empty() {
+            return Err(malformed("audio track contains no samples"));
+        }
+        let decoded_ranges = track.aac_decoded_ranges(track.audio_sample_rate()?)?;
+        Ok(Self {
+            track,
+            source,
+            decoded_ranges,
+        })
+    }
+
+    pub fn track(&self) -> &Mp4Track {
+        &self.track
+    }
+
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<S: ByteSource + Send> AudioPacketProvider for Mp4AudioPacketProvider<S> {
+    fn len(&self) -> usize {
+        self.decoded_ranges.len()
+    }
+
+    fn decoded_range(&self, index: usize) -> crate::SampleRange {
+        self.decoded_ranges[index]
+    }
+
+    fn read(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        let size = self
+            .track
+            .samples
+            .get(index)
+            .ok_or_else(|| invalid("MP4 sample index is out of range"))?
+            .size as usize;
+        let mut data = vec![0_u8; size];
+        poll_once(self.track.read_sample_into(&self.source, index, &mut data)).ok_or_else(
+            || {
+                unsupported(
+                    "Mp4AudioPacketProvider requires a byte source whose reads complete \
+                     synchronously; it cannot drive one that suspends",
+                )
+            },
+        )??;
         Ok(Cow::Owned(data))
     }
 }
