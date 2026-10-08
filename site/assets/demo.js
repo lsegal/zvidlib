@@ -132,7 +132,9 @@ async function startScrubber() {
   let audioRun = 0;
 
   let shown = -1;
+  let previewShown = false;
   let wanted = 0;
+  let seekVersion = 0;
   let decoding = false;
   let playing = false;
   let playStartedAt = 0;
@@ -151,16 +153,21 @@ async function startScrubber() {
     if (decoding) return;
     decoding = true;
     try {
-      while (shown !== wanted) {
+      while (shown !== wanted || previewShown) {
         const target = wanted;
+        const version = seekVersion;
         const began = performance.now();
         const frame = await video.get(BigInt(target));
+        if (version !== seekVersion) {
+          frame.free();
+          continue;
+        }
         const elapsed = performance.now() - began;
         paint(canvas, frame);
         frame.free();
         shown = target;
+        previewShown = false;
         show("exact", target, playing ? null : `decoded in ${elapsed.toFixed(1)} ms`);
-        if (!playing) timeline.value = String(target);
       }
     } catch (error) {
       status.textContent = `video.get() rejected: ${errorText(zvid, error)}`;
@@ -198,11 +205,14 @@ async function startScrubber() {
 
   function seek(frame) {
     wanted = Math.max(0, Math.min(last, frame));
-    if (previews && wanted !== shown) {
+    seekVersion++;
+    timeline.value = String(wanted);
+    if (previews && (wanted !== shown || previewShown)) {
       const preview = previews.nearest(BigInt(wanted));
       if (preview) {
         const picture = preview.picture;
         paint(canvas, picture);
+        previewShown = true;
         show("preview", Number(preview.frame), `exact frame ${wanted} decoding…`);
         picture.free();
         preview.free();
