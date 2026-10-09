@@ -675,7 +675,7 @@ pub(crate) async fn read_exact<S: ByteSource + ?Sized>(
     Ok(())
 }
 
-fn scale_time(value: u64, source_timescale: u32, destination_rate: u32) -> Result<u64> {
+pub(crate) fn scale_time(value: u64, source_timescale: u32, destination_rate: u32) -> Result<u64> {
     if source_timescale == 0 || destination_rate == 0 {
         return Err(malformed("media timescale and sample rate must be nonzero"));
     }

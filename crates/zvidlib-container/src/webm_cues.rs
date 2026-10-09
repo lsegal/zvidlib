@@ -23,7 +23,10 @@ use crate::audio::AudioTrackTiming;
 use crate::codec::TrackKind;
 use crate::ebml::{self, children, read_uint};
 use crate::io::ByteSource;
-use crate::track::Track;
+use crate::media::Codec;
+use crate::opus::OPUS_SAMPLE_RATE;
+use crate::timeline::SampleRange;
+use crate::track::{Track, read_exact, scale_time};
 use crate::webm_demux::{
     Clock, Header, RawCue, Scan, TrackEntry, TrackMedia, Visit, WebmAudioTrim, WebmDemuxerOptions,
     WebmSkippedTrack, audio_timing, build_track, cued_blocks, parse_cues, parse_ebml_header,
@@ -335,6 +338,60 @@ impl WebmCuedIndex {
         )
     }
 
+    /// The decoded interval of each of `span`'s packets of the Opus track
+    /// `track_id`, as [`crate::TrackSampleLoader::opus_packet_provider`] gives
+    /// them for [`crate::WebmDemuxer`]'s index of the whole track: counted from
+    /// the track's first packet, whose presentation time is `first_pts`, by
+    /// the sample table's durations, and for the track's last packet - in the
+    /// last span - by its own table of contents, whose first bytes this reads
+    /// from `source`.
+    ///
+    /// The packets before the span are counted by their presentation times
+    /// rather than their durations, which agree whenever each block lasts until
+    /// the next, as Opus blocks without a `BlockDuration` do.
+    pub async fn opus_decoded_ranges<S: ByteSource + ?Sized>(
+        &self,
+        source: &S,
+        span: &WebmCueSpan,
+        track_id: u32,
+        first_pts: i64,
+    ) -> Result<Vec<SampleRange>> {
+        let track = span
+            .track(track_id)
+            .filter(|track| track.kind == TrackKind::Audio && track.codec == Codec::Opus)
+            .ok_or_else(|| invalid("no such WebM Opus track"))?;
+        let Some(first) = track.samples.first() else {
+            return Ok(Vec::new());
+        };
+        let mut track_ticks = u64::try_from(first.pts - first_pts)
+            .map_err(|_| malformed("a WebM audio block precedes the track's first"))?;
+        let mut ranges = Vec::with_capacity(track.samples.len());
+        let mut decoded_start = scale_time(track_ticks, track.timescale, OPUS_SAMPLE_RATE)?;
+        for (index, sample) in track.samples.iter().enumerate() {
+            let decoded_end = if span.is_last && index + 1 == track.samples.len() {
+                // A muxer shortens the last sample's duration to trim the
+                // stream's end, so only the packet itself says how long it is.
+                let mut head = [0_u8; 2];
+                let head = &mut head[..(sample.size as usize).min(2)];
+                read_exact(source, sample.offset, head).await?;
+                decoded_start
+                    .checked_add(u64::from(crate::opus::opus_packet_samples(head)?))
+                    .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "audio timing overflow"))?
+            } else {
+                track_ticks = track_ticks
+                    .checked_add(u64::from(sample.duration))
+                    .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "audio timing overflow"))?;
+                scale_time(track_ticks, track.timescale, OPUS_SAMPLE_RATE)?
+            };
+            if decoded_end <= decoded_start {
+                return Err(malformed("audio packet has an empty decoded interval"));
+            }
+            ranges.push(SampleRange::new(decoded_start, decoded_end)?);
+            decoded_start = decoded_end;
+        }
+        Ok(ranges)
+    }
+
     /// Indexes `span`: reads the block headers from its cued key frame to the
     /// next one, and the few after that time its last blocks, and gives each
     /// track's samples in it as [`crate::WebmDemuxer`] indexes them.
@@ -354,7 +411,7 @@ impl WebmCuedIndex {
         let start = span.checked_sub(1).map(|index| self.boundaries[index]);
         let stop = self.boundaries.get(span).copied();
         let video_number = u64::from(self.video_track);
-        let codecs: HashMap<u64, crate::media::Codec> = self
+        let codecs: HashMap<u64, Codec> = self
             .entries
             .iter()
             .filter_map(|entry| Some((entry.number, entry.indexed.as_ref()?.codec)))
@@ -760,6 +817,21 @@ mod tests {
         assert_eq!(
             cued.audio_timing(audio, spans.last()).unwrap(),
             whole.audio_timing(audio).unwrap()
+        );
+        // The Opus packets' intervals, a span at a time, are the ones the
+        // whole track's index gives.
+        let first_pts = spans[0].track(audio).unwrap().samples[0].pts;
+        let ranges: Vec<SampleRange> = spans
+            .iter()
+            .flat_map(|span| {
+                block_on(cued.opus_decoded_ranges(&source, span, audio, first_pts)).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            whole.tracks[1]
+                .opus_decoded_ranges(PACKET as u32)
+                .unwrap()
         );
         assert_eq!(cued.audio_timing(audio, spans.first()).unwrap().padding, 0);
     }
