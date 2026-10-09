@@ -181,6 +181,11 @@ path = "tests/on_demand_player.rs"
 required-features = ["av1-decoder", "av1-encoder", "opus-decoder", "opus-encoder"]
 
 [[test]]
+name = "on_demand_cued_webm"
+path = "tests/on_demand_cued_webm.rs"
+required-features = ["vp8-decoder", "vp8-encoder", "opus-decoder", "opus-encoder"]
+
+[[test]]
 name = "preview_index"
 path = "tests/preview_index.rs"
 required-features = ["hevc-decoder"]

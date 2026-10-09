@@ -173,7 +173,9 @@ impl WebmCuedIndex {
                         segment_start,
                     )?);
                 }
-                ebml::SEEK_HEAD => seeks.extend(parse_seek_head(&scan.payload(header, end).await?)?),
+                ebml::SEEK_HEAD => {
+                    seeks.extend(parse_seek_head(&scan.payload(header, end).await?)?)
+                }
                 _ => {}
             }
             cursor = end;
@@ -790,7 +792,12 @@ mod tests {
                 let base = samples.len();
                 assert_eq!(
                     (part.kind, part.codec, part.timescale, &part.decoder_config),
-                    (track.kind, track.codec, track.timescale, &track.decoder_config)
+                    (
+                        track.kind,
+                        track.codec,
+                        track.timescale,
+                        &track.decoder_config
+                    )
                 );
                 presentation_order.extend(part.presentation_order.iter().map(|index| base + index));
                 samples.extend(part.samples.iter().cloned());
@@ -808,10 +815,7 @@ mod tests {
                 (span.index > 0).then(|| video.samples[0].pts)
             );
             assert_eq!(cued.span_at(video.samples[0].pts), span.index);
-            assert_eq!(
-                cued.span_at(video.samples.last().unwrap().pts),
-                span.index
-            );
+            assert_eq!(cued.span_at(video.samples.last().unwrap().pts), span.index);
         }
         let audio = whole.tracks[1].id;
         assert_eq!(
@@ -829,9 +833,7 @@ mod tests {
             .collect();
         assert_eq!(
             ranges,
-            whole.tracks[1]
-                .opus_decoded_ranges(PACKET as u32)
-                .unwrap()
+            whole.tracks[1].opus_decoded_ranges(PACKET as u32).unwrap()
         );
         assert_eq!(cued.audio_timing(audio, spans.first()).unwrap().padding, 0);
     }
@@ -869,10 +871,7 @@ mod tests {
     fn a_webm_without_cues_is_left_to_the_whole_file_scan() {
         let mut bytes = webm(3);
         let cues = ebml::CUES.to_be_bytes();
-        let at = bytes
-            .windows(4)
-            .rposition(|window| window == cues)
-            .unwrap();
+        let at = bytes.windows(4).rposition(|window| window == cues).unwrap();
         bytes[at..at + 4].copy_from_slice(&ebml::TAGS.to_be_bytes());
         let source = MemorySource::new(bytes);
         assert!(

@@ -815,7 +815,9 @@ fn plays_and_seeks_the_bundled_sample_within_its_byte_budgets() {
     // before its target: these stay near the start to keep the test quick,
     // and still move back and forth across what the budgets can hold.
     for target in [0, 48, 16, 72, 24] {
-        player.seek(Duration::from_millis(target * 1_000 / 24)).unwrap();
+        player
+            .seek(Duration::from_millis(target * 1_000 / 24))
+            .unwrap();
         within_budgets(&player);
         for _ in 0..6 {
             clock.advance(rate / 24);

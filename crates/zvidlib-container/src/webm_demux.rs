@@ -913,7 +913,10 @@ pub(crate) fn parse_info(payload: &[u8]) -> Result<Info> {
     Ok(info)
 }
 
-pub(crate) fn parse_tracks(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Vec<TrackEntry>> {
+pub(crate) fn parse_tracks(
+    payload: &[u8],
+    options: &WebmDemuxerOptions,
+) -> Result<Vec<TrackEntry>> {
     let mut entries: Vec<TrackEntry> = Vec::new();
     for child in children(payload) {
         let (id, value) = child?;

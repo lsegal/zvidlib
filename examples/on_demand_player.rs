@@ -36,9 +36,10 @@ fn main() -> Result<()> {
     let dimensions = player.dimensions();
     // A WebM with Cues is indexed as playback reaches it, so its frame count
     // is unknown and its duration estimated until playback nears its end.
-    let frames = player
-        .frame_count()
-        .map_or_else(|| "indexed as it plays".to_owned(), |count| format!("{count} frames"));
+    let frames = player.frame_count().map_or_else(
+        || "indexed as it plays".to_owned(),
+        |count| format!("{count} frames"),
+    );
     println!(
         "Opened {}: {}x{}, {:.1} s, {frames}",
         path.display(),

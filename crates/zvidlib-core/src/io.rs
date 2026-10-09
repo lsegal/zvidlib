@@ -331,22 +331,30 @@ impl<S: ByteSource> CachingByteSource<S> {
         }
     }
 
-    /// Reads one page, from the cache if present, filling it from the inner
-    /// source otherwise.
-    async fn page(&self, page_index: u64) -> Result<Vec<u8>> {
-        if let Some(cached) = self.pages.borrow().get(&page_index) {
-            self.touch(page_index);
-            return Ok(cached.clone());
-        }
-        let mut bytes = vec![0_u8; self.page_size as usize];
+    /// Reads `pages` pages from `first` with one read of the inner source,
+    /// caches each of them, and returns their bytes, which end early where
+    /// the inner source does.
+    async fn fetch(&self, first: u64, pages: u64) -> Result<Vec<u8>> {
+        let length = usize::try_from(pages * self.page_size).map_err(|_| {
+            Error::new(
+                ErrorKind::ResourceLimit,
+                "caching byte source read is too large",
+            )
+        })?;
+        let mut bytes = vec![0_u8; length];
         let read = self
             .inner
-            .read_at(page_index * self.page_size, &mut bytes)
+            .read_at(first * self.page_size, &mut bytes)
             .await?;
         bytes.truncate(read);
-        *self.resident_bytes.borrow_mut() += bytes.len() as u64;
-        self.pages.borrow_mut().insert(page_index, bytes.clone());
-        self.touch(page_index);
+        for (index, chunk) in bytes.chunks(self.page_size as usize).enumerate() {
+            let page = first + index as u64;
+            *self.resident_bytes.borrow_mut() += chunk.len() as u64;
+            if let Some(replaced) = self.pages.borrow_mut().insert(page, chunk.to_vec()) {
+                *self.resident_bytes.borrow_mut() -= replaced.len() as u64;
+            }
+            self.touch(page);
+        }
         self.evict_until_within_budget();
         Ok(bytes)
     }
@@ -357,24 +365,42 @@ impl<S: ByteSource> ByteSource for CachingByteSource<S> {
         self.inner.len()
     }
 
+    /// Answers each cached page of the read from the cache, and fetches each
+    /// run of neighboring pages that is not with one read of the inner source,
+    /// so a read spanning many pages, such as a large index element, costs one
+    /// request however large it is (issue #692).
     fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
         Box::pin(async move {
             let mut produced = 0_usize;
             while produced < destination.len() {
                 let position = offset + produced as u64;
                 let page_index = position / self.page_size;
-                let page_start = page_index * self.page_size;
-                let in_page_offset = (position - page_start) as usize;
-                let page = self.page(page_index).await?;
-                if in_page_offset >= page.len() {
+                let in_page_offset = (position - page_index * self.page_size) as usize;
+                let cached = self.pages.borrow().get(&page_index).cloned();
+                let (bytes, pages) = match cached {
+                    Some(page) => {
+                        self.touch(page_index);
+                        (page, 1)
+                    }
+                    None => {
+                        let last_page = (offset + destination.len() as u64 - 1) / self.page_size;
+                        let mut run_end = page_index + 1;
+                        while run_end <= last_page && !self.pages.borrow().contains_key(&run_end) {
+                            run_end += 1;
+                        }
+                        let pages = run_end - page_index;
+                        (self.fetch(page_index, pages).await?, pages)
+                    }
+                };
+                if in_page_offset >= bytes.len() {
                     break;
                 }
-                let available = (page.len() - in_page_offset).min(destination.len() - produced);
+                let available = (bytes.len() - in_page_offset).min(destination.len() - produced);
                 destination[produced..produced + available]
-                    .copy_from_slice(&page[in_page_offset..in_page_offset + available]);
+                    .copy_from_slice(&bytes[in_page_offset..in_page_offset + available]);
                 produced += available;
-                if page.len() < self.page_size as usize {
-                    // The inner source ended partway through this page.
+                if (bytes.len() as u64) < pages * self.page_size {
+                    // The inner source ended partway through these pages.
                     break;
                 }
             }
@@ -435,10 +461,11 @@ mod tests {
     }
 
     /// A source that counts every byte actually read from it, so a test can
-    /// tell a cache hit from a fetch.
+    /// tell a cache hit from a fetch, and every request made of it.
     struct CountingSource {
         inner: MemorySource,
         reads: std::cell::Cell<u64>,
+        requests: std::cell::Cell<u64>,
     }
 
     impl ByteSource for CountingSource {
@@ -448,6 +475,7 @@ mod tests {
 
         fn read_at<'a>(&'a self, offset: u64, destination: &'a mut [u8]) -> IoFuture<'a, usize> {
             Box::pin(async move {
+                self.requests.set(self.requests.get() + 1);
                 let read = self.inner.read_at(offset, destination).await?;
                 self.reads.set(self.reads.get() + read as u64);
                 Ok(read)
@@ -459,7 +487,40 @@ mod tests {
         CountingSource {
             inner: MemorySource::new((0..bytes).map(|value| value as u8).collect::<Vec<u8>>()),
             reads: std::cell::Cell::new(0),
+            requests: std::cell::Cell::new(0),
         }
+    }
+
+    /// Issue #692: a read over many pages none of which is cached is one
+    /// request of the inner source, and a read over cached and uncached pages
+    /// fetches each uncached run at once, ending where the source ends.
+    #[test]
+    fn caching_byte_source_fetches_a_run_of_uncached_pages_in_one_request() {
+        let cache = CachingByteSource::new(large_source(1000), 64, 1_000_000).unwrap();
+        let mut destination = [0_u8; 500];
+        assert_eq!(ready(cache.read_at(10, &mut destination)).unwrap(), 500);
+        assert_eq!(cache.inner.requests.get(), 1);
+        let expected: Vec<u8> = (10..510).map(|value| value as u8).collect();
+        assert_eq!(&destination[..], expected.as_slice());
+
+        // Pages 0..=7 are cached; 8 to the end come in one more request.
+        let mut destination = [0_u8; 1000];
+        assert_eq!(ready(cache.read_at(0, &mut destination)).unwrap(), 1000);
+        assert_eq!(cache.inner.requests.get(), 2);
+        let expected: Vec<u8> = (0..1000).map(|value| value as u8).collect();
+        assert_eq!(&destination[..], expected.as_slice());
+        let mut destination = [0_u8; 1000];
+        assert_eq!(ready(cache.read_at(0, &mut destination)).unwrap(), 1000);
+        assert_eq!(cache.inner.requests.get(), 2);
+
+        // A run larger than the budget is still read whole and once.
+        let small = CachingByteSource::new(large_source(1000), 64, 128).unwrap();
+        let mut destination = [0_u8; 600];
+        assert_eq!(ready(small.read_at(100, &mut destination)).unwrap(), 600);
+        assert_eq!(small.inner.requests.get(), 1);
+        assert!(small.resident_bytes() <= 128);
+        let expected: Vec<u8> = (100..700).map(|value| value as u8).collect();
+        assert_eq!(&destination[..], expected.as_slice());
     }
 
     #[test]

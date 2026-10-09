@@ -319,11 +319,8 @@ impl<S: ByteSource + Clone + 'static> Input<S> {
                 IndexedPresentationTimeline::from_track(video, sample_rate, &self.limits)?.into()
             }
             Index::Cued(spans) => {
-                let timeline: Box<dyn LazyPresentationTimeline> = Box::new(CuedTimeline::new(
-                    spans.clone(),
-                    sample_rate,
-                    &self.limits,
-                )?);
+                let timeline: Box<dyn LazyPresentationTimeline> =
+                    Box::new(CuedTimeline::new(spans.clone(), sample_rate, &self.limits)?);
                 timeline.into()
             }
         })

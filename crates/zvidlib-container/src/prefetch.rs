@@ -901,7 +901,10 @@ mod tests {
         // Each loader loads only what its own provider missed.
         assert_eq!(block_on(first.load_missing()).unwrap(), 1);
         assert_eq!(first_provider.read(1).unwrap().as_ref(), &[1; 10]);
-        assert_eq!(second_provider.read(1).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(
+            second_provider.read(1).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
         assert_eq!(block_on(second.load_missing()).unwrap(), 1);
         assert_eq!(second_provider.read(1).unwrap().as_ref(), &[5; 10]);
 

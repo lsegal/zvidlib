@@ -141,10 +141,9 @@ impl<I: ByteSource> CuedSpans<I> {
     /// `Duration`, but never less than a second past where the last span
     /// starts.
     fn estimated_length(&self, sample_rate: u32) -> u64 {
-        let declared = self
-            .index
-            .duration_seconds
-            .map_or(0, |seconds| (seconds * f64::from(sample_rate)).round() as u64);
+        let declared = self.index.duration_seconds.map_or(0, |seconds| {
+            (seconds * f64::from(sample_rate)).round() as u64
+        });
         let last_start = self
             .index
             .span_start(self.index.span_count() - 1)
@@ -178,9 +177,12 @@ fn frame_intervals(
     Ok(video.presentation_order.iter().map(move |&index| {
         let sample = &video.samples[index];
         let pts = frame_identity(sample.pts)?.0;
-        let end = pts
-            .checked_add(u64::from(sample.duration))
-            .ok_or_else(|| Error::new(ErrorKind::ResourceLimit, "video presentation timing overflow"))?;
+        let end = pts.checked_add(u64::from(sample.duration)).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ResourceLimit,
+                "video presentation timing overflow",
+            )
+        })?;
         Ok((
             FrameIndex(pts),
             SampleRange::new(
@@ -318,12 +320,7 @@ impl<V> SpanVideo<V> {
         self.frames
             .binary_search(&frame)
             .map(|position| FrameIndex(position as u64))
-            .map_err(|_| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    "presentation frame is not indexed",
-                )
-            })
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "presentation frame is not indexed"))
     }
 }
 
@@ -408,8 +405,7 @@ impl<I: ByteSource, V: PrefetchVideoSource> PrefetchVideoSource for CuedVideoSou
             // Near the span's end, the next span's first frames are loaded
             // too, so playback crosses into it without waiting.
             let remaining = current.frames.len().saturating_sub(local.0 as usize);
-            if remaining > VIDEO_READAHEAD_SAMPLES || span + 1 >= self.spans.index().span_count()
-            {
+            if remaining > VIDEO_READAHEAD_SAMPLES || span + 1 >= self.spans.index().span_count() {
                 return Ok(());
             }
             if self.next.as_ref().is_none_or(|next| next.span != span + 1) {
@@ -654,9 +650,10 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioWindow<I, S> {
     /// `span`'s samples of the track and their decoded intervals.
     async fn span_packets(&self, span: usize) -> Result<(Track, Vec<SampleRange>)> {
         let indexed = self.spans.span(span).await?;
-        let part = indexed.track(self.track.id).cloned().ok_or_else(|| {
-            Error::new(ErrorKind::Internal, "a cue span lost an audio track")
-        })?;
+        let part = indexed
+            .track(self.track.id)
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::Internal, "a cue span lost an audio track"))?;
         let ranges = self
             .spans
             .index()
@@ -680,8 +677,10 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioWindow<I, S> {
     async fn restart(&mut self, media: u64) -> Result<()> {
         let index = self.spans.index();
         let ticks = self.first_pts.saturating_add(
-            i64::try_from(media * u64::from(index.timescale()) / u64::from(crate::opus::OPUS_SAMPLE_RATE))
-                .unwrap_or(i64::MAX),
+            i64::try_from(
+                media * u64::from(index.timescale()) / u64::from(crate::opus::OPUS_SAMPLE_RATE),
+            )
+            .unwrap_or(i64::MAX),
         );
         let count = index.span_count();
         let mut first = index.span_at(ticks);
@@ -852,7 +851,9 @@ impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PrefetchAudioSource
             loader.load_missing().await?;
             // Covering the range may have found the presentation shorter than
             // it was estimated to be when the range was asked for.
-            let end = range.end.min(self.packets.presentation_length(&self.reader));
+            let end = range
+                .end
+                .min(self.packets.presentation_length(&self.reader));
             if range.start >= end {
                 return Ok(());
             }
