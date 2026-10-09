@@ -181,8 +181,8 @@ fn frame_identity(pts: i64) -> Result<FrameIndex> {
 fn frame_intervals(
     video: &Track,
     sample_rate: u32,
-) -> Result<impl Iterator<Item = Result<(FrameIndex, SampleRange)>> + '_> {
-    Ok(video.presentation_order.iter().map(move |&index| {
+) -> impl Iterator<Item = Result<(FrameIndex, SampleRange)>> + '_ {
+    video.presentation_order.iter().map(move |&index| {
         let sample = &video.samples[index];
         let pts = frame_identity(sample.pts)?.0;
         let end = pts.checked_add(u64::from(sample.duration)).ok_or_else(|| {
@@ -198,7 +198,7 @@ fn frame_intervals(
                 scale_to_audio_samples(end, video.timescale, sample_rate)?,
             )?,
         ))
-    }))
+    })
 }
 
 fn not_indexed() -> Error {
@@ -257,7 +257,7 @@ impl<I: ByteSource> LazyPresentationTimeline for CuedTimeline<I> {
         let span = self.span_for_sample(sample);
         let indexed = self.spans.indexed(span).ok_or_else(not_indexed)?;
         let mut last = None;
-        for interval in frame_intervals(self.spans.video(&indexed)?, self.sample_rate)? {
+        for interval in frame_intervals(self.spans.video(&indexed)?, self.sample_rate) {
             let (frame, range) = interval?;
             if range.end > sample {
                 return Ok(frame);
@@ -277,7 +277,7 @@ impl<I: ByteSource> LazyPresentationTimeline for CuedTimeline<I> {
             .spans
             .indexed(self.spans.span_of(frame))
             .ok_or_else(not_indexed)?;
-        for interval in frame_intervals(self.spans.video(&indexed)?, self.sample_rate)? {
+        for interval in frame_intervals(self.spans.video(&indexed)?, self.sample_rate) {
             let (identity, range) = interval?;
             if identity == frame {
                 return Ok(range);
@@ -446,7 +446,7 @@ impl<I: ByteSource> PlaybackAudioSource for CuedSilence<I> {
         let exact = self.spans.last().and_then(|last| {
             let video = self.spans.video(&last).ok()?;
             let mut end = None;
-            for interval in frame_intervals(video, self.sample_rate).ok()? {
+            for interval in frame_intervals(video, self.sample_rate) {
                 end = Some(interval.ok()?.1.end);
             }
             end
@@ -737,7 +737,7 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioWindow<I, S> {
 /// The packets an audio track's reader reads: the whole track's, indexed when
 /// the input opened, or a cued WebM's window of them.
 pub(crate) enum AudioPackets<I, S> {
-    Whole(TrackSampleLoader<S>),
+    Whole(Box<TrackSampleLoader<S>>),
     Cued(Box<AudioWindow<I, S>>),
 }
 

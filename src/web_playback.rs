@@ -389,7 +389,12 @@ impl BrowserAudioSource {
             AudioIndex::Whole(timing) => {
                 let loader = TrackSampleLoader::new(audio, source, budget_bytes)?;
                 let (provider, preroll) = audio_packets(&loader).await?;
-                (AudioPackets::Whole(loader), provider, timing, preroll)
+                (
+                    AudioPackets::Whole(Box::new(loader)),
+                    provider,
+                    timing,
+                    preroll,
+                )
             }
             AudioIndex::Cued(spans) => {
                 let (window, provider, timing) =
@@ -785,7 +790,7 @@ impl PrefetchVideoSource for BrowserVideoSource {
 /// a time.
 pub(crate) enum PlaybackVideo {
     Whole(BrowserVideoSource),
-    Cued(CuedVideoSource<PageSource, BrowserVideoSource>),
+    Cued(Box<CuedVideoSource<PageSource, BrowserVideoSource>>),
 }
 
 impl PlaybackVideoSource for PlaybackVideo {
@@ -1174,7 +1179,7 @@ impl WasmOnDemandPlayback {
                     .map_err(core_error)?,
                 ),
             }),
-            Opening::Cued { spans, video, .. } => PlaybackVideo::Cued(
+            Opening::Cued { spans, video, .. } => PlaybackVideo::Cued(Box::new(
                 cued_video(
                     spans,
                     video,
@@ -1185,7 +1190,7 @@ impl WasmOnDemandPlayback {
                 )
                 .await
                 .map_err(core_error)?,
-            ),
+            )),
         };
 
         let audio_source = match &opening {

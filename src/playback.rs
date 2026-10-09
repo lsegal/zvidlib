@@ -868,6 +868,9 @@ impl<V: PrefetchVideoSource, A: PrefetchAudioSource, O: PlaybackAudioOutput>
     /// were missing. Calling it ahead of time, between frames, keeps them from reporting it at
     /// all. [`Self::seek`] itself never needs it: the only thing it reads is a preroll it can
     /// skip.
+    ///
+    /// On a [`LazyPresentationTimeline`] it first indexes the part of the timeline the clock is
+    /// in, which until then reports [`ErrorKind::WouldBlock`] too.
     pub async fn prefetch(&mut self) -> Result<()> {
         let now = self.current_sample();
         self.timeline.prepare(now).await?;

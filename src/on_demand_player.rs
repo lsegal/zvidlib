@@ -132,8 +132,8 @@ type TrackAudio<S> = PacketAudioSource<Box<dyn AudioDecoder>, IndexSource<S>, S>
 /// What the player's video comes from: the whole track's index, or a cued
 /// WebM's spans.
 enum PlayerVideo<S> {
-    Whole(OnDemandVideoSource<S>),
-    Cued(CuedVideoSource<IndexSource<S>, OnDemandVideoSource<S>>),
+    Whole(Box<OnDemandVideoSource<S>>),
+    Cued(Box<CuedVideoSource<IndexSource<S>, OnDemandVideoSource<S>>>),
 }
 
 impl<S: ByteSource> PlayerVideo<S> {
@@ -376,7 +376,12 @@ impl<S: ByteSource + Clone + 'static> Input<S> {
                     self.options.audio_budget_bytes,
                 )?;
                 let (provider, preroll) = block_on(audio_packets(&loader))?;
-                (AudioPackets::Whole(loader), provider, timing, preroll)
+                (
+                    AudioPackets::Whole(Box::new(loader)),
+                    provider,
+                    timing,
+                    preroll,
+                )
             }
             Index::Cued(spans) => {
                 let (window, provider, timing) = block_on(AudioWindow::open(
@@ -531,7 +536,7 @@ impl<S: ByteSource + Clone + 'static> OnDemandPlayer<S> {
                 audio_timings,
             },
             audio_tracks,
-            PlayerVideo::Whole(video_source),
+            PlayerVideo::Whole(Box::new(video_source)),
             dimensions,
         ))
     }
@@ -582,7 +587,7 @@ impl<S: ByteSource + Clone + 'static> OnDemandPlayer<S> {
         Ok((
             Index::Cued(spans),
             audio_tracks,
-            PlayerVideo::Cued(video_source),
+            PlayerVideo::Cued(Box::new(video_source)),
             dimensions,
         ))
     }

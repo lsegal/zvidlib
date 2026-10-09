@@ -243,11 +243,14 @@ impl Future for YieldOnce {
     }
 }
 
+/// Each buffer an output was asked to play: its samples and where they go.
+type Scheduled = Vec<(SampleRange, Vec<f32>)>;
+
 /// A clock the test moves by hand, and every buffer scheduled against it.
 #[derive(Clone, Default)]
 struct Output {
     clock: Arc<Mutex<u64>>,
-    scheduled: Arc<Mutex<Vec<(SampleRange, Vec<f32>)>>>,
+    scheduled: Arc<Mutex<Scheduled>>,
 }
 
 impl AudioOutputBackend for Output {
@@ -290,10 +293,10 @@ enum Event {
     Paused(Vec<u8>),
 }
 
-/// Plays `bytes` from `source` through a fixed script of clock steps, seeks
-/// and pauses, and returns what it presented, the audio it scheduled, its
-/// duration once it played to the end, and the reads it took to open.
-fn play(source: SuspendingSource) -> (Vec<Event>, Vec<(SampleRange, Vec<f32>)>, Duration, usize) {
+/// Plays what `source` reads through a fixed script of clock steps, seeks and
+/// pauses, and returns what it presented, the audio it scheduled, and its
+/// duration once it played to the end.
+fn play(source: SuspendingSource) -> (Vec<Event>, Scheduled, Duration) {
     let output = Output::default();
     let mut player = OnDemandPlayer::with_output(
         source.clone(),
@@ -305,7 +308,6 @@ fn play(source: SuspendingSource) -> (Vec<Event>, Vec<(SampleRange, Vec<f32>)>, 
         opener(&output),
     )
     .unwrap();
-    let opening_reads = source.reads.get();
     let mut events = Vec::new();
     let present = |player: &mut OnDemandPlayer<SuspendingSource>, events: &mut Vec<Event>| {
         let presentation = player.present().unwrap();
@@ -362,7 +364,7 @@ fn play(source: SuspendingSource) -> (Vec<Event>, Vec<(SampleRange, Vec<f32>)>, 
     assert!(finished, "playback never reached the end");
     let duration = player.duration();
     let scheduled = std::mem::take(&mut *output.scheduled.lock().unwrap());
-    (events, scheduled, duration, opening_reads)
+    (events, scheduled, duration)
 }
 
 /// Issue #692: a cued WebM plays and seeks, over a source whose reads
@@ -373,8 +375,8 @@ fn plays_and_seeks_a_cued_webm_as_its_whole_index_does() {
     let bytes = webm(video(4), Some(audio(4)));
     let cued = SuspendingSource::new(bytes.clone());
     let scanned = SuspendingSource::new(without_cues(bytes));
-    let (cued_events, cued_audio, cued_duration, _) = play(cued.clone());
-    let (events, audio, duration, _) = play(scanned.clone());
+    let (cued_events, cued_audio, cued_duration) = play(cued);
+    let (events, audio, duration) = play(scanned);
     assert_eq!(cued_events.len(), events.len());
     for (index, (cued, whole)) in cued_events.iter().zip(&events).enumerate() {
         assert_eq!(cued, whole, "event {index} differs");
@@ -400,7 +402,7 @@ fn plays_and_seeks_a_cued_webm_as_its_whole_index_does() {
     assert_eq!(cued_duration, duration);
 }
 
-//// A video-only cued WebM shows, wherever a seek lands, the frame the whole
+/// A video-only cued WebM shows, wherever a seek lands, the frame the whole
 /// file's index shows there, and finds its end where that index puts it. With
 /// no audio track it plays on the system's clock, so the seeks are made while
 /// paused, where nothing depends on how fast the test runs.
