@@ -135,6 +135,9 @@ pub struct AudioSampleReader<D> {
     timing: AudioTrackTiming,
     sample_rate: u32,
     channels: u16,
+    /// Where the first packet's decoded interval starts: zero for a whole
+    /// track, and later for a window of one (see [`Self::replace_packets`]).
+    decoded_start: u64,
     decoded_length: u64,
     presentation_length: u64,
     preroll_packets: usize,
@@ -174,6 +177,11 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
     ///
     /// Behaves exactly as [`Self::new`], which is this constructor with an
     /// owned `Vec<EncodedAudioSample>` as the provider.
+    ///
+    /// The packets' intervals must be contiguous. They normally start at zero,
+    /// as a whole track's do; a provider holding only a window of a track's
+    /// packets starts at its first packet's interval, and the reader then
+    /// refuses requests for samples before it.
     pub fn from_provider(
         decoder: D,
         packets: Box<dyn AudioPacketProvider>,
@@ -183,47 +191,13 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
         preroll_packets: usize,
         limits: Limits,
     ) -> Result<Self> {
-        if packets.is_empty() {
-            return Err(invalid("an audio reader requires at least one packet"));
-        }
         if sample_rate == 0 || sample_rate > limits.max_sample_rate {
             return Err(limit("audio sample rate is outside configured limits"));
         }
         if channels == 0 || channels > limits.max_audio_channels {
             return Err(limit("audio channel count is outside configured limits"));
         }
-        let mut expected = 0;
-        for index in 0..packets.len() {
-            let range = packets.decoded_range(index);
-            if range.start != expected {
-                return Err(invalid("audio packet sample intervals must be contiguous"));
-            }
-            expected = range.end;
-        }
-        if expected == 0 {
-            return Err(invalid("audio packets decode no samples"));
-        }
-        let trimmed = expected
-            .checked_sub(u64::from(timing.priming) + u64::from(timing.padding))
-            .ok_or_else(|| invalid("audio priming and padding exceed decoded duration"))?;
-        validate_edits(&timing, expected)?;
-        let presentation_length = if timing.edits.is_empty() {
-            if timing.track_offset >= 0 {
-                trimmed.checked_add(timing.track_offset.unsigned_abs())
-            } else {
-                trimmed.checked_sub(timing.track_offset.unsigned_abs())
-            }
-            .ok_or_else(|| invalid("track offset exceeds gapless audio duration"))?
-        } else {
-            timing.edits.iter().try_fold(0, |length, edit| {
-                Ok::<_, Error>(
-                    length.max(
-                        shifted_edit(*edit, timing.track_offset)?
-                            .map_or(0, |shifted| shifted.presentation.end),
-                    ),
-                )
-            })?
-        };
+        let lengths = PacketLengths::of(packets.as_ref(), &timing)?;
         Ok(Self {
             decoder,
             packets,
@@ -233,11 +207,46 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
             timing,
             sample_rate,
             channels,
-            decoded_length: expected,
-            presentation_length,
+            decoded_start: lengths.decoded_start,
+            decoded_length: lengths.decoded_length,
+            presentation_length: lengths.presentation_length,
             preroll_packets,
             limits,
         })
+    }
+
+    /// Reads from `packets` and with `timing` from now on, for a track whose
+    /// packets are indexed as playback reaches them (issue #692): a window of
+    /// them that grows as playback goes on, or a new one where a seek lands.
+    ///
+    /// When `packets` begins with every packet the reader had, at the same
+    /// intervals, the decoder and the samples it has decoded are kept, so
+    /// reading on past the old window's end continues the decode rather than
+    /// resetting it. Otherwise both are dropped, as [`Self::reset`] does. The
+    /// packets are validated as [`Self::from_provider`] validates them.
+    pub fn replace_packets(
+        &mut self,
+        packets: Box<dyn AudioPacketProvider>,
+        timing: AudioTrackTiming,
+    ) -> Result<()> {
+        let lengths = PacketLengths::of(packets.as_ref(), &timing)?;
+        let extends = packets.len() >= self.packets.len()
+            && (0..self.packets.len())
+                .all(|index| packets.decoded_range(index) == self.packets.decoded_range(index));
+        if !extends {
+            self.reset()?;
+        }
+        self.packets = packets;
+        self.timing = timing;
+        self.decoded_start = lengths.decoded_start;
+        self.decoded_length = lengths.decoded_length;
+        self.presentation_length = lengths.presentation_length;
+        Ok(())
+    }
+
+    /// The number of packets the reader reads from.
+    pub fn packet_count(&self) -> usize {
+        self.packets.len()
     }
 
     pub const fn sample_rate(&self) -> u32 {
@@ -496,6 +505,11 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
 
     /// [`Self::plan_decode`]'s decision, without acting on it.
     fn plan(&self, range: SampleRange) -> Result<Planned> {
+        if range.start < self.decoded_start {
+            return Err(invalid(
+                "audio request starts before the packets the reader holds",
+            ));
+        }
         let first = (0..self.packets.len())
             .find(|&index| self.packets.decoded_range(index).end > range.start)
             .ok_or_else(|| invalid("audio edit maps beyond decoded samples"))?;
@@ -598,6 +612,62 @@ impl<D: AudioDecoder> AudioSampleReader<D> {
                 .copy_from_slice(&buffer.samples[input_start..input_start + count]);
         }
         Ok(())
+    }
+}
+
+/// Where a reader's packets' decoded samples start and end, and how long the
+/// presentation they make with a timing is.
+struct PacketLengths {
+    decoded_start: u64,
+    decoded_length: u64,
+    presentation_length: u64,
+}
+
+impl PacketLengths {
+    /// Validates `packets` and `timing` together: at least one packet,
+    /// contiguous intervals, and trims and edits within what they decode.
+    fn of(packets: &dyn AudioPacketProvider, timing: &AudioTrackTiming) -> Result<Self> {
+        if packets.is_empty() {
+            return Err(invalid("an audio reader requires at least one packet"));
+        }
+        let decoded_start = packets.decoded_range(0).start;
+        let mut expected = decoded_start;
+        for index in 0..packets.len() {
+            let range = packets.decoded_range(index);
+            if range.start != expected {
+                return Err(invalid("audio packet sample intervals must be contiguous"));
+            }
+            expected = range.end;
+        }
+        if expected == decoded_start {
+            return Err(invalid("audio packets decode no samples"));
+        }
+        let trimmed = expected
+            .checked_sub(u64::from(timing.priming) + u64::from(timing.padding))
+            .ok_or_else(|| invalid("audio priming and padding exceed decoded duration"))?;
+        validate_edits(timing, expected)?;
+        let presentation_length = if timing.edits.is_empty() {
+            if timing.track_offset >= 0 {
+                trimmed.checked_add(timing.track_offset.unsigned_abs())
+            } else {
+                trimmed.checked_sub(timing.track_offset.unsigned_abs())
+            }
+            .ok_or_else(|| invalid("track offset exceeds gapless audio duration"))?
+        } else {
+            timing.edits.iter().try_fold(0, |length, edit| {
+                Ok::<_, Error>(
+                    length.max(
+                        shifted_edit(*edit, timing.track_offset)?
+                            .map_or(0, |shifted| shifted.presentation.end),
+                    ),
+                )
+            })?
+        };
+        Ok(Self {
+            decoded_start,
+            decoded_length: expected,
+            presentation_length,
+        })
     }
 }
 
@@ -813,6 +883,74 @@ mod tests {
                 Err(Error::new(ErrorKind::WouldBlock, "not loaded yet"))
             }
         }
+    }
+
+    /// Issue #692: a reader over a window of a track's packets decodes what a
+    /// reader over all of them does, refuses samples before the window, and
+    /// reads on into a window that grows without resetting its decoder.
+    #[test]
+    fn a_window_of_packets_reads_as_the_whole_track_and_grows_without_a_reset() {
+        let cancellation = CancellationToken::new();
+        let (mut whole, _) = counted_reader(20, 2, Limits::default());
+        let decoder = FixtureDecoder::default();
+        let counts = decoder.counts.clone();
+        let mut window = AudioSampleReader::new(
+            decoder,
+            packets_of(20)[5..10].to_vec(),
+            48_000,
+            1,
+            AudioTrackTiming::default(),
+            2,
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(window.presentation_length(), 40);
+        assert_eq!(window.packet_count(), 5);
+        let range = SampleRange::new(30, 38).unwrap();
+        assert_eq!(
+            window.get_range(range, &cancellation).unwrap(),
+            whole.get_range(range, &cancellation).unwrap()
+        );
+        assert_eq!(
+            window
+                .get_range(SampleRange::new(18, 22).unwrap(), &cancellation)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let resets = counts.resets.get();
+
+        // The window grows: what it decoded is kept, and the decode goes on.
+        window
+            .replace_packets(
+                Box::new(packets_of(20)[5..15].to_vec()),
+                AudioTrackTiming::default(),
+            )
+            .unwrap();
+        assert_eq!(window.presentation_length(), 60);
+        assert_eq!(window.packets_for_range(range).unwrap(), Vec::new());
+        let decodes = counts.decodes.get();
+        let later = SampleRange::new(38, 50).unwrap();
+        assert_eq!(
+            window.get_range(later, &cancellation).unwrap(),
+            whole.get_range(later, &cancellation).unwrap()
+        );
+        assert_eq!(counts.resets.get(), resets);
+        assert_eq!(counts.decodes.get(), decodes + 3);
+
+        // A window elsewhere starts again.
+        window
+            .replace_packets(
+                Box::new(packets_of(20)[12..20].to_vec()),
+                AudioTrackTiming::default(),
+            )
+            .unwrap();
+        assert_eq!(counts.resets.get(), resets + 1);
+        let end = SampleRange::new(72, 80).unwrap();
+        assert_eq!(
+            window.get_range(end, &cancellation).unwrap(),
+            whole.get_range(end, &cancellation).unwrap()
+        );
     }
 
     /// Issue #672: a request whose provider has not loaded a packet yet reports `WouldBlock`,
