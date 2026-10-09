@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use zvidlib::{FrameIndex, OnDemandOptions, OnDemandPlayer, Result};
+use zvidlib::{OnDemandOptions, OnDemandPlayer, Result};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -34,12 +34,17 @@ fn main() -> Result<()> {
         },
     )?;
     let dimensions = player.dimensions();
+    // A WebM with Cues is indexed as playback reaches it, so its frame count
+    // is unknown and its duration estimated until playback nears its end.
+    let frames = player
+        .frame_count()
+        .map_or_else(|| "indexed as it plays".to_owned(), |count| format!("{count} frames"));
     println!(
-        "Opened {}: {}x{}, {} frames",
+        "Opened {}: {}x{}, {:.1} s, {frames}",
         path.display(),
         dimensions.width,
         dimensions.height,
-        player.frame_count()
+        player.duration().as_secs_f64(),
     );
     for (index, track) in player.audio_tracks().iter().enumerate() {
         println!(
@@ -55,19 +60,19 @@ fn main() -> Result<()> {
     let mut switched = language.is_none();
     let mut sought = false;
     loop {
-        let (presentation, frame) = player.present()?;
+        let presentation = player.present()?;
         if presentation.finished || started.elapsed() > Duration::from_secs(10) {
             break;
         }
-        if frame.is_some() {
+        if presentation.frame.is_some() {
             presented += 1;
         }
         if !switched && started.elapsed() > Duration::from_secs(5) {
             let language = language.as_deref().unwrap_or_default();
             player.select_audio_language(language)?;
             println!(
-                "Switched to the {language} audio track at frame {}",
-                presentation.requested_frame.0
+                "Switched to the {language} audio track at {:.2} s",
+                presentation.time.as_secs_f64()
             );
             switched = true;
         }
@@ -75,8 +80,8 @@ fn main() -> Result<()> {
             // Jump back, as a seek bar would. A seek decodes from the key frame
             // before its target, and the bundled sample has only one, so this
             // stays near the start.
-            player.seek(FrameIndex(12))?;
-            println!("Sought back to frame 12");
+            player.seek(Duration::from_millis(500))?;
+            println!("Sought back to 0.5 s");
             sought = true;
         }
         std::thread::sleep(Duration::from_millis(4));

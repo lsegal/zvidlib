@@ -103,16 +103,6 @@ extern "C" {
 /// third of a second at 24 frames a second.
 const DECODED_VIDEO_FRAMES: u64 = 8;
 
-/// The page size opening an input reads its container's header and index
-/// through. A WebM's index is every block's header, a few bytes each across
-/// all of its clusters, so a page combines the headers of the blocks near each
-/// other into one request instead of two requests a block (issue #685).
-const INDEX_PAGE_BYTES: u64 = 4 * 1024;
-
-/// The index pages opening an input holds at once. The index is read front to
-/// back, so only the pages around the read in progress are worth keeping.
-const INDEX_CACHE_BYTES: u64 = 64 * 1024;
-
 /// How many prefetch passes an audio decode may take to load packets the plan
 /// missed before giving up on the request.
 const MAX_AUDIO_LOAD_PASSES: usize = 8;

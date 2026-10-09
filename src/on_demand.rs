@@ -47,6 +47,17 @@ pub(crate) const AUDIO_READAHEAD_PACKETS: usize = 16;
 /// standing in for an audio sample rate.
 pub(crate) const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 
+/// The page size an input's container header and index are read through. A
+/// WebM's index is every block's header, a few bytes each, so a page combines
+/// the headers of the blocks near each other into one request instead of two
+/// requests a block (issue #685).
+pub(crate) const INDEX_PAGE_BYTES: u64 = 4 * 1024;
+
+/// The index pages held at once. An index is read front to back, a span at a
+/// time for a cued WebM (issue #692), so only the pages around the read in
+/// progress are worth keeping.
+pub(crate) const INDEX_CACHE_BYTES: u64 = 64 * 1024;
+
 /// How many AAC access units an audio read decodes ahead of the first it
 /// needs. Each AAC frame overlaps the one before it, so one is enough; the
 /// second covers the decoder's own start-up.

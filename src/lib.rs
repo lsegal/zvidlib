@@ -312,7 +312,9 @@ pub use native_audio::DefaultAudioOutput;
 pub use native_audio::NativeAacDecoder;
 #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 #[doc(no_inline)]
-pub use on_demand_player::{AudioOutputOpener, OnDemandOptions, OnDemandPlayer};
+pub use on_demand_player::{
+    AudioOutputOpener, OnDemandOptions, OnDemandPlayer, OnDemandPresentation,
+};
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(no_inline)]
 pub use previews::PreviewIndex;

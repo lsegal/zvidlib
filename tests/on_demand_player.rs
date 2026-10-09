@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use zvidlib::io::{ByteSource, FileSource, IoFuture, MemorySink, MemorySource};
 use zvidlib::mp4::{Mp4Muxer, Mp4TrackConfig, Mp4TrackFormat};
@@ -332,6 +333,22 @@ fn outputs(clock: &Clock) -> (AudioOutputOpener, OpenedOutputs) {
     (opener, all)
 }
 
+/// When frame `index` of [`movie`] starts in an MP4.
+fn at(index: u64) -> Duration {
+    Duration::from_nanos(index * 1_000_000_000 / RATE)
+}
+
+/// When frame `index` of [`webm`] starts: a WebM times its blocks in whole
+/// milliseconds.
+fn webm_at(index: u64) -> Duration {
+    Duration::from_millis(index * 1_000 / RATE)
+}
+
+/// The frame of [`movie`] or [`webm`] that starts at `time`.
+fn frame_at(time: Duration) -> u64 {
+    (time.as_secs_f64() * RATE as f64).round() as u64
+}
+
 fn assert_gray(frame: &VideoFrame, index: u64) {
     let plane = &frame.planes[0];
     let row = frame.dimensions.width as usize * 4;
@@ -379,7 +396,8 @@ fn opens_a_file_and_plays_it_without_the_caller_loading_anything() {
         opener,
     )
     .unwrap();
-    assert_eq!(player.frame_count(), FRAMES);
+    assert_eq!(player.frame_count(), Some(FRAMES));
+    assert_eq!(player.duration(), at(FRAMES));
     assert_eq!(player.sample_rate(), Some(48_000));
     assert_eq!(player.audio_track(), Some(0));
     {
@@ -394,10 +412,11 @@ fn opens_a_file_and_plays_it_without_the_caller_loading_anything() {
     let mut presented = Vec::new();
     for _ in 0..20 {
         clock.advance(48_000 / RATE);
-        if let (_, Some(frame)) = player.present().unwrap() {
-            let index = player.current_frame_index().unwrap();
-            assert_gray(&frame, index.0);
-            presented.push(index.0);
+        let presentation = player.present().unwrap();
+        if let Some(frame) = presentation.frame {
+            let index = frame_at(presentation.time);
+            assert_gray(&frame, index);
+            presented.push(index);
         }
     }
     assert_eq!(presented, (1..=20).collect::<Vec<_>>());
@@ -409,11 +428,11 @@ fn opens_a_file_and_plays_it_without_the_caller_loading_anything() {
             .is_empty()
     );
 
-    player.seek(FrameIndex(45)).unwrap();
+    player.seek(at(45)).unwrap();
     assert!(player.is_playing());
-    let (presentation, frame) = player.present().unwrap();
-    assert_eq!(presentation.frame, Some(FrameIndex(45)));
-    assert_gray(&frame.unwrap(), 45);
+    let presentation = player.present().unwrap();
+    assert_eq!(presentation.time, at(45));
+    assert_gray(&presentation.frame.unwrap(), 45);
     drop(player);
     std::fs::remove_file(&path).unwrap();
 }
@@ -435,23 +454,25 @@ fn switching_audio_tracks_keeps_the_frame_and_releases_the_old_tracks_packets() 
         .collect();
     assert_eq!(languages, LANGUAGES);
 
-    player.seek(FrameIndex(10)).unwrap();
+    player.seek(at(10)).unwrap();
     player.play().unwrap();
     clock.advance(48_000 / RATE);
-    let (presentation, _) = player.present().unwrap();
-    assert_eq!(presentation.frame, Some(FrameIndex(11)));
+    let presentation = player.present().unwrap();
+    assert_eq!(presentation.time, at(11));
+    assert!(presentation.frame.is_some());
     assert!(player.audio_resident_bytes() > 0);
 
     player.select_audio_language("fra").unwrap();
     assert_eq!(player.audio_track(), Some(1));
     assert!(player.is_playing());
-    assert_eq!(player.current_frame_index().unwrap(), FrameIndex(11));
+    // Playback goes on from the start of the frame it was on.
+    assert_eq!(player.current_time(), at(11));
     // Nothing of the old track is held, and nothing of the new one yet.
     assert_eq!(player.audio_resident_bytes(), 0);
 
     // The new track plays on its own output from the frame's interval.
-    let (presentation, _) = player.present().unwrap();
-    assert_eq!(presentation.requested_frame, FrameIndex(11));
+    let presentation = player.present().unwrap();
+    assert_eq!(presentation.time, at(11));
     assert!(player.audio_resident_bytes() > 0);
     assert!(player.audio_resident_bytes() <= options.audio_budget_bytes);
     {
@@ -461,16 +482,16 @@ fn switching_audio_tracks_keeps_the_frame_and_releases_the_old_tracks_packets() 
         assert_eq!(scheduled.first().unwrap().start, 11 * 48_000 / RATE);
     }
     clock.advance(48_000 / RATE);
-    let (_, frame) = player.present().unwrap();
-    assert_gray(&frame.unwrap(), 12);
+    assert_gray(&player.present().unwrap().frame.unwrap(), 12);
 
     // Paused, a switch stays paused on the same frame.
     player.pause().unwrap();
-    let paused_on = player.current_frame_index().unwrap();
+    let paused_on = player.current_frame().unwrap();
     player.select_audio_track(2).unwrap();
     assert!(!player.is_playing());
-    assert_eq!(player.current_frame_index().unwrap(), paused_on);
-    assert_gray(&player.current_frame().unwrap(), paused_on.0);
+    assert_eq!(player.current_time(), at(12));
+    assert_eq!(player.current_frame().unwrap(), paused_on);
+    assert_gray(&paused_on, 12);
 }
 
 /// Issue #685: a WebM opens through the same path an MP4 does, plays and
@@ -486,7 +507,9 @@ fn plays_seeks_and_switches_the_audio_of_a_webm() {
         opener,
     )
     .unwrap();
-    assert_eq!(player.frame_count(), FRAMES);
+    // The muxer cues every key frame, so the WebM is indexed a cue span at a
+    // time as playback reaches it, and how many frames it has is not known.
+    assert_eq!(player.frame_count(), None);
     assert_eq!(player.sample_rate(), Some(48_000));
     assert_eq!(player.audio_tracks().len(), 2);
     assert!(
@@ -503,9 +526,9 @@ fn plays_seeks_and_switches_the_audio_of_a_webm() {
     clock.advance(48_000 / RATE / 2);
     for frame in 1..=5 {
         clock.advance(48_000 / RATE);
-        let (presentation, picture) = player.present().unwrap();
-        assert_eq!(presentation.frame, Some(FrameIndex(frame)));
-        assert_gray(&picture.unwrap(), frame);
+        let presentation = player.present().unwrap();
+        assert_eq!(frame_at(presentation.time), frame);
+        assert_gray(&presentation.frame.unwrap(), frame);
     }
     assert_eq!(
         opened.lock().unwrap()[0]
@@ -518,14 +541,14 @@ fn plays_seeks_and_switches_the_audio_of_a_webm() {
         0
     );
 
-    player.seek(FrameIndex(45)).unwrap();
-    let (presentation, picture) = player.present().unwrap();
-    assert_eq!(presentation.frame, Some(FrameIndex(45)));
-    assert_gray(&picture.unwrap(), 45);
+    player.seek(at(45)).unwrap();
+    let presentation = player.present().unwrap();
+    assert_eq!(presentation.time, at(45));
+    assert_gray(&presentation.frame.unwrap(), 45);
 
     player.select_audio_track(1).unwrap();
     assert_eq!(player.audio_track(), Some(1));
-    assert_eq!(player.current_frame_index().unwrap(), FrameIndex(45));
+    assert_eq!(player.current_time(), at(45));
     player.present().unwrap();
     let opened = opened.lock().unwrap();
     assert_eq!(opened.len(), 2);
@@ -565,15 +588,15 @@ fn plays_and_seeks_a_webm_with_vorbis_audio() {
     clock.advance(48_000 / RATE / 2);
     for frame in 1..=5 {
         clock.advance(48_000 / RATE);
-        let (presentation, picture) = player.present().unwrap();
-        assert_eq!(presentation.frame, Some(FrameIndex(frame)));
-        assert_gray(&picture.unwrap(), frame);
+        let presentation = player.present().unwrap();
+        assert_eq!(frame_at(presentation.time), frame);
+        assert_gray(&presentation.frame.unwrap(), frame);
     }
     for frame in [45, 10] {
-        player.seek(FrameIndex(frame)).unwrap();
-        let (presentation, picture) = player.present().unwrap();
-        assert_eq!(presentation.frame, Some(FrameIndex(frame)));
-        assert_gray(&picture.unwrap(), frame);
+        player.seek(webm_at(frame)).unwrap();
+        let presentation = player.present().unwrap();
+        assert_eq!(presentation.time, webm_at(frame));
+        assert_gray(&presentation.frame.unwrap(), frame);
     }
     assert!(player.audio_resident_bytes() <= audio_budget);
 
@@ -611,11 +634,11 @@ fn plays_from_the_start_on_an_input_nothing_has_been_loaded_from() {
         assert_eq!(player.audio_resident_bytes(), 0);
         player.play().unwrap();
         assert!(player.is_playing());
-        assert_eq!(player.current_frame_index().unwrap(), FrameIndex(0));
+        assert_eq!(player.current_time(), Duration::ZERO);
         clock.advance(48_000 / RATE * 5 / 2);
-        let (presentation, picture) = player.present().unwrap();
-        assert_eq!(presentation.frame, Some(FrameIndex(2)));
-        assert_gray(&picture.unwrap(), 2);
+        let presentation = player.present().unwrap();
+        assert_eq!(frame_at(presentation.time), 2);
+        assert_gray(&presentation.frame.unwrap(), 2);
 
         let opened = opened.lock().unwrap();
         let scheduled = &opened[0].lock().unwrap().scheduled;
@@ -674,11 +697,11 @@ fn plays_a_video_only_input_on_its_own_clock() {
     assert!(opened.lock().unwrap().is_empty());
     assert_eq!(player.sample_rate(), None);
     assert_eq!(player.audio_track(), None);
-    player.seek(FrameIndex(30)).unwrap();
+    assert_eq!(player.duration(), at(FRAMES));
+    player.seek(at(30)).unwrap();
     assert_gray(&player.current_frame().unwrap(), 30);
     player.play().unwrap();
-    let (presentation, _) = player.present().unwrap();
-    assert!(presentation.requested_frame >= FrameIndex(30));
+    assert!(player.present().unwrap().time >= at(30));
 }
 
 /// A source whose every read suspends once before completing, the way a
@@ -732,7 +755,7 @@ fn waits_on_a_source_whose_reads_suspend() {
     player.play().unwrap();
     for index in 1..=5 {
         clock.advance(48_000 / RATE);
-        let (_, frame) = player.present().unwrap();
+        let frame = player.present().unwrap().frame;
         assert_gray(&frame.unwrap(), index);
     }
     assert!(source.reads.get() > 0);
@@ -792,7 +815,7 @@ fn plays_and_seeks_the_bundled_sample_within_its_byte_budgets() {
     // before its target: these stay near the start to keep the test quick,
     // and still move back and forth across what the budgets can hold.
     for target in [0, 48, 16, 72, 24] {
-        player.seek(FrameIndex(target)).unwrap();
+        player.seek(Duration::from_millis(target * 1_000 / 24)).unwrap();
         within_budgets(&player);
         for _ in 0..6 {
             clock.advance(rate / 24);
