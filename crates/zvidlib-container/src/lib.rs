@@ -16,6 +16,7 @@ pub mod mp4_demux;
 pub mod prefetch;
 pub mod track;
 pub mod webm;
+pub mod webm_cues;
 pub mod webm_demux;
 
 #[allow(unused_imports)]
@@ -43,9 +44,12 @@ pub use container::{container_capabilities, probe_container};
 pub use cover::{COVER_THUMBNAIL_MAX_EDGE, CoverSource, DEFAULT_COVER_FRAME};
 pub use mp4::{CoverArt, CoverArtFormat};
 pub use mp4_demux::{AacTrackConfig, Mp4Demuxer, Mp4DemuxerOptions, probe_mp4};
-pub use prefetch::{PrefetchedAudioPacketProvider, PrefetchedSampleProvider, TrackSampleLoader};
+pub use prefetch::{
+    PrefetchedAudioPacketProvider, PrefetchedSampleProvider, SampleCache, TrackSampleLoader,
+};
 pub use track::{EditMapping, Track, TrackAudioPacketProvider, TrackSample, TrackSampleProvider};
 pub use webm::WebmMuxer;
+pub use webm_cues::{WebmCueSpan, WebmCuedIndex};
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,
     probe_webm,

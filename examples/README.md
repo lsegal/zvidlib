@@ -70,7 +70,7 @@ not provide an AV1 WebCodecs encoder; the status text says whether audio was inc
 Plays an MP4 or WebM natively with `OnDemandPlayer`, the native counterpart of the browser's
 `OnDemandPlayback`. It reads only the container's header and index up front and then the compressed
 samples playback reaches, within a 3.5 MB video and 512 KiB audio budget, and plays the audio on the
-default output device. It lists each audio track's language, seeks back after three seconds, and, given a language
+default output device. It lists each audio track's language, seeks back to half a second after three seconds, and, given a language
 such as `fra`, switches to that audio track after five. Frames are decoded and counted rather than
 drawn. With no path it plays the bundled AV1 sample:
 

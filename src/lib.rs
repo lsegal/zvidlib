@@ -19,7 +19,8 @@ pub use zvidlib_av1::{
 pub use zvidlib_av1_syntax as av1;
 #[doc(inline)]
 pub use zvidlib_container::{
-    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, track, webm, webm_demux,
+    codec_config, conformance, container, cover, mp4, mp4_demux, prefetch, track, webm, webm_cues,
+    webm_demux,
 };
 #[doc(inline)]
 pub use zvidlib_core::{api, audio, codec, io, media, timeline, transfer};
@@ -99,6 +100,9 @@ mod native_audio;
 
 #[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
 mod on_demand;
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "web"))]
+mod on_demand_cues;
 
 #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 pub mod on_demand_player;
@@ -227,13 +231,15 @@ pub use opus::{
 pub use output::{MediaOutput, OutputOptions};
 #[doc(no_inline)]
 pub use playback::{
-    AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, NativeAudioOutput,
-    OnDemandAudioSource, OnDemandVideoSource, PlaybackAudioOutput, PlaybackAudioSource,
-    PlaybackController, PlaybackOptions, PlaybackVideoSource, PrefetchAudioSource,
-    PrefetchVideoSource, Presentation, WebAudioOutput,
+    AudioOutputBackend, AudioOutputKind, IndexedPresentationTimeline, LazyPresentationTimeline,
+    NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PlaybackAudioOutput,
+    PlaybackAudioSource, PlaybackController, PlaybackOptions, PlaybackVideoSource,
+    PrefetchAudioSource, PrefetchVideoSource, Presentation, PresentationTimeline, WebAudioOutput,
 };
 #[doc(no_inline)]
-pub use prefetch::{PrefetchedAudioPacketProvider, PrefetchedSampleProvider, TrackSampleLoader};
+pub use prefetch::{
+    PrefetchedAudioPacketProvider, PrefetchedSampleProvider, SampleCache, TrackSampleLoader,
+};
 #[doc(no_inline)]
 pub use previews::{PreviewOptions, PreviewPass, PreviewStore};
 #[doc(no_inline)]
@@ -287,6 +293,8 @@ pub use vp9_encoder::native_vp9_video_encoder_factory;
 #[doc(no_inline)]
 pub use webm::WebmMuxer;
 #[doc(no_inline)]
+pub use webm_cues::{WebmCueSpan, WebmCuedIndex};
+#[doc(no_inline)]
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,
     probe_webm,
@@ -304,7 +312,9 @@ pub use native_audio::DefaultAudioOutput;
 pub use native_audio::NativeAacDecoder;
 #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 #[doc(no_inline)]
-pub use on_demand_player::{AudioOutputOpener, OnDemandOptions, OnDemandPlayer};
+pub use on_demand_player::{
+    AudioOutputOpener, OnDemandOptions, OnDemandPlayer, OnDemandPresentation,
+};
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(no_inline)]
 pub use previews::PreviewIndex;

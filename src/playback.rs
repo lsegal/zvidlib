@@ -398,24 +398,78 @@ impl IndexedPresentationTimeline {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PlaybackTimeline {
-    Constant(Timeline),
-    Indexed(IndexedPresentationTimeline),
+/// A presentation timeline whose frames are indexed as playback reaches them
+/// rather than all before it starts, such as a cued WebM's (issue #692).
+///
+/// Its frames need not be numbered densely: a [`FrameIndex`] is whatever
+/// identity the timeline and the video source it is paired with agree on, such
+/// as a frame's presentation time.
+pub trait LazyPresentationTimeline {
+    /// The frame presented at `sample`, as
+    /// [`IndexedPresentationTimeline::frame_for_audio_sample`] answers it, or
+    /// [`ErrorKind::WouldBlock`] while the part of the timeline holding it is
+    /// not indexed, which [`Self::prepare`] indexes.
+    fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex>;
+
+    /// The audio samples `frame` is presented for, or
+    /// [`ErrorKind::WouldBlock`] while its part of the timeline is not indexed.
+    fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange>;
+
+    /// Indexes the part of the timeline holding `sample`.
+    fn prepare(&mut self, sample: u64) -> IoFuture<'_, ()>;
 }
 
-impl PlaybackTimeline {
-    fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange> {
+/// How a [`PlaybackController`] maps the audio clock to video frames.
+pub enum PresentationTimeline {
+    /// A constant frame rate.
+    Constant(Timeline),
+    /// Every frame's interval, indexed up front.
+    Indexed(IndexedPresentationTimeline),
+    /// Frames indexed as playback reaches them.
+    Lazy(Box<dyn LazyPresentationTimeline>),
+}
+
+impl From<Timeline> for PresentationTimeline {
+    fn from(timeline: Timeline) -> Self {
+        Self::Constant(timeline)
+    }
+}
+
+impl From<IndexedPresentationTimeline> for PresentationTimeline {
+    fn from(timeline: IndexedPresentationTimeline) -> Self {
+        Self::Indexed(timeline)
+    }
+}
+
+impl From<Box<dyn LazyPresentationTimeline>> for PresentationTimeline {
+    fn from(timeline: Box<dyn LazyPresentationTimeline>) -> Self {
+        Self::Lazy(timeline)
+    }
+}
+
+impl PresentationTimeline {
+    pub fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange> {
         match self {
             Self::Constant(timeline) => timeline.audio_interval_for_frame(frame),
             Self::Indexed(timeline) => timeline.audio_interval_for_frame(frame),
+            Self::Lazy(timeline) => timeline.audio_interval_for_frame(frame),
         }
     }
 
-    fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex> {
+    pub fn frame_for_audio_sample(&self, sample: u64) -> Result<FrameIndex> {
         match self {
             Self::Constant(timeline) => timeline.frame_for_audio_sample(sample),
             Self::Indexed(timeline) => timeline.frame_for_audio_sample(sample),
+            Self::Lazy(timeline) => timeline.frame_for_audio_sample(sample),
+        }
+    }
+
+    /// Indexes the part of a lazy timeline holding `sample`; the others are
+    /// indexed already.
+    async fn prepare(&mut self, sample: u64) -> Result<()> {
+        match self {
+            Self::Lazy(timeline) => timeline.prepare(sample).await,
+            Self::Constant(_) | Self::Indexed(_) => Ok(()),
         }
     }
 }
@@ -425,7 +479,7 @@ pub struct PlaybackController<V, A, O> {
     video: V,
     audio: A,
     output: O,
-    timeline: PlaybackTimeline,
+    timeline: PresentationTimeline,
     options: PlaybackOptions,
     cancellation: CancellationToken,
     generation: u64,
@@ -451,13 +505,7 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
                 "playback timeline and audio source sample rates do not match",
             ));
         }
-        Self::new_with_playback_timeline(
-            video,
-            audio,
-            output,
-            PlaybackTimeline::Constant(timeline),
-            options,
-        )
+        Self::new_with_timeline(video, audio, output, timeline, options)
     }
 
     pub fn new_with_indexed_timeline(
@@ -467,22 +515,20 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         timeline: IndexedPresentationTimeline,
         options: PlaybackOptions,
     ) -> Result<Self> {
-        Self::new_with_playback_timeline(
-            video,
-            audio,
-            output,
-            PlaybackTimeline::Indexed(timeline),
-            options,
-        )
+        Self::new_with_timeline(video, audio, output, timeline, options)
     }
 
-    fn new_with_playback_timeline(
+    /// A controller on any [`PresentationTimeline`], such as a
+    /// [`LazyPresentationTimeline`] whose frames are indexed as playback
+    /// reaches them.
+    pub fn new_with_timeline(
         video: V,
         audio: A,
         output: O,
-        timeline: PlaybackTimeline,
+        timeline: impl Into<PresentationTimeline>,
         options: PlaybackOptions,
     ) -> Result<Self> {
+        let timeline = timeline.into();
         if options.schedule_ahead_samples == 0 {
             return Err(invalid("playback scheduling window must be nonzero"));
         }
@@ -560,9 +606,29 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         self.timeline.frame_for_audio_sample(self.current_sample())
     }
 
+    /// The audio sample playback is on: where it was paused, or where the
+    /// audio clock has run to while it plays.
+    pub fn current_audio_sample(&self) -> u64 {
+        self.current_sample()
+    }
+
+    /// The audio samples `frame` is presented for, on the controller's
+    /// timeline.
+    pub fn audio_interval_for_frame(&self, frame: FrameIndex) -> Result<SampleRange> {
+        self.timeline.audio_interval_for_frame(frame)
+    }
+
     /// Cancels old decode/scheduling work, resets both streams, prerolls, then resumes.
     pub fn seek(&mut self, frame: FrameIndex) -> Result<()> {
         let target = self.timeline.audio_interval_for_frame(frame)?.start;
+        self.seek_to_sample(target)
+    }
+
+    /// [`Self::seek`] to an audio sample rather than a frame: playback goes on
+    /// from `target`, presenting whichever frame is on screen there. A seek
+    /// by time, which a timeline whose frames are indexed as playback reaches
+    /// them can answer before it knows which frame that is (issue #692).
+    pub fn seek_to_sample(&mut self, target: u64) -> Result<()> {
         if target > self.audio.presentation_length() {
             return Err(invalid(
                 "playback seek exceeds the audio presentation duration",
@@ -618,8 +684,9 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
         &mut self,
         audio: A,
         output: O,
-        timeline: IndexedPresentationTimeline,
+        timeline: impl Into<PresentationTimeline>,
     ) -> Result<(A, O)> {
+        let timeline = timeline.into();
         let frame = self.current_frame_index()?;
         let target = timeline.audio_interval_for_frame(frame)?.start;
         if target > audio.presentation_length() {
@@ -639,7 +706,7 @@ impl<V: PlaybackVideoSource, A: PlaybackAudioSource, O: PlaybackAudioOutput>
             .ok_or_else(|| invalid("playback generation overflow"))?;
         let old_audio = std::mem::replace(&mut self.audio, audio);
         let old_output = std::mem::replace(&mut self.output, output);
-        self.timeline = PlaybackTimeline::Indexed(timeline);
+        self.timeline = timeline;
         self.media_anchor = target;
         self.clock_anchor = self.output.clock_samples();
         self.queued_until = target;
@@ -801,8 +868,12 @@ impl<V: PrefetchVideoSource, A: PrefetchAudioSource, O: PlaybackAudioOutput>
     /// were missing. Calling it ahead of time, between frames, keeps them from reporting it at
     /// all. [`Self::seek`] itself never needs it: the only thing it reads is a preroll it can
     /// skip.
+    ///
+    /// On a [`LazyPresentationTimeline`] it first indexes the part of the timeline the clock is
+    /// in, which until then reports [`ErrorKind::WouldBlock`] too.
     pub async fn prefetch(&mut self) -> Result<()> {
         let now = self.current_sample();
+        self.timeline.prepare(now).await?;
         let frame = self.timeline.frame_for_audio_sample(now)?;
         self.video.prefetch(frame).await?;
         let length = self.audio.presentation_length();
@@ -821,7 +892,7 @@ fn invalid(message: &str) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
 
-fn scale_to_audio_samples(
+pub(crate) fn scale_to_audio_samples(
     value: u64,
     source_timescale: u32,
     audio_sample_rate: u32,

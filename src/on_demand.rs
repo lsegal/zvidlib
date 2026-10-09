@@ -47,6 +47,17 @@ pub(crate) const AUDIO_READAHEAD_PACKETS: usize = 16;
 /// standing in for an audio sample rate.
 pub(crate) const VIDEO_ONLY_CLOCK_RATE: u32 = 48_000;
 
+/// The page size an input's container header and index are read through. A
+/// WebM's index is every block's header, a few bytes each, so a page combines
+/// the headers of the blocks near each other into one request instead of two
+/// requests a block (issue #685).
+pub(crate) const INDEX_PAGE_BYTES: u64 = 4 * 1024;
+
+/// The index pages held at once. An index is read front to back, a span at a
+/// time for a cued WebM (issue #692), so only the pages around the read in
+/// progress are worth keeping.
+pub(crate) const INDEX_CACHE_BYTES: u64 = 64 * 1024;
+
 /// How many AAC access units an audio read decodes ahead of the first it
 /// needs. Each AAC frame overlaps the one before it, so one is enough; the
 /// second covers the decoder's own start-up.
@@ -65,47 +76,81 @@ pub(crate) async fn crate_video_source<S: ByteSource>(
     hardware: HardwarePreference,
     limits: Limits,
 ) -> Result<OnDemandVideoSource<S>> {
-    let dimensions = video
-        .dimensions
-        .ok_or_else(|| Error::new(ErrorKind::MalformedMedia, "video track has no dimensions"))?;
-    let derived = derive_codec_string(video.codec, &video.decoder_config)?;
     // Before any read, so a budget that cannot hold the largest sample is
     // refused without one.
     let loader = TrackSampleLoader::new(video.clone(), source, budget_bytes)?;
-    let mut leading = Vec::new();
-    if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
-        let first = video.samples.first().ok_or_else(|| {
-            Error::new(ErrorKind::MalformedMedia, "video track contains no samples")
+    let decoding = VideoDecoding::open(video, loader.source(), hardware, limits).await?;
+    decoding.source(loader)
+}
+
+/// The crate's decoder for a video track and the configuration it decodes the
+/// track with, chosen once when the input opens, from which a reader is built
+/// over any loader of the track's samples: the whole track's, or one cue
+/// span's of a lazily indexed WebM (issue #692).
+pub(crate) struct VideoDecoding {
+    factory: Box<dyn VideoDecoderFactory>,
+    configuration: VideoDecoderConfig,
+    limits: Limits,
+}
+
+impl VideoDecoding {
+    /// The decoder for `video`, whose first sample - read from `source`, for
+    /// an AV1 or VP9 track only - is the stream's first.
+    pub(crate) async fn open<S: ByteSource>(
+        video: &Track,
+        source: &S,
+        hardware: HardwarePreference,
+        limits: Limits,
+    ) -> Result<Self> {
+        let dimensions = video.dimensions.ok_or_else(|| {
+            Error::new(ErrorKind::MalformedMedia, "video track has no dimensions")
         })?;
-        let mut data = vec![0_u8; first.size as usize];
-        video
-            .read_sample_into(loader.source(), 0, &mut data)
-            .await?;
-        leading.push(EncodedVideoSample {
-            presentation_index: FrameIndex(0),
-            random_access: first.is_sync,
-            data,
-        });
+        let derived = derive_codec_string(video.codec, &video.decoder_config)?;
+        let mut leading = Vec::new();
+        if matches!(video.codec, Codec::Av1 | Codec::Vp9) {
+            let first = video.samples.first().ok_or_else(|| {
+                Error::new(ErrorKind::MalformedMedia, "video track contains no samples")
+            })?;
+            let mut data = vec![0_u8; first.size as usize];
+            video.read_sample_into(source, 0, &mut data).await?;
+            leading.push(EncodedVideoSample {
+                presentation_index: FrameIndex(0),
+                random_access: first.is_sync,
+                data,
+            });
+        }
+        let (factory, configuration) = crate_video_decoder(
+            video,
+            derived.profile,
+            dimensions,
+            &leading,
+            hardware,
+            &limits,
+        )?;
+        Ok(Self {
+            factory,
+            configuration,
+            limits,
+        })
     }
-    let (factory, configuration) = crate_video_decoder(
-        video,
-        derived.profile,
-        dimensions,
-        &leading,
-        hardware,
-        &limits,
-    )?;
-    let reader = ExactFrameReader::from_provider(
-        factory.as_ref(),
-        configuration,
-        Box::new(loader.sample_provider()?),
-        limits,
-    )?;
-    Ok(OnDemandVideoSource::new(
-        reader,
-        loader,
-        VIDEO_READAHEAD_SAMPLES,
-    ))
+
+    /// The track `loader` loads, decoded on demand.
+    pub(crate) fn source<S: ByteSource>(
+        &self,
+        loader: TrackSampleLoader<S>,
+    ) -> Result<OnDemandVideoSource<S>> {
+        let reader = ExactFrameReader::from_provider(
+            self.factory.as_ref(),
+            self.configuration.clone(),
+            Box::new(loader.sample_provider()?),
+            self.limits,
+        )?;
+        Ok(OnDemandVideoSource::new(
+            reader,
+            loader,
+            VIDEO_READAHEAD_SAMPLES,
+        ))
+    }
 }
 
 /// The packets of the loader's AAC, Opus or Vorbis track, indexed without

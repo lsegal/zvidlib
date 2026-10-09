@@ -42,7 +42,7 @@ use crate::codec::{SampleProvider, TrackKind};
 use crate::io::ByteSource;
 use crate::media::Codec;
 use crate::timeline::{FrameIndex, SampleRange};
-use crate::track::{Track, read_exact};
+use crate::track::{Track, TrackSample, read_exact};
 use crate::{Error, ErrorKind, Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -84,19 +84,56 @@ pub struct TrackSampleLoader<S> {
     track: Track,
     source: S,
     cache: SharedCache,
+    /// The cache key of the track's first sample: loaders sharing a cache key
+    /// their samples from different bases, so their keys never meet.
+    base: usize,
+}
+
+/// A byte-budgeted cache of compressed samples that several
+/// [`TrackSampleLoader`]s can share, so loaders over different parts of one
+/// track - a lazily indexed WebM's cue spans (issue #692) - hold no more
+/// between them than one budget allows.
+#[derive(Clone)]
+pub struct SampleCache(SharedCache);
+
+impl SampleCache {
+    pub fn new(budget_bytes: u64) -> Self {
+        Self(SharedCache::new(budget_bytes))
+    }
+
+    pub fn budget_bytes(&self) -> u64 {
+        self.0.budget_bytes
+    }
+
+    /// The compressed bytes every loader sharing the cache holds now, which
+    /// never exceeds [`Self::budget_bytes`].
+    pub fn resident_bytes(&self) -> u64 {
+        self.0.lock().resident_bytes
+    }
 }
 
 impl<S: ByteSource> TrackSampleLoader<S> {
     /// Fails if `budget_bytes` cannot hold the track's largest sample, which
     /// could then never be loaded. Reads no sample data.
     pub fn new(track: Track, source: S, budget_bytes: u64) -> Result<Self> {
+        Self::with_cache(track, source, &SampleCache::new(budget_bytes), 0)
+    }
+
+    /// A loader for `track` that loads into `cache`, keying its samples from
+    /// `base`. Loaders sharing a cache key their samples from bases far enough
+    /// apart that their keys never meet: one loader's `base` plus its sample
+    /// count at most the next one's `base`.
+    ///
+    /// Fails if the cache's budget cannot hold the track's largest sample.
+    /// Reads no sample data.
+    pub fn with_cache(track: Track, source: S, cache: &SampleCache, base: usize) -> Result<Self> {
         let largest = track
             .samples
             .iter()
             .map(|sample| u64::from(sample.size))
             .max()
             .ok_or_else(|| invalid("an on-demand sample loader requires a nonempty track"))?;
-        if budget_bytes < largest {
+        if cache.budget_bytes() < largest {
             return Err(limit(
                 "the sample cache budget cannot hold the track's largest sample",
             ));
@@ -104,8 +141,31 @@ impl<S: ByteSource> TrackSampleLoader<S> {
         Ok(Self {
             track,
             source,
-            cache: SharedCache::new(budget_bytes),
+            cache: cache.0.clone(),
+            base,
         })
+    }
+
+    /// The cache this loader loads into, to share with another.
+    pub fn cache(&self) -> SampleCache {
+        SampleCache(self.cache.clone())
+    }
+
+    /// Adds samples to the end of the track, as indexing more of it finds
+    /// them (issue #692). A provider built before keeps the samples it had;
+    /// one built after has these too. Fails, adding none, if the budget cannot
+    /// hold the largest of them.
+    pub fn append(&mut self, samples: &[TrackSample]) -> Result<()> {
+        if samples
+            .iter()
+            .any(|sample| u64::from(sample.size) > self.cache.budget_bytes)
+        {
+            return Err(limit(
+                "the sample cache budget cannot hold the track's largest sample",
+            ));
+        }
+        self.track.samples.extend_from_slice(samples);
+        Ok(())
     }
 
     pub fn track(&self) -> &Track {
@@ -131,6 +191,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
                 .map(|sample| sample.is_sync)
                 .collect(),
             cache: self.cache.clone(),
+            base: self.base,
         })
     }
 
@@ -163,7 +224,30 @@ impl<S: ByteSource> TrackSampleLoader<S> {
             decoded_ranges,
             check_opus_durations: false,
             cache: self.cache.clone(),
+            base: self.base,
         })
+    }
+
+    /// An [`AudioPacketProvider`] for an Opus track whose packets' decoded
+    /// intervals the caller gives, one per sample in decode order, as
+    /// [`Self::opus_packet_provider`] would derive them from the whole
+    /// track's sample table: for a track only part of whose table is known
+    /// yet (issue #692). Each packet is checked against its interval as
+    /// playback reaches it, exactly as there. Reads no packet data. Fails if
+    /// the track is not an Opus audio track or `decoded_ranges` does not have
+    /// one interval per sample.
+    pub fn opus_packet_provider_with_ranges(
+        &self,
+        decoded_ranges: Vec<SampleRange>,
+    ) -> Result<PrefetchedAudioPacketProvider> {
+        if self.track.kind != TrackKind::Audio || self.track.codec != Codec::Opus {
+            return Err(unsupported(
+                "an Opus audio packet provider requires an Opus audio track",
+            ));
+        }
+        let mut provider = self.audio_packet_provider(decoded_ranges)?;
+        provider.check_opus_durations = true;
+        Ok(provider)
     }
 
     /// An [`AudioPacketProvider`] for an Opus track, answering from this
@@ -192,9 +276,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
         let decoded_ranges = self
             .track
             .opus_decoded_ranges(crate::opus::opus_packet_samples(head)?)?;
-        let mut provider = self.audio_packet_provider(decoded_ranges)?;
-        provider.check_opus_durations = true;
-        Ok(provider)
+        self.opus_packet_provider_with_ranges(decoded_ranges)
     }
 
     /// An [`AudioPacketProvider`] for an AAC track, answering from this
@@ -325,7 +407,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
     /// This is what a caller awaits after a reader reports
     /// [`ErrorKind::WouldBlock`], before asking the reader again.
     pub async fn load_missing(&self) -> Result<usize> {
-        let missing = std::mem::take(&mut self.cache.lock().missing);
+        let missing = self.take_missing();
         let count = missing.len();
         let mut indexes = missing.into_iter().peekable();
         while let Some(start) = indexes.next() {
@@ -341,15 +423,33 @@ impl<S: ByteSource> TrackSampleLoader<S> {
     /// Forgets the samples providers have reported missing, as a seek does:
     /// what the old position needed is no longer worth loading.
     pub fn clear_missing(&self) {
-        self.cache.lock().missing.clear();
+        self.take_missing();
+    }
+
+    /// Takes the decode indexes of this loader's samples that providers have
+    /// reported missing, leaving those of any other loader sharing the cache.
+    fn take_missing(&self) -> Vec<usize> {
+        let mut cache = self.cache.lock();
+        let own: Vec<usize> = cache
+            .missing
+            .range(self.base..self.base + self.track.samples.len())
+            .copied()
+            .collect();
+        for key in &own {
+            cache.missing.remove(key);
+        }
+        own.into_iter().map(|key| key - self.base).collect()
     }
 
     pub fn is_loaded(&self, decode_index: usize) -> bool {
-        self.cache.lock().samples.contains_key(&decode_index)
+        self.cache
+            .lock()
+            .samples
+            .contains_key(&(self.base + decode_index))
     }
 
     /// The compressed bytes currently held, which never exceeds
-    /// [`Self::budget_bytes`].
+    /// [`Self::budget_bytes`]: by every loader sharing the cache.
     pub fn resident_bytes(&self) -> u64 {
         self.cache.lock().resident_bytes
     }
@@ -367,7 +467,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
         let samples = &self.track.samples;
         let mut index = range.start;
         while index < range.end {
-            if self.cache.lock().touch(index) {
+            if self.cache.lock().touch(self.base + index) {
                 index += 1;
                 continue;
             }
@@ -398,7 +498,7 @@ impl<S: ByteSource> TrackSampleLoader<S> {
             for (decode_index, sample) in samples.iter().enumerate().take(run_end).skip(index) {
                 let start = (sample.offset - offset) as usize;
                 cache.insert(
-                    decode_index,
+                    self.base + decode_index,
                     Arc::from(&bytes[start..start + sample.size as usize]),
                 );
             }
@@ -414,6 +514,8 @@ pub struct PrefetchedSampleProvider {
     presentation_index_by_decode: Vec<u64>,
     random_access: Vec<bool>,
     cache: SharedCache,
+    /// The cache key of the first sample; see [`TrackSampleLoader::with_cache`].
+    base: usize,
 }
 
 impl SampleProvider for PrefetchedSampleProvider {
@@ -433,7 +535,7 @@ impl SampleProvider for PrefetchedSampleProvider {
         if decode_index >= self.len() {
             return Err(invalid("sample index is out of range"));
         }
-        self.cache.read(decode_index)
+        self.cache.read(self.base + decode_index)
     }
 }
 
@@ -446,6 +548,8 @@ pub struct PrefetchedAudioPacketProvider {
     /// sample table, so its own table of contents must agree with it.
     check_opus_durations: bool,
     cache: SharedCache,
+    /// The cache key of the first packet; see [`TrackSampleLoader::with_cache`].
+    base: usize,
 }
 
 impl AudioPacketProvider for PrefetchedAudioPacketProvider {
@@ -461,7 +565,7 @@ impl AudioPacketProvider for PrefetchedAudioPacketProvider {
         if index >= self.len() {
             return Err(invalid("sample index is out of range"));
         }
-        let packet = self.cache.read(index)?;
+        let packet = self.cache.read(self.base + index)?;
         if self.check_opus_durations
             && u64::from(crate::opus::opus_packet_samples(&packet)?)
                 != self.decoded_ranges[index].len()
@@ -772,6 +876,75 @@ mod tests {
         assert!((0..4).all(|index| loader.is_loaded(index)));
         assert!(!loader.is_loaded(4) && !loader.is_loaded(5));
         assert_eq!(loader.resident_bytes(), 40);
+    }
+
+    /// Issue #692: loaders over different parts of a track share one cache,
+    /// so together they hold no more than its budget, and each loads only the
+    /// samples its own providers missed.
+    #[test]
+    fn loaders_sharing_a_cache_share_its_budget_and_keep_their_own_samples() {
+        let (track, first_source) = track_and_source(&[10; 8]);
+        let (_, second_source) = track_and_source(&[10; 8]);
+        let part = |range: std::ops::Range<usize>| Track {
+            samples: track.samples[range.clone()].to_vec(),
+            presentation_order: (0..range.len()).collect(),
+            ..track.clone()
+        };
+        let cache = SampleCache::new(40);
+        let first = TrackSampleLoader::with_cache(part(0..4), first_source, &cache, 0).unwrap();
+        let second = TrackSampleLoader::with_cache(part(4..8), second_source, &cache, 4).unwrap();
+        let first_provider = first.sample_provider().unwrap();
+        let second_provider = second.sample_provider().unwrap();
+
+        first_provider.read(1).unwrap_err();
+        second_provider.read(1).unwrap_err();
+        // Each loader loads only what its own provider missed.
+        assert_eq!(block_on(first.load_missing()).unwrap(), 1);
+        assert_eq!(first_provider.read(1).unwrap().as_ref(), &[1; 10]);
+        assert_eq!(
+            second_provider.read(1).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(block_on(second.load_missing()).unwrap(), 1);
+        assert_eq!(second_provider.read(1).unwrap().as_ref(), &[5; 10]);
+
+        block_on(first.load(0..4, 0)).unwrap();
+        block_on(second.load(0..4, 0)).unwrap();
+        assert_eq!(cache.resident_bytes(), 40);
+        assert_eq!(first.resident_bytes(), 40);
+        assert!((0..4).all(|index| second.is_loaded(index)));
+        assert!((0..4).all(|index| !first.is_loaded(index)));
+    }
+
+    #[test]
+    fn appended_samples_load_like_the_ones_before_them() {
+        let (track, source) = track_and_source(&[10; 8]);
+        let mut loader = TrackSampleLoader::new(
+            Track {
+                samples: track.samples[..3].to_vec(),
+                presentation_order: (0..3).collect(),
+                ..track.clone()
+            },
+            source,
+            1_000,
+        )
+        .unwrap();
+        let before = loader.sample_provider().unwrap();
+        loader.append(&track.samples[3..]).unwrap();
+        let after = loader.sample_provider().unwrap();
+        assert_eq!((before.len(), after.len()), (3, 8));
+        block_on(loader.load(2..6, 0)).unwrap();
+        assert_eq!(loader.source().reads.get(), 1, "the run was not coalesced");
+        assert_eq!(after.read(5).unwrap().as_ref(), &[5; 10]);
+        assert_eq!(before.read(2).unwrap().as_ref(), &[2; 10]);
+
+        let mut huge = track.samples[0].clone();
+        huge.size = 2_000;
+        assert_eq!(
+            loader.append(&[huge]).unwrap_err().kind(),
+            ErrorKind::ResourceLimit
+        );
+        assert_eq!(loader.track().samples.len(), 8);
     }
 
     #[test]
