@@ -917,6 +917,7 @@ fn finalize_track(mut b: TrackBuilder, options: &Mp4DemuxerOptions) -> Result<Tr
         edits: b.edits,
         samples: b.samples,
         presentation_order: Vec::new(),
+        vorbis_packet_heads: Vec::new(),
     })
 }
 
@@ -2036,26 +2037,179 @@ mod tests {
         }
     }
 
-    /// Opus and Vorbis packets' decoded ranges need their bytes, so the
-    /// provider rejects those tracks - and any non-audio track - outright.
+    /// An Opus packet's decoded range needs its bytes, so the provider
+    /// rejects Opus tracks - and any non-audio track - outright.
     #[test]
-    fn mp4_audio_packet_provider_rejects_non_aac_tracks() {
+    fn mp4_audio_packet_provider_rejects_opus_and_video_tracks() {
         let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
-        for codec in [Codec::Opus, Codec::Vorbis] {
-            let track = Track {
-                codec,
-                ..aac.clone()
-            };
-            let error = TrackAudioPacketProvider::new(track, MemorySource::new(bytes.clone()))
-                .err()
-                .expect("a non-AAC audio track is rejected");
-            assert_eq!(error.kind(), ErrorKind::Unsupported);
-        }
+        let track = Track {
+            codec: Codec::Opus,
+            ..aac
+        };
+        let error = TrackAudioPacketProvider::new(track, MemorySource::new(bytes))
+            .err()
+            .expect("an Opus track is rejected");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
         let (video, bytes) = bundled_hevc_track_and_bytes();
         let error = TrackAudioPacketProvider::new(video, MemorySource::new(bytes))
             .err()
             .expect("a video track is rejected");
         assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    /// The packets of a single-stream Ogg file (RFC 3533).
+    fn ogg_packets(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        let mut partial = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            assert_eq!(&bytes[at..at + 4], b"OggS", "an Ogg page at {at}");
+            let segments = usize::from(bytes[at + 26]);
+            let lacing = &bytes[at + 27..at + 27 + segments];
+            let mut body = at + 27 + segments;
+            for &length in lacing {
+                partial.extend_from_slice(&bytes[body..body + usize::from(length)]);
+                body += usize::from(length);
+                if length < 255 {
+                    packets.push(std::mem::take(&mut partial));
+                }
+            }
+            at = body;
+        }
+        packets
+    }
+
+    /// libvorbis's mono stream, whose transients code short blocks among
+    /// the long ones, remuxed into a WebM: its Vorbis track and the file.
+    fn vorbis_webm_track_and_bytes() -> (Track, Vec<u8>) {
+        let mut packets = ogg_packets(include_bytes!(
+            "../../zvidlib-vorbis-decoder/tests/fixtures/vorbis_transient_mono.ogg"
+        ));
+        let audio = packets.split_off(3);
+        let [identification, comment, setup]: [Vec<u8>; 3] = packets.try_into().unwrap();
+        let config =
+            crate::vorbis::VorbisConfig::from_headers(identification, comment, setup).unwrap();
+        let mut muxer = block_on(crate::WebmMuxer::new(
+            crate::io::MemorySink::new(),
+            vec![crate::mp4::Mp4TrackConfig {
+                encoder: crate::codec::EncoderConfig {
+                    codec: Codec::Vorbis,
+                    timescale: config.sample_rate,
+                    decoder_config: config.to_codec_private(),
+                },
+                format: crate::mp4::Mp4TrackFormat::Audio {
+                    channels: u16::from(config.channels),
+                },
+            }],
+            1_000,
+        ))
+        .unwrap();
+        for sample in config.encoded_samples(audio).unwrap() {
+            let start = sample.decoded_range.start as i64;
+            block_on(muxer.write_sample(
+                0,
+                crate::codec::EncodedSample {
+                    data: sample.data,
+                    dts: start,
+                    pts: start,
+                    duration: sample.decoded_range.len() as u32,
+                    is_sync: true,
+                    dependency: SampleDependency::INDEPENDENT,
+                },
+            ))
+            .unwrap();
+        }
+        let bytes = block_on(muxer.finish()).unwrap().into_inner();
+        let source = MemorySource::new(bytes.clone());
+        let demuxer = block_on(crate::WebmDemuxer::open(
+            &source,
+            crate::WebmDemuxerOptions::default(),
+        ))
+        .unwrap();
+        (demuxer.tracks[0].clone(), bytes)
+    }
+
+    /// Issue #686: the WebM demuxer records every Vorbis packet's first
+    /// byte, so both on-demand providers index a Vorbis track - short blocks
+    /// and long - with exactly the decoded ranges the eager path gives,
+    /// without reading a packet.
+    #[test]
+    fn vorbis_providers_index_a_webm_track_without_reading_its_packets() {
+        let (track, bytes) = vorbis_webm_track_and_bytes();
+        assert_eq!(track.codec, Codec::Vorbis);
+        assert_eq!(track.vorbis_packet_heads.len(), track.samples.len());
+        let eager = block_on(
+            track.to_encoded_audio_samples(&MemorySource::new(bytes.clone()), &Limits::default()),
+        )
+        .unwrap();
+        assert!(
+            eager
+                .windows(2)
+                .any(|pair| pair[0].decoded_range.len() != pair[1].decoded_range.len()),
+            "the fixture codes blocks of more than one size"
+        );
+
+        let counting = || CountingSource {
+            inner: MemorySource::new(bytes.clone()),
+            bytes_read: Cell::new(0),
+        };
+        let synchronous = TrackAudioPacketProvider::new(track.clone(), counting()).unwrap();
+        let loader = crate::TrackSampleLoader::new(track.clone(), counting(), 1 << 20).unwrap();
+        let prefetched = loader.vorbis_packet_provider().unwrap();
+        for provider in [
+            &synchronous as &dyn AudioPacketProvider,
+            &prefetched as &dyn AudioPacketProvider,
+        ] {
+            assert_eq!(provider.len(), eager.len());
+            for (index, expected) in eager.iter().enumerate() {
+                assert_eq!(provider.decoded_range(index), expected.decoded_range);
+            }
+        }
+        assert_eq!(synchronous.source().bytes_read.get(), 0);
+        assert_eq!(loader.source().bytes_read.get(), 0);
+
+        assert_eq!(synchronous.read(5).unwrap().as_ref(), eager[5].data);
+        assert_eq!(
+            synchronous.source().bytes_read.get(),
+            eager[5].data.len() as u64
+        );
+        assert_eq!(
+            prefetched.read(5).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        block_on(loader.load_missing()).unwrap();
+        assert_eq!(prefetched.read(5).unwrap().as_ref(), eager[5].data);
+    }
+
+    /// A Vorbis track whose packets' first bytes were not recorded - one not
+    /// built by the WebM demuxer - cannot be indexed without reading them, so
+    /// the providers refuse it rather than read the whole track; and the
+    /// loader's Vorbis provider refuses other codecs.
+    #[test]
+    fn vorbis_providers_refuse_tracks_they_cannot_index() {
+        let (track, bytes) = vorbis_webm_track_and_bytes();
+        let unrecorded = Track {
+            vorbis_packet_heads: Vec::new(),
+            ..track
+        };
+        let error =
+            TrackAudioPacketProvider::new(unrecorded.clone(), MemorySource::new(bytes.clone()))
+                .err()
+                .expect("the track's intervals are unknown");
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        let loader =
+            crate::TrackSampleLoader::new(unrecorded, MemorySource::new(bytes), 1 << 20).unwrap();
+        assert_eq!(
+            loader.vorbis_packet_provider().err().unwrap().kind(),
+            ErrorKind::Unsupported
+        );
+
+        let (aac, bytes) = aac_fixture_tracks_and_bytes().swap_remove(0);
+        let loader = crate::TrackSampleLoader::new(aac, MemorySource::new(bytes), 1 << 20).unwrap();
+        assert_eq!(
+            loader.vorbis_packet_provider().err().unwrap().kind(),
+            ErrorKind::Unsupported
+        );
     }
 
     /// Issue #676: a loader builds an AAC track's prefetched provider from
@@ -2161,6 +2315,7 @@ mod tests {
             edits: Vec::new(),
             presentation_order: (0..packets.len()).collect(),
             samples,
+            vorbis_packet_heads: Vec::new(),
         };
         (track, bytes)
     }

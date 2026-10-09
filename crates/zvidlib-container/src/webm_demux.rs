@@ -29,7 +29,8 @@ const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
 /// The longest element header: a four-byte ID and an eight-byte size.
 const MAX_HEADER: usize = 12;
 /// Enough of an unlaced block for its track number, timestamp and flags, and
-/// the first byte of its frame, which holds a VP8 frame's `show_frame` bit.
+/// the first byte of its frame, which holds a VP8 frame's `show_frame` bit and
+/// a Vorbis packet's mode number.
 const BLOCK_PREFIX: usize = 12;
 /// The Matroska invisible flag, in both SimpleBlock and Block flags.
 const INVISIBLE: u8 = 0x08;
@@ -349,6 +350,9 @@ struct IndexedTrack {
     default_duration_ns: Option<u64>,
     frames: Vec<Frame>,
     blocks: Vec<Block>,
+    /// A Vorbis track's frames' first bytes, in frame order; see
+    /// [`Track::vorbis_packet_heads`].
+    vorbis_packet_heads: Vec<u8>,
 }
 
 /// What an indexed track carries.
@@ -631,7 +635,9 @@ impl ParsedBlock {
         }
         ensure_allocation(
             total,
-            std::mem::size_of::<Frame>() + std::mem::size_of::<TrackSample>(),
+            std::mem::size_of::<Frame>()
+                + std::mem::size_of::<TrackSample>()
+                + usize::from(track.codec == Codec::Vorbis),
             options,
             "WebM sample index",
         )?;
@@ -651,6 +657,12 @@ impl ParsedBlock {
                 Codec::Vp9 => !self.invisible,
                 _ => true,
             };
+            if track.codec == Codec::Vorbis {
+                // A frame is never empty, so its first byte was read.
+                track
+                    .vorbis_packet_heads
+                    .push(first_byte.ok_or_else(|| malformed("WebM block header is truncated"))?);
+            }
             track.frames.push(Frame {
                 offset,
                 size,
@@ -936,6 +948,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
                 default_duration_ns: default_duration.filter(|&duration| duration > 0),
                 frames: Vec::new(),
                 blocks: Vec::new(),
+                vorbis_packet_heads: Vec::new(),
             }),
         });
     }
@@ -974,6 +987,7 @@ fn parse_track_entry(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Tra
             default_duration_ns: default_duration.filter(|&duration| duration > 0),
             frames: Vec::new(),
             blocks: Vec::new(),
+            vorbis_packet_heads: Vec::new(),
         }),
     })
 }
@@ -1290,6 +1304,7 @@ fn finish(
             edits: Vec::new(),
             samples,
             presentation_order,
+            vorbis_packet_heads: track.vorbis_packet_heads,
         });
     }
     Ok(WebmDemuxer {

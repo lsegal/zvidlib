@@ -22,9 +22,10 @@ use zvidlib::{
     AudioTrackTiming, CancellationToken, Codec, CodecProfile, ColorRange, EncodedAudioSample,
     ErrorKind, ExactFrameReader, FrameIndex, HardwarePreference, IndexedPresentationTimeline,
     Limits, NativeAudioOutput, OnDemandAudioSource, OnDemandVideoSource, PixelFormat,
-    PlaybackController, PlaybackOptions, Result, Track, TrackKind, TrackSampleLoader,
-    TrackSampleProvider, VideoDecoderConfig, VideoDecoderFactory, VideoFrame, WebAudioOutput,
-    native_hevc_video_decoder_factory, native_vp9_video_decoder_factory,
+    PlaybackAudioSource, PlaybackController, PlaybackOptions, PrefetchAudioSource, Result,
+    SampleRange, Track, TrackKind, TrackSampleLoader, TrackSampleProvider, VideoDecoderConfig,
+    VideoDecoderFactory, VideoFrame, WebAudioOutput, native_hevc_video_decoder_factory,
+    native_vp9_video_decoder_factory,
 };
 
 /// A source whose every read suspends once before completing, the way a
@@ -574,5 +575,70 @@ fn prefetching_ahead_keeps_playback_from_reporting_missing_samples_of(bundled: &
         let (presentation, _) = playback.present().unwrap();
         assert_eq!(presentation.frame, Some(FrameIndex(frame)));
         block_on(playback.prefetch()).unwrap();
+    }
+}
+
+/// Issue #694: an audio budget too small for a packet and the two packets
+/// `audio_reader` decodes ahead of it is refused, rather than prefetching the
+/// same packets forever, and at the smallest budget the loader accepts every
+/// read completes, a packet's worth of prefetches at a time at worst. Runs
+/// over the bundled MP4's AAC track and the WebM's Opus track.
+#[test]
+fn an_on_demand_audio_source_at_the_smallest_accepted_budget_completes_its_reads() {
+    for bundled in [bundled(), webm()] {
+        let codec = bundled.audio.codec;
+        let checked_loader = |budget: u64| {
+            let loader = TrackSampleLoader::new(
+                bundled.audio.clone(),
+                SuspendingSource::new(bundled.bytes.clone()),
+                budget,
+            )?;
+            let provider = match codec {
+                Codec::Aac => loader.aac_packet_provider()?,
+                _ => block_on(loader.opus_packet_provider())?,
+            };
+            loader.check_audio_budget(&provider, 2)?;
+            Ok::<_, zvidlib::Error>((loader, provider))
+        };
+        let (loader, provider) = checked_loader(u64::MAX).unwrap();
+        let floor = loader.audio_budget_floor(&provider, 2);
+        let error = checked_loader(floor - 1).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit, "{codec:?}");
+
+        let (loader, provider) = checked_loader(floor).unwrap();
+        let mut audio =
+            OnDemandAudioSource::new(bundled.audio_reader(Box::new(provider)), loader, 8);
+        let mut eager = bundled.audio_reader(Box::new(bundled.eager_audio_packets()));
+        let length = audio.presentation_length();
+        let packets = bundled.audio.samples.len();
+        let window = length / 64;
+        let cancellation = CancellationToken::new();
+        for start in [
+            0,
+            window,
+            length - window,
+            window / 2,
+            length / 3,
+            length / 2,
+        ] {
+            let range = SampleRange::new(start, start + window).unwrap();
+            let mut prefetches = 0;
+            let got = loop {
+                match audio.read(range, &cancellation) {
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        prefetches += 1;
+                        assert!(
+                            prefetches <= packets,
+                            "{codec:?}: {range:?} still had not loaded after {packets} prefetches"
+                        );
+                        block_on(audio.prefetch(range)).unwrap();
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            let expected = eager.get_range(range, &cancellation).unwrap();
+            assert_eq!(got.samples, expected.samples, "{codec:?}: {range:?}");
+            assert!(audio.loader().resident_bytes() <= floor);
+        }
     }
 }
