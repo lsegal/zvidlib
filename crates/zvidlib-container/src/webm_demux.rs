@@ -261,23 +261,7 @@ impl WebmDemuxer {
             .iter()
             .find(|trim| trim.track == track_id)
             .ok_or_else(|| invalid("no such WebM audio track"))?;
-        let sample_rate = track.audio_sample_rate()?;
-        let to_samples = |nanoseconds: u64| -> Result<u32> {
-            let samples = (u128::from(nanoseconds) * u128::from(sample_rate)
-                + u128::from(NANOSECONDS_PER_SECOND) / 2)
-                / u128::from(NANOSECONDS_PER_SECOND);
-            u32::try_from(samples).map_err(|_| limit("WebM audio trim is out of range"))
-        };
-        let priming = match (trim.codec_delay_ns, track.codec) {
-            (Some(delay), _) => to_samples(delay)?,
-            (None, Codec::Opus) => u32::from(track.opus_config()?.pre_skip),
-            (None, _) => 0,
-        };
-        Ok(AudioTrackTiming {
-            priming,
-            padding: to_samples(trim.discard_padding_ns)?,
-            ..AudioTrackTiming::default()
-        })
+        audio_timing(track, trim)
     }
 
     /// The random-access point a decode reaching `time` (in track ticks)
@@ -315,48 +299,111 @@ impl WebmDemuxer {
     }
 }
 
+/// An audio track's timing from the trims it declares: `CodecDelay` is the
+/// priming and the last block's `DiscardPadding` the end padding, each
+/// converted to samples. An Opus track that declares no `CodecDelay` is primed
+/// by its `OpusHead` pre-skip instead.
+pub(crate) fn audio_timing(track: &Track, trim: &WebmAudioTrim) -> Result<AudioTrackTiming> {
+    let sample_rate = track.audio_sample_rate()?;
+    let to_samples = |nanoseconds: u64| -> Result<u32> {
+        let samples = (u128::from(nanoseconds) * u128::from(sample_rate)
+            + u128::from(NANOSECONDS_PER_SECOND) / 2)
+            / u128::from(NANOSECONDS_PER_SECOND);
+        u32::try_from(samples).map_err(|_| limit("WebM audio trim is out of range"))
+    };
+    let priming = match (trim.codec_delay_ns, track.codec) {
+        (Some(delay), _) => to_samples(delay)?,
+        (None, Codec::Opus) => u32::from(track.opus_config()?.pre_skip),
+        (None, _) => 0,
+    };
+    Ok(AudioTrackTiming {
+        priming,
+        padding: to_samples(trim.discard_padding_ns)?,
+        ..AudioTrackTiming::default()
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
-struct Header {
-    id: u32,
-    start: u64,
-    data_start: u64,
+pub(crate) struct Header {
+    pub(crate) id: u32,
+    pub(crate) start: u64,
+    pub(crate) data_start: u64,
     /// `None` for an unknown-size element.
-    end: Option<u64>,
+    pub(crate) end: Option<u64>,
 }
 
 impl Header {
-    fn known_end(self) -> Result<u64> {
+    pub(crate) fn known_end(self) -> Result<u64> {
         self.end
             .ok_or_else(|| malformed("only a Segment or Cluster may have an unknown EBML size"))
     }
 }
 
-struct Info {
-    timestamp_scale: u64,
-    duration: Option<f64>,
+pub(crate) struct Info {
+    pub(crate) timestamp_scale: u64,
+    pub(crate) duration: Option<f64>,
 }
 
-struct TrackEntry {
-    number: u64,
-    codec_id: String,
+/// How a segment's raw block timestamps become track ticks.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Clock {
+    /// Ticks per second of every track's timescale.
+    pub(crate) timescale: u32,
+    /// Track ticks per raw `TimestampScale` tick.
+    pub(crate) ticks_per_raw: u64,
+    /// The segment's `Duration`, in track ticks, when it declares one.
+    pub(crate) segment_end: Option<i64>,
+}
+
+impl Clock {
+    /// A track tick is one `TimestampScale` when that divides a second, which
+    /// the default of one millisecond does; otherwise a nanosecond.
+    pub(crate) fn new(info: &Info) -> Self {
+        let (timescale, ticks_per_raw) = if NANOSECONDS_PER_SECOND % info.timestamp_scale == 0 {
+            (NANOSECONDS_PER_SECOND / info.timestamp_scale, 1)
+        } else {
+            (NANOSECONDS_PER_SECOND, info.timestamp_scale)
+        };
+        let timescale = u32::try_from(timescale).expect("at most a billion");
+        Self {
+            timescale,
+            ticks_per_raw,
+            segment_end: info.duration.map(|duration| {
+                (duration * info.timestamp_scale as f64 / 1e9 * f64::from(timescale)) as i64
+            }),
+        }
+    }
+
+    pub(crate) fn to_ticks(self, raw: i64) -> Result<i64> {
+        raw.checked_mul(self.ticks_per_raw as i64)
+            .ok_or_else(|| limit("WebM timestamp overflow"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TrackEntry {
+    pub(crate) number: u64,
+    pub(crate) codec_id: String,
     /// `Some` for a track that is indexed.
-    indexed: Option<IndexedTrack>,
+    pub(crate) indexed: Option<IndexedTrack>,
 }
 
-struct IndexedTrack {
-    codec: Codec,
-    media: TrackMedia,
-    decoder_config: Vec<u8>,
-    default_duration_ns: Option<u64>,
-    frames: Vec<Frame>,
-    blocks: Vec<Block>,
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedTrack {
+    pub(crate) codec: Codec,
+    pub(crate) media: TrackMedia,
+    pub(crate) decoder_config: Vec<u8>,
+    pub(crate) default_duration_ns: Option<u64>,
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) blocks: Vec<Block>,
     /// A Vorbis track's frames' first bytes, in frame order; see
     /// [`Track::vorbis_packet_heads`].
-    vorbis_packet_heads: Vec<u8>,
+    pub(crate) vorbis_packet_heads: Vec<u8>,
 }
 
 /// What an indexed track carries.
-enum TrackMedia {
+#[derive(Clone, Debug)]
+pub(crate) enum TrackMedia {
     Video(VideoDimensions),
     Audio {
         channels: u16,
@@ -365,8 +412,8 @@ enum TrackMedia {
     },
 }
 
-#[derive(Clone, Copy)]
-struct Frame {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Frame {
     offset: u64,
     size: u32,
     /// `false` for a decode-only frame that is never presented, such as a
@@ -374,11 +421,12 @@ struct Frame {
     shown: bool,
 }
 
-struct Block {
+#[derive(Clone, Debug)]
+pub(crate) struct Block {
     /// Raw timestamp in `TimestampScale` ticks.
     timestamp: i64,
     /// `DiscardPadding`, in nanoseconds.
-    discard_padding_ns: i64,
+    pub(crate) discard_padding_ns: i64,
     first_frame: usize,
     frames: u32,
     keyframe: bool,
@@ -389,15 +437,22 @@ struct Block {
     cluster_offset: u64,
 }
 
-struct Scan<'a, S: ?Sized> {
-    source: &'a S,
-    options: &'a WebmDemuxerOptions,
-    elements: u64,
+/// What a [`Scan::cluster_blocks`] visitor wants after a block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Visit {
+    Continue,
+    Stop,
+}
+
+pub(crate) struct Scan<'a, S: ?Sized> {
+    pub(crate) source: &'a S,
+    pub(crate) options: &'a WebmDemuxerOptions,
+    pub(crate) elements: u64,
 }
 
 impl<S: ByteSource + ?Sized> Scan<'_, S> {
     /// Reads the element header at `start`, which must end by `parent_end`.
-    async fn header(&mut self, start: u64, parent_end: u64) -> Result<Header> {
+    pub(crate) async fn header(&mut self, start: u64, parent_end: u64) -> Result<Header> {
         self.elements = self
             .elements
             .checked_add(1)
@@ -435,7 +490,7 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
         })
     }
 
-    async fn payload(&self, header: Header, end: u64) -> Result<Vec<u8>> {
+    pub(crate) async fn payload(&self, header: Header, end: u64) -> Result<Vec<u8>> {
         let length = end - header.data_start;
         if length > self.options.max_element_bytes {
             return Err(limit("WebM element exceeds the configured element limit"));
@@ -454,6 +509,26 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
         segment_end: u64,
         tracks: &mut [TrackEntry],
     ) -> Result<u64> {
+        let options = self.options;
+        let (end, _) = self
+            .cluster_blocks(cluster, segment_end, |block| {
+                block.commit(tracks, cluster.start, options)?;
+                Ok(Visit::Continue)
+            })
+            .await?;
+        Ok(end)
+    }
+
+    /// Hands each of one Cluster's blocks to `visit`, in file order, until it
+    /// asks to stop. Returns where the Cluster ends, and whether `visit`
+    /// stopped it. An unknown-size Cluster ends at the next Segment child or
+    /// EBML header.
+    pub(crate) async fn cluster_blocks(
+        &mut self,
+        cluster: Header,
+        segment_end: u64,
+        mut visit: impl FnMut(ParsedBlock) -> Result<Visit>,
+    ) -> Result<(u64, bool)> {
         let end = cluster.end.unwrap_or(segment_end);
         let mut timestamp = None;
         let mut cursor = cluster.data_start;
@@ -463,10 +538,10 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
                 && (ebml::is_segment_child(header.id)
                     || matches!(header.id, ebml::EBML | ebml::SEGMENT))
             {
-                return Ok(cursor);
+                return Ok((cursor, false));
             }
             let element_end = header.known_end()?;
-            match header.id {
+            let block = match header.id {
                 ebml::TIMESTAMP => {
                     if element_end - header.data_start > 8 {
                         return Err(malformed("WebM Cluster timestamp is too long"));
@@ -476,26 +551,31 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
                         i64::try_from(value)
                             .map_err(|_| malformed("WebM Cluster timestamp is out of range"))?,
                     );
+                    None
                 }
                 ebml::SIMPLE_BLOCK => {
                     let timestamp = timestamp
                         .ok_or_else(|| malformed("a WebM block precedes its Cluster timestamp"))?;
-                    self.block(header.data_start, element_end, timestamp, None, None)
-                        .await?
-                        .commit(tracks, cluster.start, self.options)?;
+                    Some(
+                        self.block(header.data_start, element_end, timestamp, None, None)
+                            .await?,
+                    )
                 }
                 ebml::BLOCK_GROUP => {
                     let timestamp = timestamp
                         .ok_or_else(|| malformed("a WebM block precedes its Cluster timestamp"))?;
-                    self.block_group(header, element_end, timestamp)
-                        .await?
-                        .commit(tracks, cluster.start, self.options)?;
+                    Some(self.block_group(header, element_end, timestamp).await?)
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(block) = block
+                && visit(block)? == Visit::Stop
+            {
+                return Ok((end, true));
             }
             cursor = element_end;
         }
-        Ok(end)
+        Ok((end, false))
     }
 
     async fn block_group(
@@ -604,9 +684,10 @@ impl<S: ByteSource + ?Sized> Scan<'_, S> {
     }
 }
 
-struct ParsedBlock {
-    track: u64,
-    timestamp: i64,
+pub(crate) struct ParsedBlock {
+    pub(crate) track: u64,
+    /// Raw timestamp in `TimestampScale` ticks.
+    pub(crate) timestamp: i64,
     keyframe: bool,
     invisible: bool,
     duration: Option<u64>,
@@ -616,7 +697,15 @@ struct ParsedBlock {
 }
 
 impl ParsedBlock {
-    fn commit(
+    /// Whether any of the block's frames is presented, as
+    /// [`Self::commit`] decides it for a track of `codec`.
+    pub(crate) fn is_shown(&self, codec: Codec) -> bool {
+        self.frames
+            .iter()
+            .any(|&(_, _, first_byte)| frame_shown(codec, self.invisible, first_byte))
+    }
+
+    pub(crate) fn commit(
         self,
         tracks: &mut [TrackEntry],
         cluster_offset: u64,
@@ -643,20 +732,7 @@ impl ParsedBlock {
         )?;
         let first_frame = track.frames.len();
         for (offset, size, first_byte) in self.frames {
-            // A VP8 frame with `show_frame` (bit 4 of its frame tag) clear is
-            // decoded for its references but never presented (RFC 6386
-            // section 9.1), and Matroska's invisible flag says the same of
-            // the whole block.
-            //
-            // A VP9 block is a chunk that shows one frame, carrying hidden
-            // frames ahead of it in a superframe; whether a chunk shows a
-            // frame is only known from its last frame, so a block that does
-            // not is identified by the invisible flag alone.
-            let shown = match track.codec {
-                Codec::Vp8 => !self.invisible && first_byte.is_none_or(|tag| tag & 0x10 != 0),
-                Codec::Vp9 => !self.invisible,
-                _ => true,
-            };
+            let shown = frame_shown(track.codec, self.invisible, first_byte);
             if track.codec == Codec::Vorbis {
                 // A frame is never empty, so its first byte was read.
                 track
@@ -681,6 +757,24 @@ impl ParsedBlock {
             cluster_offset,
         });
         Ok(())
+    }
+}
+
+/// Whether a frame of a `codec` block is presented.
+///
+/// A VP8 frame with `show_frame` (bit 4 of its frame tag) clear is decoded for
+/// its references but never presented (RFC 6386 section 9.1), and Matroska's
+/// invisible flag says the same of the whole block.
+///
+/// A VP9 block is a chunk that shows one frame, carrying hidden frames ahead
+/// of it in a superframe; whether a chunk shows a frame is only known from its
+/// last frame, so a block that does not is identified by the invisible flag
+/// alone.
+fn frame_shown(codec: Codec, invisible: bool, first_byte: Option<u8>) -> bool {
+    match codec {
+        Codec::Vp8 => !invisible && first_byte.is_none_or(|tag| tag & 0x10 != 0),
+        Codec::Vp9 => !invisible,
+        _ => true,
     }
 }
 
@@ -757,7 +851,7 @@ fn parse_lacing(bytes: &[u8], header_length: usize, lacing: u8) -> Result<Vec<(u
     Ok(frames)
 }
 
-fn parse_ebml_header(payload: &[u8]) -> Result<String> {
+pub(crate) fn parse_ebml_header(payload: &[u8]) -> Result<String> {
     let mut doc_type = None;
     for child in children(payload) {
         let (id, value) = child?;
@@ -794,7 +888,7 @@ fn parse_ebml_header(payload: &[u8]) -> Result<String> {
     }
 }
 
-fn parse_info(payload: &[u8]) -> Result<Info> {
+pub(crate) fn parse_info(payload: &[u8]) -> Result<Info> {
     let mut info = Info {
         timestamp_scale: DEFAULT_TIMESTAMP_SCALE,
         duration: None,
@@ -819,7 +913,7 @@ fn parse_info(payload: &[u8]) -> Result<Info> {
     Ok(info)
 }
 
-fn parse_tracks(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Vec<TrackEntry>> {
+pub(crate) fn parse_tracks(payload: &[u8], options: &WebmDemuxerOptions) -> Result<Vec<TrackEntry>> {
     let mut entries: Vec<TrackEntry> = Vec::new();
     for child in children(payload) {
         let (id, value) = child?;
@@ -1068,7 +1162,7 @@ fn decoder_config(
     }
 }
 
-fn parse_cues(payload: &[u8], segment_start: u64) -> Result<Vec<RawCue>> {
+pub(crate) fn parse_cues(payload: &[u8], segment_start: u64) -> Result<Vec<RawCue>> {
     let mut cues = Vec::new();
     for child in children(payload) {
         let (id, value) = child?;
@@ -1112,10 +1206,12 @@ fn parse_cues(payload: &[u8], segment_start: u64) -> Result<Vec<RawCue>> {
     Ok(cues)
 }
 
-struct RawCue {
-    time: i64,
-    track: u64,
-    cluster_offset: u64,
+#[derive(Clone, Debug)]
+pub(crate) struct RawCue {
+    /// Raw `CueTime`, in `TimestampScale` ticks.
+    pub(crate) time: i64,
+    pub(crate) track: u64,
+    pub(crate) cluster_offset: u64,
 }
 
 /// Converts the scanned blocks into sample tables in track ticks.
@@ -1126,22 +1222,7 @@ fn finish(
     raw_cues: Vec<RawCue>,
     options: &WebmDemuxerOptions,
 ) -> Result<WebmDemuxer> {
-    // A track tick is one `TimestampScale` when that divides a second, which
-    // the default of one millisecond does; otherwise a nanosecond.
-    let (timescale, ticks_per_raw) = if NANOSECONDS_PER_SECOND % info.timestamp_scale == 0 {
-        (NANOSECONDS_PER_SECOND / info.timestamp_scale, 1)
-    } else {
-        (NANOSECONDS_PER_SECOND, info.timestamp_scale)
-    };
-    let timescale = u32::try_from(timescale).expect("at most a billion");
-    let to_ticks = |raw: i64| -> Result<i64> {
-        raw.checked_mul(ticks_per_raw as i64)
-            .ok_or_else(|| limit("WebM timestamp overflow"))
-    };
-    let segment_end = info.duration.map(|duration| {
-        (duration * info.timestamp_scale as f64 / 1e9 * f64::from(timescale)) as i64
-    });
-
+    let clock = Clock::new(&info);
     let mut tracks = Vec::new();
     let mut skipped_tracks = Vec::new();
     let mut cues = Vec::new();
@@ -1154,158 +1235,18 @@ fn finish(
             });
             continue;
         };
-        let id = u32::try_from(entry.number)
-            .map_err(|_| unsupported("WebM track numbers above 2^32 are unsupported"))?;
-        let mut keyframes: BTreeMap<(u64, i64), usize> = BTreeMap::new();
-        for (index, block) in track.blocks.iter().enumerate() {
-            keyframes.insert((block.cluster_offset, block.timestamp), index);
-        }
-        let mut cued = vec![false; track.blocks.len()];
+        let id = track_id(entry.number)?;
         for cue in raw_cues.iter().filter(|cue| cue.track == entry.number) {
-            if let Some(&index) = keyframes.get(&(cue.cluster_offset, cue.time)) {
-                cued[index] = true;
-            }
             cues.push(WebmCuePoint {
-                time: to_ticks(cue.time)?,
+                time: clock.to_ticks(cue.time)?,
                 track: id,
                 cluster_offset: cue.cluster_offset,
             });
         }
-        let default_duration = track.default_duration_ns.map(|duration| {
-            (u128::from(duration) * u128::from(timescale) / u128::from(NANOSECONDS_PER_SECOND))
-                as u64
-        });
-
-        // A shown frame lasts until the next shown block, not the hidden one
-        // an encoder may store a tick after it.
-        let mut next_shown = vec![None; track.blocks.len()];
-        let mut following = None;
-        for (index, block) in track.blocks.iter().enumerate().rev() {
-            next_shown[index] = following;
-            if block.shown {
-                following = Some(block.timestamp);
-            }
-        }
-        let mut samples = Vec::with_capacity(track.frames.len());
-        let mut shown = Vec::with_capacity(track.frames.len());
-        let mut previous_frame_duration = None;
-        let mut dts = 0_u64;
-        for (index, block) in track.blocks.iter().enumerate() {
-            let pts = to_ticks(block.timestamp)?;
-            let next = next_shown[index].map(to_ticks).transpose()?;
-            let frames = u64::from(block.frames);
-            let duration = block
-                .duration
-                .map(|duration| duration.saturating_mul(ticks_per_raw))
-                .or_else(|| {
-                    next.and_then(|next| u64::try_from(next.checked_sub(pts)?).ok())
-                        .filter(|&delta| delta > 0)
-                })
-                .or_else(|| default_duration.map(|duration| duration.saturating_mul(frames)))
-                .or_else(|| {
-                    segment_end
-                        .and_then(|end| u64::try_from(end.checked_sub(pts)?).ok())
-                        .filter(|&delta| delta > 0)
-                })
-                .or_else(|| previous_frame_duration.map(|duration: u64| duration * frames))
-                .unwrap_or(frames)
-                .max(frames);
-            let frame_duration = duration / frames;
-            previous_frame_duration = Some(frame_duration);
-            let keyframe = block.keyframe || cued[index];
-            let mut frame_pts = pts;
-            for frame in 0..block.frames {
-                let Frame {
-                    offset,
-                    size,
-                    shown: frame_shown,
-                } = track.frames[block.first_frame + frame as usize];
-                shown.push(frame_shown);
-                let this_duration = if frame + 1 == block.frames {
-                    duration - frame_duration * (frames - 1)
-                } else {
-                    frame_duration
-                };
-                dts = dts.max(u64::try_from(frame_pts.max(0)).expect("nonnegative"));
-                samples.push(TrackSample {
-                    offset,
-                    size,
-                    dts,
-                    pts: frame_pts,
-                    duration: u32::try_from(this_duration)
-                        .map_err(|_| limit("WebM frame duration is out of range"))?,
-                    dependency: if keyframe {
-                        SampleDependency::INDEPENDENT
-                    } else {
-                        SampleDependency::DEPENDENT
-                    },
-                    is_sync: keyframe,
-                });
-                frame_pts = frame_pts
-                    .checked_add(this_duration as i64)
-                    .ok_or_else(|| limit("WebM timestamp overflow"))?;
-            }
-        }
-        let mut duration = 0_u64;
-        for sample in &samples {
-            duration = duration.max(
-                sample
-                    .dts
-                    .checked_add(u64::from(sample.duration))
-                    .ok_or_else(|| limit("track duration overflow"))?,
-            );
-        }
-        ensure_allocation(
-            samples.len(),
-            std::mem::size_of::<usize>(),
-            options,
-            "presentation index",
-        )?;
-        // A decode-only frame is decoded whenever a seek passes through it,
-        // but it is not a presentation frame.
-        let mut presentation_order: Vec<usize> =
-            (0..samples.len()).filter(|&index| shown[index]).collect();
-        presentation_order.sort_by_key(|&index| {
-            let sample = &samples[index];
-            (sample.pts, sample.dts, index)
-        });
-        let (kind, dimensions, channels, sample_rate) = match track.media {
-            TrackMedia::Video(dimensions) => (TrackKind::Video, Some(dimensions), None, None),
-            TrackMedia::Audio {
-                channels,
-                sample_rate,
-                codec_delay_ns,
-            } => {
-                // Only the last block's padding trims the stream's end.
-                let discard_padding_ns = track
-                    .blocks
-                    .last()
-                    .map_or(0, |block| block.discard_padding_ns);
-                audio_trims.push(WebmAudioTrim {
-                    track: id,
-                    codec_delay_ns,
-                    discard_padding_ns: u64::try_from(discard_padding_ns)
-                        .map_err(|_| malformed("WebM DiscardPadding is negative"))?,
-                });
-                (TrackKind::Audio, None, Some(channels), Some(sample_rate))
-            }
-        };
-        tracks.push(Track {
-            id,
-            kind,
-            codec: track.codec,
-            timescale,
-            duration,
-            dimensions,
-            channels,
-            sample_rate,
-            language: None,
-            decoder_config: track.decoder_config,
-            edits: Vec::new(),
-            samples,
-            presentation_order,
-            vorbis_packet_heads: track.vorbis_packet_heads,
-        });
+        let cued = cued_blocks(&track, entry.number, &raw_cues);
+        let (track, trim) = build_track(id, track, &cued, None, clock, options)?;
+        tracks.push(track);
+        audio_trims.extend(trim);
     }
     Ok(WebmDemuxer {
         doc_type,
@@ -1319,6 +1260,188 @@ fn finish(
     })
 }
 
+/// The [`Track::id`] of the track Matroska numbers `number`.
+pub(crate) fn track_id(number: u64) -> Result<u32> {
+    u32::try_from(number).map_err(|_| unsupported("WebM track numbers above 2^32 are unsupported"))
+}
+
+/// Which of `track`'s blocks, the scanned blocks of the track Matroska numbers
+/// `number`, a cue names, so they are random-access points whatever their
+/// flags say.
+pub(crate) fn cued_blocks(track: &IndexedTrack, number: u64, raw_cues: &[RawCue]) -> Vec<bool> {
+    let mut keyframes: BTreeMap<(u64, i64), usize> = BTreeMap::new();
+    for (index, block) in track.blocks.iter().enumerate() {
+        keyframes.insert((block.cluster_offset, block.timestamp), index);
+    }
+    let mut cued = vec![false; track.blocks.len()];
+    for cue in raw_cues.iter().filter(|cue| cue.track == number) {
+        if let Some(&index) = keyframes.get(&(cue.cluster_offset, cue.time)) {
+            cued[index] = true;
+        }
+    }
+    cued
+}
+
+/// `track`'s scanned blocks as a [`Track`] in track ticks, and the trims an
+/// audio track declares.
+///
+/// `following` is the raw timestamp of the track's next shown block after its
+/// last scanned one, when the blocks are only part of the track (issue #692):
+/// the last block lasts until it, as every other block lasts until the next
+/// shown block after it.
+pub(crate) fn build_track(
+    id: u32,
+    track: IndexedTrack,
+    cued: &[bool],
+    following: Option<i64>,
+    clock: Clock,
+    options: &WebmDemuxerOptions,
+) -> Result<(Track, Option<WebmAudioTrim>)> {
+    let Clock {
+        timescale,
+        ticks_per_raw,
+        segment_end,
+    } = clock;
+    let default_duration = track.default_duration_ns.map(|duration| {
+        (u128::from(duration) * u128::from(timescale) / u128::from(NANOSECONDS_PER_SECOND)) as u64
+    });
+
+    // A shown frame lasts until the next shown block, not the hidden one
+    // an encoder may store a tick after it.
+    let mut next_shown = vec![None; track.blocks.len()];
+    let mut following = following;
+    for (index, block) in track.blocks.iter().enumerate().rev() {
+        next_shown[index] = following;
+        if block.shown {
+            following = Some(block.timestamp);
+        }
+    }
+    let mut samples = Vec::with_capacity(track.frames.len());
+    let mut shown = Vec::with_capacity(track.frames.len());
+    let mut previous_frame_duration = None;
+    let mut dts = 0_u64;
+    for (index, block) in track.blocks.iter().enumerate() {
+        let pts = clock.to_ticks(block.timestamp)?;
+        let next = next_shown[index]
+            .map(|raw| clock.to_ticks(raw))
+            .transpose()?;
+        let frames = u64::from(block.frames);
+        let duration = block
+            .duration
+            .map(|duration| duration.saturating_mul(ticks_per_raw))
+            .or_else(|| {
+                next.and_then(|next| u64::try_from(next.checked_sub(pts)?).ok())
+                    .filter(|&delta| delta > 0)
+            })
+            .or_else(|| default_duration.map(|duration| duration.saturating_mul(frames)))
+            .or_else(|| {
+                segment_end
+                    .and_then(|end| u64::try_from(end.checked_sub(pts)?).ok())
+                    .filter(|&delta| delta > 0)
+            })
+            .or_else(|| previous_frame_duration.map(|duration: u64| duration * frames))
+            .unwrap_or(frames)
+            .max(frames);
+        let frame_duration = duration / frames;
+        previous_frame_duration = Some(frame_duration);
+        let keyframe = block.keyframe || cued[index];
+        let mut frame_pts = pts;
+        for frame in 0..block.frames {
+            let Frame {
+                offset,
+                size,
+                shown: frame_shown,
+            } = track.frames[block.first_frame + frame as usize];
+            shown.push(frame_shown);
+            let this_duration = if frame + 1 == block.frames {
+                duration - frame_duration * (frames - 1)
+            } else {
+                frame_duration
+            };
+            dts = dts.max(u64::try_from(frame_pts.max(0)).expect("nonnegative"));
+            samples.push(TrackSample {
+                offset,
+                size,
+                dts,
+                pts: frame_pts,
+                duration: u32::try_from(this_duration)
+                    .map_err(|_| limit("WebM frame duration is out of range"))?,
+                dependency: if keyframe {
+                    SampleDependency::INDEPENDENT
+                } else {
+                    SampleDependency::DEPENDENT
+                },
+                is_sync: keyframe,
+            });
+            frame_pts = frame_pts
+                .checked_add(this_duration as i64)
+                .ok_or_else(|| limit("WebM timestamp overflow"))?;
+        }
+    }
+    let mut duration = 0_u64;
+    for sample in &samples {
+        duration = duration.max(
+            sample
+                .dts
+                .checked_add(u64::from(sample.duration))
+                .ok_or_else(|| limit("track duration overflow"))?,
+        );
+    }
+    ensure_allocation(
+        samples.len(),
+        std::mem::size_of::<usize>(),
+        options,
+        "presentation index",
+    )?;
+    // A decode-only frame is decoded whenever a seek passes through it,
+    // but it is not a presentation frame.
+    let mut presentation_order: Vec<usize> =
+        (0..samples.len()).filter(|&index| shown[index]).collect();
+    presentation_order.sort_by_key(|&index| {
+        let sample = &samples[index];
+        (sample.pts, sample.dts, index)
+    });
+    let mut trim = None;
+    let (kind, dimensions, channels, sample_rate) = match track.media {
+        TrackMedia::Video(dimensions) => (TrackKind::Video, Some(dimensions), None, None),
+        TrackMedia::Audio {
+            channels,
+            sample_rate,
+            codec_delay_ns,
+        } => {
+            // Only the last block's padding trims the stream's end.
+            let discard_padding_ns = track
+                .blocks
+                .last()
+                .map_or(0, |block| block.discard_padding_ns);
+            trim = Some(WebmAudioTrim {
+                track: id,
+                codec_delay_ns,
+                discard_padding_ns: u64::try_from(discard_padding_ns)
+                    .map_err(|_| malformed("WebM DiscardPadding is negative"))?,
+            });
+            (TrackKind::Audio, None, Some(channels), Some(sample_rate))
+        }
+    };
+    let track = Track {
+        id,
+        kind,
+        codec: track.codec,
+        timescale,
+        duration,
+        dimensions,
+        channels,
+        sample_rate,
+        language: None,
+        decoder_config: track.decoder_config,
+        edits: Vec::new(),
+        samples,
+        presentation_order,
+        vorbis_packet_heads: track.vorbis_packet_heads,
+    };
+    Ok((track, trim))
+}
+
 fn frame_size(size: u64) -> Result<u32> {
     if size == 0 {
         return Err(malformed("WebM block contains an empty frame"));
@@ -1326,7 +1449,7 @@ fn frame_size(size: u64) -> Result<u32> {
     u32::try_from(size).map_err(|_| limit("WebM frame is too large"))
 }
 
-fn validate_options(options: &WebmDemuxerOptions) -> Result<()> {
+pub(crate) fn validate_options(options: &WebmDemuxerOptions) -> Result<()> {
     if options.max_element_bytes == 0 || options.max_elements == 0 {
         return Err(invalid("WebM structure limits must be nonzero"));
     }
@@ -1375,7 +1498,7 @@ async fn read_up_to<S: ByteSource + ?Sized>(
     Ok(read)
 }
 
-async fn read_exact<S: ByteSource + ?Sized>(
+pub(crate) async fn read_exact<S: ByteSource + ?Sized>(
     source: &S,
     offset: u64,
     destination: &mut [u8],

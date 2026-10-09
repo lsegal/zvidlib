@@ -16,6 +16,7 @@ pub mod mp4_demux;
 pub mod prefetch;
 pub mod track;
 pub mod webm;
+pub mod webm_cues;
 pub mod webm_demux;
 
 #[allow(unused_imports)]
@@ -46,6 +47,7 @@ pub use mp4_demux::{AacTrackConfig, Mp4Demuxer, Mp4DemuxerOptions, probe_mp4};
 pub use prefetch::{PrefetchedAudioPacketProvider, PrefetchedSampleProvider, TrackSampleLoader};
 pub use track::{EditMapping, Track, TrackAudioPacketProvider, TrackSample, TrackSampleProvider};
 pub use webm::WebmMuxer;
+pub use webm_cues::{WebmCueSpan, WebmCuedIndex};
 pub use webm_demux::{
     WebmAudioTrim, WebmCuePoint, WebmDemuxer, WebmDemuxerOptions, WebmSeekPoint, WebmSkippedTrack,
     probe_webm,
