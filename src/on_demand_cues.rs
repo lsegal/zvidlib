@@ -59,45 +59,53 @@ impl<I> Clone for CuedSpans<I> {
     }
 }
 
+/// What [`CuedSpans::open`] found an input to be.
+pub(crate) enum Opened<I> {
+    /// A cued WebM, played as its spans are indexed.
+    Cued(CuedSpans<I>),
+    /// Anything else, which the whole file's index plays: the source back,
+    /// with whatever it cached of the input's header.
+    Whole(I),
+}
+
 impl<I: ByteSource> CuedSpans<I> {
-    /// Opens `source` as a cued WebM and indexes its first span. `None` for
-    /// an input the whole file's index plays instead: an MP4, a WebM without
-    /// `Cues`, one with a Vorbis audio track - a Vorbis packet's position
-    /// depends on the length of every packet before it - or one with an audio
-    /// track that has no packet in the first span, which its packets' positions
-    /// are counted from.
-    pub(crate) async fn open(source: I, limits: &Limits) -> Result<Option<Self>> {
+    /// Opens `source` as a cued WebM and indexes its first span. The whole
+    /// file's index plays anything else: an MP4, a WebM without `Cues`, one
+    /// with a Vorbis audio track - a Vorbis packet's position depends on the
+    /// length of every packet before it - or one with an audio track that has
+    /// no packet in the first span, which its packets' positions are counted
+    /// from.
+    pub(crate) async fn open(source: I, limits: &Limits) -> Result<Opened<I>> {
         if !probe_webm(&source).await? {
-            return Ok(None);
+            return Ok(Opened::Whole(source));
         }
         let options = WebmDemuxerOptions {
             limits: *limits,
             ..WebmDemuxerOptions::default()
         };
         let Some(index) = WebmCuedIndex::open(&source, options).await? else {
-            return Ok(None);
+            return Ok(Opened::Whole(source));
         };
         if index
             .tracks
             .iter()
             .any(|track| track.kind == TrackKind::Audio && track.codec != Codec::Opus)
         {
-            return Ok(None);
+            return Ok(Opened::Whole(source));
         }
-        let spans = Self {
-            index: Rc::new(index),
-            source: Rc::new(source),
-            spans: Rc::new(RefCell::new(BTreeMap::new())),
-        };
-        let first = spans.span(0).await?;
+        let first = index.index_span(&source, 0).await?;
         if first
             .tracks
             .iter()
             .any(|track| track.kind == TrackKind::Audio && track.samples.is_empty())
         {
-            return Ok(None);
+            return Ok(Opened::Whole(source));
         }
-        Ok(Some(spans))
+        Ok(Opened::Cued(Self {
+            index: Rc::new(index),
+            source: Rc::new(source),
+            spans: Rc::new(RefCell::new(BTreeMap::from([(0, Rc::new(first))]))),
+        }))
     }
 
     pub(crate) fn index(&self) -> &WebmCuedIndex {
@@ -339,6 +347,7 @@ impl<I: ByteSource, V: PrefetchVideoSource> CuedVideoSource<I, V> {
     }
 
     /// The compressed video bytes loaded now, across every span.
+    #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.cache.resident_bytes()
     }
@@ -588,6 +597,7 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioWindow<I, S> {
 
     /// Whether `reader` reads `range` of the presentation from the window as
     /// it is, without [`Self::cover`] moving or growing it.
+    #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
     pub(crate) fn covers<D: AudioDecoder>(
         &self,
         range: SampleRange,
@@ -750,6 +760,7 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioPackets<I, S> {
     }
 
     /// Whether `reader` reads `range` from what it has now.
+    #[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
     pub(crate) fn covers<D: AudioDecoder>(
         &self,
         range: SampleRange,
@@ -786,12 +797,14 @@ impl<I: ByteSource, S: ByteSource + Clone> AudioPackets<I, S> {
 /// An audio track's presentation samples, decoded from packets loaded on
 /// demand, from the whole track's index or a cued WebM's window of it: the
 /// [`crate::OnDemandAudioSource`] of [`crate::OnDemandPlayer`].
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 pub(crate) struct PacketAudioSource<D, I, S> {
     reader: AudioSampleReader<D>,
     packets: AudioPackets<I, S>,
     readahead_packets: usize,
 }
 
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PacketAudioSource<D, I, S> {
     pub(crate) fn new(
         reader: AudioSampleReader<D>,
@@ -810,6 +823,7 @@ impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PacketAudioSource<D,
     }
 }
 
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PlaybackAudioSource
     for PacketAudioSource<D, I, S>
 {
@@ -838,6 +852,7 @@ impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PlaybackAudioSource
     }
 }
 
+#[cfg(all(any(unix, windows), not(target_arch = "wasm32")))]
 impl<D: AudioDecoder, I: ByteSource, S: ByteSource + Clone> PrefetchAudioSource
     for PacketAudioSource<D, I, S>
 {

@@ -52,7 +52,7 @@ use crate::on_demand::{
     audio_packets, crate_video_source,
 };
 use crate::on_demand_cues::{
-    AudioPackets, AudioWindow, CuedSilence, CuedSpans, CuedTimeline, CuedVideoSource,
+    AudioPackets, AudioWindow, CuedSilence, CuedSpans, CuedTimeline, CuedVideoSource, Opened,
     PacketAudioSource,
 };
 use crate::playback::{
@@ -460,8 +460,8 @@ impl<S: ByteSource + Clone + 'static> OnDemandPlayer<S> {
             CachingByteSource::new(source.clone(), INDEX_PAGE_BYTES, INDEX_CACHE_BYTES)?;
         let (index, audio_tracks, video_source, dimensions) =
             match block_on(CuedSpans::open(index_source, &limits))? {
-                Some(spans) => Self::open_cued(spans, &source, options, limits)?,
-                None => Self::open_whole(&source, options, limits)?,
+                Opened::Cued(spans) => Self::open_cued(spans, &source, options, limits)?,
+                Opened::Whole(_) => Self::open_whole(&source, options, limits)?,
             };
         let audio_track = if audio_tracks.is_empty() {
             None
